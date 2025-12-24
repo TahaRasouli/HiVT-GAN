@@ -1,0 +1,1 @@
+from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
