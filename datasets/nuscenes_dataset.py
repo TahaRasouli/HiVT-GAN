@@ -10,16 +10,7 @@ from utils import TemporalData
 class NuScenesHiVTDataset(Dataset):
     """
     HiVT-compatible nuScenes dataset.
-
-    This dataset assumes that all preprocessing has already been done
-    offline and stored as TemporalData (.pt files), one file per sample.
-
-    Directory structure:
-        root/
-            train_processed/
-                <sample_token>.pt
-            val_processed/
-                <sample_token>.pt
+    Assumes offline preprocessing to .pt TemporalData files.
     """
 
     def __init__(
@@ -29,25 +20,19 @@ class NuScenesHiVTDataset(Dataset):
         transform=None,
         max_samples: Optional[int] = None,
     ):
-        """
-        Args:
-            root: Root directory containing <split>_processed/
-            split: "train" or "val"
-            transform: optional PyG transform
-            max_samples: optional limit for debugging
-        """
         self.split = split
         self._directory = f"{split}_processed"
         self.root = root
         self.transform = transform
 
-        self.processed_dir = os.path.join(self.root, self._directory)
-        if not os.path.isdir(self.processed_dir):
-            raise FileNotFoundError(f"Processed directory not found: {self.processed_dir}")
+        # IMPORTANT: use a private attribute (PyG already has processed_dir)
+        self._processed_dir = os.path.join(self.root, self._directory)
+        if not os.path.isdir(self._processed_dir):
+            raise FileNotFoundError(f"Processed directory not found: {self._processed_dir}")
 
         self.processed_paths = sorted(
-            os.path.join(self.processed_dir, f)
-            for f in os.listdir(self.processed_dir)
+            os.path.join(self._processed_dir, f)
+            for f in os.listdir(self._processed_dir)
             if f.endswith(".pt")
         )
 
@@ -69,7 +54,4 @@ class NuScenesHiVTDataset(Dataset):
     # --------------------------------------------------
     @staticmethod
     def collate_fn(batch: List[TemporalData]) -> Batch:
-        """
-        Collate TemporalData objects into a PyG Batch.
-        """
         return Batch.from_data_list(batch)
