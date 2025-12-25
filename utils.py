@@ -38,17 +38,28 @@ class TemporalData(Data):
             for t in range(self.x.size(1)):
                 self[f'edge_attr_{t}'] = edge_attrs[t]
 
-    def __inc__(self, key, value, store):
+
+    def __cat_dim__(self, key, value, store=None):
+        # Indices are concatenated along dim=1 in PyG
+        if key in ("edge_index", "lane_actor_index"):
+            return 1
+        return super().__cat_dim__(key, value, store)
+
+    def __inc__(self, key, value, store=None):
         if key == "edge_index":
+            # edge_index is [2, E], offset both rows by num_nodes
             return self.num_nodes
 
         if key == "lane_actor_index":
-            # Always return a (2,) tensor, even if E == 0
-            num_lanes = self.lane_vectors.size(0) if hasattr(self, "lane_vectors") else 0
-            num_nodes = self.num_nodes
-            return torch.tensor([num_lanes, num_nodes], device=value.device)
+            # lane_actor_index is [2, E]
+            # row0: lane indices -> offset by num_lanes
+            # row1: actor indices -> offset by num_nodes
+            num_lanes = int(self.lane_vectors.size(0)) if hasattr(self, "lane_vectors") else 0
+            inc = torch.tensor([[num_lanes], [int(self.num_nodes)]],
+                               dtype=value.dtype, device=value.device)
+            return inc
 
-        return 0
+        return super().__inc__(key, value, store)
 
 class DistanceDropEdge(object):
 
