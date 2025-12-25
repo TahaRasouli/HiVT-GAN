@@ -27,7 +27,7 @@ def main():
     # -----------------------------
     # Training arguments
     # -----------------------------
-    parser.add_argument("--gpus", type=int, default=1)
+    parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--max_epochs", type=int, default=64)
     parser.add_argument(
         "--monitor",
@@ -59,11 +59,13 @@ def main():
     # -----------------------------
     trainer = pl.Trainer(
         accelerator="gpu" if args.gpus > 0 else "cpu",
-        devices=args.gpus if args.gpus > 0 else 1,
+        devices=args.devices,
+        strategy="ddp", 
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback],
         enable_checkpointing=True,
         log_every_n_steps=1,
+        num_sanity_val_steps=0,
     )
 
     # -----------------------------
