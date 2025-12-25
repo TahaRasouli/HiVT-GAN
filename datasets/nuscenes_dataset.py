@@ -53,19 +53,51 @@ class NuScenesHiVTDataset(Dataset):
         return self._processed_file_names
 
     def _sanitize(self, data):
-        # lane_vectors: [L, 2]
-        if data.lane_vectors.numel() == 0:
-            data.lane_vectors = data.lane_vectors.reshape(0, 2)
+        # Always [2, E]
+        if hasattr(data, "lane_actor_index"):
+            lai = data.lane_actor_index
+            if not torch.is_tensor(lai):
+                data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
+            elif lai.numel() == 0:
+                data.lane_actor_index = lai.reshape(2, 0)
+            elif lai.dim() == 1 and lai.size(0) == 2:
+                # occasionally stored as shape [2] (single edge) -> make [2,1]
+                data.lane_actor_index = lai.reshape(2, 1)
+            elif lai.dim() != 2 or lai.size(0) != 2:
+                raise ValueError(f"Bad lane_actor_index shape: {tuple(lai.shape)}")
 
-        # lane_actor_vectors: [E, 2]
-        if data.lane_actor_vectors.numel() == 0:
-            data.lane_actor_vectors = data.lane_actor_vectors.reshape(0, 2)
+        # Always [E, 2]
+        if hasattr(data, "lane_actor_vectors"):
+            lav = data.lane_actor_vectors
+            if not torch.is_tensor(lav):
+                data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
+            elif lav.numel() == 0:
+                data.lane_actor_vectors = lav.reshape(0, 2)
+            elif lav.dim() != 2 or lav.size(-1) != 2:
+                raise ValueError(f"Bad lane_actor_vectors shape: {tuple(lav.shape)}")
 
-        # lane_actor_index: [2, E]
-        if data.lane_actor_index.numel() == 0:
-            data.lane_actor_index = data.lane_actor_index.reshape(2, 0)
+        # Always [L, 2]
+        if hasattr(data, "lane_vectors"):
+            lv = data.lane_vectors
+            if not torch.is_tensor(lv):
+                data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
+            elif lv.numel() == 0:
+                data.lane_vectors = lv.reshape(0, 2)
+            elif lv.dim() != 2 or lv.size(-1) != 2:
+                raise ValueError(f"Bad lane_vectors shape: {tuple(lv.shape)}")
+
+        # Always [2, E]
+        if hasattr(data, "edge_index"):
+            ei = data.edge_index
+            if ei.numel() == 0:
+                data.edge_index = ei.reshape(2, 0)
+            elif ei.dim() == 1 and ei.size(0) == 2:
+                data.edge_index = ei.reshape(2, 1)
+            elif ei.dim() != 2 or ei.size(0) != 2:
+                raise ValueError(f"Bad edge_index shape: {tuple(ei.shape)}")
 
         return data
+
 
 
     # --------------------------------------------------
