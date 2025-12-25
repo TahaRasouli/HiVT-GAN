@@ -260,11 +260,13 @@ class TemporalEncoderLayer(nn.Module):
     def forward(self,
                 src: torch.Tensor,
                 src_mask: Optional[torch.Tensor] = None,
-                src_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                src_key_padding_mask: Optional[torch.Tensor] = None,
+                is_causal: bool = False) -> torch.Tensor:
         x = src
         x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask)
         x = x + self._ff_block(self.norm2(x))
         return x
+
 
     def _sa_block(self,
                   x: torch.Tensor,
