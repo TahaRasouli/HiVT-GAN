@@ -80,20 +80,20 @@ class NuScenesHiVTDataModule(LightningDataModule):
             self.train_dataset,
             batch_size=self.train_batch_size,
             shuffle=self.shuffle,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            collate_fn=NuScenesHiVTDataset.collate_fn,
+            num_workers=0,              # start with 0 for stability
+            pin_memory=False,           # critical
+            persistent_workers=False,   # critical
         )
+
 
     # --------------------------------------------------
     def val_dataloader(self):
         return DataLoader(
-            self.val_dataset,
-            batch_size=self.val_batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            collate_fn=NuScenesHiVTDataset.collate_fn,
+            self.train_dataset,
+            batch_size=self.train_batch_size,
+            shuffle=self.shuffle,
+            num_workers=0,              # start with 0 for stability
+            pin_memory=False,           # critical
+            persistent_workers=False,   # critical
         )
+
