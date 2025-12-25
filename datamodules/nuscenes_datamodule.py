@@ -22,7 +22,7 @@ class NuScenesHiVTDataModule(LightningDataModule):
         train_batch_size: int = 1,
         val_batch_size: int = 1,
         shuffle: bool = True,
-        num_workers: int = 8,
+        num_workers: int = 16,
         pin_memory: bool = True,
         persistent_workers: bool = True,
         train_transform: Optional[Callable] = None,
@@ -89,11 +89,9 @@ class NuScenesHiVTDataModule(LightningDataModule):
     # --------------------------------------------------
     def val_dataloader(self):
         return DataLoader(
-            self.train_dataset,
-            batch_size=self.train_batch_size,
-            shuffle=self.shuffle,
-            num_workers=0,              # start with 0 for stability
-            pin_memory=False,           # critical
-            persistent_workers=False,   # critical
+            self.val_dataset,
+            batch_size=self.val_batch_size,
+            shuffle=False,   # IMPORTANT
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
         )
-
