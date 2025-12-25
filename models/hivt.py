@@ -244,6 +244,8 @@ class HiVT(pl.LightningModule):
             # ---- supervised HiVT training (automatic optimization) ----
             y_hat, pi = self(data)
             reg_mask = ~data['padding_mask'][:, self.historical_steps:]
+            if reg_mask.sum() == 0:
+                return None
             valid_steps = reg_mask.sum(dim=-1)
             cls_mask = valid_steps > 0
             l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
@@ -253,13 +255,15 @@ class HiVT(pl.LightningModule):
             soft_target = F.softmax(-l2_norm[:, cls_mask] / valid_steps[cls_mask], dim=0).t().detach()
             cls_loss = self.cls_loss(pi[cls_mask], soft_target)
             loss = reg_loss + cls_loss
-            self.log("train_reg_loss", reg_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+            self.log("train_reg_loss", reg_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
             return loss
 
         # -------------------------
         # GAN training (manual optimization)
         # -------------------------
-        opt_g, opt_d = self.optimizers()
+        opts = self.optimizers()
+        opt_g = opts[0]
+        opt_d = opts[1] if len(opts) > 1 else None
 
         # 1) Forward generator
         y_hat, pi = self(data)
@@ -275,9 +279,9 @@ class HiVT(pl.LightningModule):
             self.manual_backward(g_total)
             opt_g.step()
 
-            self.log('train_reg_loss', reg_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+            self.log("train_reg_loss", reg_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
             self.log('train_cls_loss', cls_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-            self.log('train_g_total', g_total, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_g_total', g_total, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
             return
 
         # 2) Update critics multiple times
@@ -299,10 +303,10 @@ class HiVT(pl.LightningModule):
         opt_g.step()
 
         # Logging
-        self.log('train_reg_loss', reg_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log("train_reg_loss", reg_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
         self.log('train_cls_loss', cls_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_g_adv', g_adv, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('train_g_total', g_total, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_g_total', g_total, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
         self.log('train_d_loss', d_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
 
         for k, v in d_logs.items():
@@ -321,7 +325,7 @@ class HiVT(pl.LightningModule):
         best_mode = l2_norm.argmin(dim=0)
         y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
         reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
-        self.log('val_reg_loss', reg_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+        self.log('val_reg_loss', reg_loss, prog_bar=True, on_epoch=True, sync_dist=True)
 
         # Standard agent metrics
         y_hat_agent = y_hat[:, data['agent_index'], :, :2]
@@ -333,9 +337,9 @@ class HiVT(pl.LightningModule):
         self.minADE.update(y_hat_best_agent, y_agent)
         self.minFDE.update(y_hat_best_agent, y_agent)
         self.minMR.update(y_hat_best_agent, y_agent)
-        self.log('val_minADE', self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
-        self.log('val_minFDE', self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
-        self.log('val_minMR', self.minMR, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
+        self.log('val_minADE', self.minADE, prog_bar=True, on_epoch=True, sync_dist=True)
+        self.log('val_minFDE', self.minFDE, prog_bar=True, on_epoch=True, sync_dist=True)
+        self.log('val_minMR', self.minMR, prog_bar=True, on_epoch=True, sync_dist=True)
 
         # Optional realism metrics on the best agent trajectory
         if _HAS_REALISM_METRICS:
@@ -343,11 +347,38 @@ class HiVT(pl.LightningModule):
             self.val_speed_violation.update(y_hat_best_agent)
             self.val_endpoint_diversity.update(y_hat_agent)  # uses all modes for diversity
 
-            self.log('val_jerk', self.val_jerk, prog_bar=False, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
-            self.log('val_speed_violation', self.val_speed_violation, prog_bar=False, on_step=False, on_epoch=True,
-                     batch_size=y_agent.size(0))
-            self.log('val_endpoint_diversity', self.val_endpoint_diversity, prog_bar=False, on_step=False, on_epoch=True,
-                     batch_size=y_agent.size(0))
+            self.log('val_jerk', self.val_jerk, on_epoch=True, sync_dist=True)
+            self.log('val_speed_violation', self.val_speed_violation, on_epoch=True, sync_dist=True)
+            self.log('val_endpoint_diversity', self.val_endpoint_diversity, on_epoch=True, sync_dist=True)
+
+    def on_validation_epoch_end(self):
+        # callback_metrics contains epoch-aggregated values
+        metrics = self.trainer.callback_metrics
+
+        # IMPORTANT: only print on rank 0 (DDP-safe)
+        if self.global_rank == 0:
+            def _get(name):
+                val = metrics.get(name)
+                return float(val) if val is not None else float("nan")
+
+            msg = (
+                f"\nEpoch {self.current_epoch:03d} | "
+                f"train_reg_loss={_get('train_reg_loss'):.4f} | "
+                f"val_reg_loss={_get('val_reg_loss'):.4f} | "
+                f"val_minADE={_get('val_minADE'):.4f} | "
+                f"val_minFDE={_get('val_minFDE'):.4f} | "
+                f"val_minMR={_get('val_minMR'):.4f}"
+            )
+
+            if _HAS_REALISM_METRICS:
+                msg += (
+                    f" | jerk={_get('val_jerk'):.4f}"
+                    f" | speed_violation={_get('val_speed_violation'):.4f}"
+                    f" | diversity={_get('val_endpoint_diversity'):.4f}"
+                )
+
+            print(msg)
+
 
     # ---------------------------------------------------------
     # Optimizers
