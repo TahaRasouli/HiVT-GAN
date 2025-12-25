@@ -73,7 +73,8 @@ class HiVT(pl.LightningModule):
         self.T_max = T_max
 
         # GAN settings
-        self.use_gan = use_gan
+        self.use_gan = kwargs.get("use_gan", False)
+        self.automatic_optimization = not self.use_gan
         self.lambda_adv = lambda_adv
         self.lambda_r1 = lambda_r1
         self.critic_steps = critic_steps
@@ -240,12 +241,19 @@ class HiVT(pl.LightningModule):
         # Standard supervised training (no GAN)
         # -------------------------
         if not self.use_gan:
+            # ---- supervised HiVT training (automatic optimization) ----
             y_hat, pi = self(data)
-            reg_loss, cls_loss, _ = self._supervised_losses(data, y_hat, pi)
+            reg_mask = ~data['padding_mask'][:, self.historical_steps:]
+            valid_steps = reg_mask.sum(dim=-1)
+            cls_mask = valid_steps > 0
+            l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
+            best_mode = l2_norm.argmin(dim=0)
+            y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
+            reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
+            soft_target = F.softmax(-l2_norm[:, cls_mask] / valid_steps[cls_mask], dim=0).t().detach()
+            cls_loss = self.cls_loss(pi[cls_mask], soft_target)
             loss = reg_loss + cls_loss
-            self.log('train_reg_loss', reg_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
-            self.log('train_cls_loss', cls_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-            self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+            self.log("train_reg_loss", reg_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
             return loss
 
         # -------------------------
@@ -345,25 +353,45 @@ class HiVT(pl.LightningModule):
     # Optimizers
     # ---------------------------------------------------------
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.lr,
-            weight_decay=self.weight_decay,
+        # -------------------------
+        # Supervised (no GAN): 1 optimizer
+        # -------------------------
+        if not self.use_gan:
+            opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.T_max, eta_min=0.0)
+            return {
+                "optimizer": opt,
+                "lr_scheduler": {"scheduler": sch, "interval": "epoch"},
+            }
+
+        # -------------------------
+        # GAN: 2 optimizers (G and D)
+        # -------------------------
+        # Generator optimizer: only HiVT generator parameters
+        gen_params = []
+        gen_params += list(self.local_encoder.parameters())
+        gen_params += list(self.global_interactor.parameters())
+        gen_params += list(self.decoder.parameters())
+
+        opt_g = torch.optim.AdamW(gen_params, lr=self.lr, weight_decay=self.weight_decay)
+
+        # Discriminator/Critic optimizer: all critic parameters
+        # Adjust these attribute names to match your implementation
+        disc_params = []
+        disc_params += list(self.D_short.parameters())
+        disc_params += list(self.D_mid.parameters())
+        disc_params += list(self.D_long.parameters())
+
+        opt_d = torch.optim.AdamW(disc_params, lr=self.critic_lr, weight_decay=0.0)
+
+        # (Optional) scheduler only for generator, typically fine
+        sch_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=self.T_max, eta_min=0.0)
+
+        return (
+            [opt_g, opt_d],
+            [{"scheduler": sch_g, "interval": "epoch"}],
         )
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.T_max,
-            eta_min=0.0,
-        )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-            },
-        }
 
 
     # ---------------------------------------------------------
