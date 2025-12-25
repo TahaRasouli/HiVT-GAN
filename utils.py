@@ -39,14 +39,14 @@ class TemporalData(Data):
                 self[f'edge_attr_{t}'] = edge_attrs[t]
 
     def __inc__(self, key, value, store):
-        if key == 'edge_index':
+        if key == "edge_index":
             return self.num_nodes
 
-        if key == 'lane_actor_index':
-            return torch.tensor([
-                self.lane_vectors.size(0),
-                self.num_nodes
-            ])
+        if key == "lane_actor_index":
+            # Always return a (2,) tensor, even if E == 0
+            num_lanes = self.lane_vectors.size(0) if hasattr(self, "lane_vectors") else 0
+            num_nodes = self.num_nodes
+            return torch.tensor([num_lanes, num_nodes], device=value.device)
 
         return 0
 
