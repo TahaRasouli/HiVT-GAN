@@ -345,65 +345,26 @@ class HiVT(pl.LightningModule):
     # Optimizers
     # ---------------------------------------------------------
     def configure_optimizers(self):
-        # --- Generator optimizer (original grouping logic) ---
-        decay = set()
-        no_decay = set()
-        whitelist_weight_modules = (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.MultiheadAttention, nn.LSTM, nn.GRU)
-        blacklist_weight_modules = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm, nn.Embedding)
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
 
-        for module_name, module in self.named_modules():
-            for param_name, param in module.named_parameters():
-                full_param_name = f'{module_name}.{param_name}' if module_name else param_name
-                if 'bias' in param_name:
-                    no_decay.add(full_param_name)
-                elif 'weight' in param_name:
-                    if isinstance(module, whitelist_weight_modules):
-                        decay.add(full_param_name)
-                    elif isinstance(module, blacklist_weight_modules):
-                        no_decay.add(full_param_name)
-                elif not ('weight' in param_name or 'bias' in param_name):
-                    no_decay.add(full_param_name)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.T_max,
+            eta_min=0.0,
+        )
 
-        param_dict = {param_name: param for param_name, param in self.named_parameters()}
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            },
+        }
 
-        # If GAN enabled, exclude critics from generator param dict grouping
-        if self.use_gan:
-            critic_param_names = set()
-            for n, _ in self.D_short.named_parameters():
-                critic_param_names.add(f"D_short.{n}")
-            for n, _ in self.D_mid.named_parameters():
-                critic_param_names.add(f"D_mid.{n}")
-            for n, _ in self.D_long.named_parameters():
-                critic_param_names.add(f"D_long.{n}")
-
-            # Remove critic params from decay/no_decay
-            decay = {n for n in decay if n not in critic_param_names}
-            no_decay = {n for n in no_decay if n not in critic_param_names}
-
-        inter_params = decay & no_decay
-        union_params = decay | no_decay
-        assert len(inter_params) == 0
-        assert len(param_dict.keys() - union_params) == 0
-
-        optim_groups = [
-            {"params": [param_dict[param_name] for param_name in sorted(list(decay))],
-             "weight_decay": self.weight_decay},
-            {"params": [param_dict[param_name] for param_name in sorted(list(no_decay))],
-             "weight_decay": 0.0},
-        ]
-
-        opt_g = torch.optim.AdamW(optim_groups, lr=self.lr, weight_decay=self.weight_decay)
-        sch_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=self.T_max, eta_min=0.0)
-
-        if not self.use_gan:
-            return [opt_g], [sch_g]
-
-        # --- Critic optimizer (separate) ---
-        d_params = list(self.D_short.parameters()) + list(self.D_mid.parameters()) + list(self.D_long.parameters())
-        opt_d = torch.optim.AdamW(d_params, lr=self.critic_lr, weight_decay=0.0)
-
-        # No scheduler for critics by default (keeps things stable)
-        return [opt_g, opt_d], [sch_g]
 
     # ---------------------------------------------------------
     # Argparse
