@@ -10,7 +10,11 @@ from utils import TemporalData
 class NuScenesHiVTDataset(Dataset):
     """
     HiVT-compatible nuScenes dataset.
-    Assumes offline preprocessing to .pt TemporalData files.
+
+    Assumes offline preprocessing producing .pt TemporalData files:
+        root/
+            train_processed/
+            val_processed/
     """
 
     def __init__(
@@ -25,29 +29,37 @@ class NuScenesHiVTDataset(Dataset):
         self.root = root
         self.transform = transform
 
-        # IMPORTANT: use a private attribute (PyG already has processed_dir)
         self._processed_dir = os.path.join(self.root, self._directory)
         if not os.path.isdir(self._processed_dir):
             raise FileNotFoundError(f"Processed directory not found: {self._processed_dir}")
 
-        self.processed_paths = sorted(
-            os.path.join(self._processed_dir, f)
-            for f in os.listdir(self._processed_dir)
-            if f.endswith(".pt")
+        self._processed_file_names = sorted(
+            f for f in os.listdir(self._processed_dir) if f.endswith(".pt")
         )
 
         if max_samples is not None:
-            self.processed_paths = self.processed_paths[:max_samples]
+            self._processed_file_names = self._processed_file_names[:max_samples]
 
         super().__init__(root, transform=transform)
 
     # --------------------------------------------------
+    @property
+    def processed_dir(self) -> str:
+        return self._processed_dir
+
+    # --------------------------------------------------
+    @property
+    def processed_file_names(self) -> List[str]:
+        return self._processed_file_names
+
+    # --------------------------------------------------
     def len(self) -> int:
-        return len(self.processed_paths)
+        return len(self._processed_file_names)
 
     # --------------------------------------------------
     def get(self, idx: int) -> TemporalData:
-        data = torch.load(self.processed_paths[idx])
+        path = os.path.join(self.processed_dir, self._processed_file_names[idx])
+        data = torch.load(path)
         assert isinstance(data, TemporalData)
         return data
 
