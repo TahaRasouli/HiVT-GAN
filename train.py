@@ -2,6 +2,8 @@ from argparse import ArgumentParser
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.strategies import DDPStrategy
+
 
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.hivt import HiVT
@@ -57,16 +59,16 @@ def main():
     # -----------------------------
     # Trainer
     # -----------------------------
+    strategy = DDPStrategy(find_unused_parameters=True) if args.use_gan else "ddp"
+
     trainer = pl.Trainer(
-        accelerator="gpu" if args.devices > 0 else "cpu",
-        devices=args.devices,
-        strategy="ddp", 
+        accelerator="gpu",
+        devices=args.devices,       
+        strategy=strategy,
         max_epochs=args.max_epochs,
-        callbacks=[checkpoint_callback],
-        enable_checkpointing=True,
         log_every_n_steps=1,
-        num_sanity_val_steps=0,
     )
+
 
     # -----------------------------
     # Model

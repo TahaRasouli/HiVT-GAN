@@ -22,7 +22,7 @@ class NuScenesHiVTDataModule(LightningDataModule):
         train_batch_size: int = 1,
         val_batch_size: int = 1,
         shuffle: bool = True,
-        num_workers: int = 16,
+        num_workers: int = 8,
         pin_memory: bool = True,
         persistent_workers: bool = True,
         train_transform: Optional[Callable] = None,
