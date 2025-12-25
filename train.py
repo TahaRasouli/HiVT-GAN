@@ -58,7 +58,7 @@ def main():
     # Trainer
     # -----------------------------
     trainer = pl.Trainer(
-        accelerator="gpu" if args.gpus > 0 else "cpu",
+        accelerator="gpu" if args.devices > 0 else "cpu",
         devices=args.devices,
         strategy="ddp", 
         max_epochs=args.max_epochs,
