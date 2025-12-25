@@ -37,17 +37,6 @@ def main():
     )
     parser.add_argument("--save_top_k", type=int, default=5)
 
-    # -----------------------------
-    # GAN-related arguments
-    # -----------------------------
-    parser.add_argument("--use_gan", action="store_true",
-                        help="Enable adversarial training")
-    parser.add_argument("--lambda_adv", type=float, default=0.1,
-                        help="Generator adversarial loss weight")
-    parser.add_argument("--lambda_r1", type=float, default=1.0,
-                        help="R1 regularization weight")
-    parser.add_argument("--critic_steps", type=int, default=1,
-                        help="Number of critic updates per generator step")
 
     # -----------------------------
     # HiVT model arguments
