@@ -121,9 +121,10 @@ class HiVT(pl.LightningModule):
 
         # Optional realism metrics
         if _HAS_REALISM_METRICS:
-            self.val_jerk = Jerk(compute_on_step=False)
-            self.val_speed_violation = SpeedViolation(compute_on_step=False)
-            self.val_endpoint_diversity = EndpointDiversity(compute_on_step=False)
+            self.val_jerk = Jerk()
+            self.val_speed_violation = SpeedViolation()
+            self.val_endpoint_diversity = EndpointDiversity()
+
 
         # -------------------------
         # Critics + adversarial losses
