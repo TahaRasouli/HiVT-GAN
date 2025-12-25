@@ -245,7 +245,10 @@ class HiVT(pl.LightningModule):
             y_hat, pi = self(data)
             reg_mask = ~data['padding_mask'][:, self.historical_steps:]
             if reg_mask.sum() == 0:
-                return None
+                zero = torch.zeros((), device=self.device, requires_grad=True)
+                self.log("train_skip_batch", 1, on_step=True, prog_bar=False)
+                return zero
+
             valid_steps = reg_mask.sum(dim=-1)
             cls_mask = valid_steps > 0
             l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
@@ -275,6 +278,7 @@ class HiVT(pl.LightningModule):
         # If there are no valid actors with future, skip adversarial and train supervised only
         if real_trajs["long"].size(0) == 0:
             g_total = reg_loss + cls_loss
+
             opt_g.zero_grad()
             self.manual_backward(g_total)
             opt_g.step()
@@ -282,7 +286,7 @@ class HiVT(pl.LightningModule):
             self.log("train_reg_loss", reg_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
             self.log('train_cls_loss', cls_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
             self.log('train_g_total', g_total, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
-            return
+            return g_total
 
         # 2) Update critics multiple times
         for _ in range(self.critic_steps):
