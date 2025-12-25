@@ -58,7 +58,8 @@ def main():
     # Trainer
     # -----------------------------
     trainer = pl.Trainer(
-        gpus=args.gpus,
+        accelerator="gpu" if args.gpus > 0 else "cpu",
+        devices=args.gpus if args.gpus > 0 else 1,
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback],
         enable_checkpointing=True,
