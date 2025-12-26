@@ -260,8 +260,11 @@ class HiVT(pl.LightningModule):
     # ---------------------------------------------------------
     def training_step(self, data, batch_idx):
         # 1. Data Integrity Guard
+        # DDP Safe Guard: If data is bad, we must still return a tensor to keep GPUs in sync
         if torch.isnan(data.y).any():
-            return None 
+            # Return a 0 loss that is connected to the model parameters
+            # This keeps the DDP communication alive without changing weights
+            return self.dummy_loss_fn()
 
         # -----------------------------------------------------
         # Case A: Standard supervised training (no GAN)
