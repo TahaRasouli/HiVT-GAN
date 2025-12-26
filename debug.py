@@ -2,7 +2,7 @@ import torch
 from pytorch_lightning import Trainer
 
 from models.hivt import HiVT
-from datasets.nuscenes_datamodule import NuScenesHiVTDataModule
+from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 
 # --------------------------------------------------
 # CONFIG — KEEP THIS MINIMAL
