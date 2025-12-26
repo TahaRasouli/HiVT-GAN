@@ -259,62 +259,58 @@ class HiVT(pl.LightningModule):
     # Training step
     # ---------------------------------------------------------
     def training_step(self, data, batch_idx):
-            # --- FIX 1: Data Integrity Guard ---
-            if torch.isnan(data.y).any():
-                return None 
+        # 1. Data Integrity Guard
+        if torch.isnan(data.y).any():
+            return None 
 
-            # -------------------------
-            # Standard supervised training (no GAN)
-            # -------------------------
-            if not self.use_gan:
-                y_hat, pi = self(data)
-                
-                # --- FIX 2: Model Output Guard ---
-                if not torch.isfinite(y_hat).all():
-                    return None
-
-                reg_mask = ~data['padding_mask'][:, self.historical_steps:]
-                if reg_mask.sum() == 0:
-                    dummy_loss = y_hat.sum() * 0.0
-                    self.log("train_skip_batch", 1, on_step=True, prog_bar=False)
-                    return dummy_loss
-
-                valid_steps = reg_mask.sum(dim=-1)
-                cls_mask = valid_steps > 0
-                l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)
-                best_mode = l2_norm.argmin(dim=0)
-                y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
-                
-                reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
-                
-                # --- FIX 3: Added Epsilon to prevent division by zero ---
-                soft_target = F.softmax(-l2_norm[:, cls_mask] / (valid_steps[cls_mask] + 1e-6), dim=0).t().detach()
-                
-                cls_loss = self.cls_loss(pi[cls_mask], soft_target)
-                loss = reg_loss + cls_loss
-                
-                if torch.isfinite(reg_loss):
-                    self.log("train_reg_loss", reg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
-                else:
-                    self.log("train_reg_loss_nan", 1, on_step=True, prog_bar=False)
-
-                return loss
-
-            # -------------------------
-            # GAN training (manual optimization)
-            # -------------------------
-            # Apply the same "finite" checks here if self.use_gan is True
-            opts = self.optimizers()
-            opt_g = opts[0]
-            opt_d = opts[1] if len(opts) > 1 else None
-
+        # -----------------------------------------------------
+        # Case A: Standard supervised training (no GAN)
+        # -----------------------------------------------------
+        if not self.use_gan:
             y_hat, pi = self(data)
             
-            # Guard for GAN forward pass
             if not torch.isfinite(y_hat).all():
                 return None
 
-            reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
+            reg_mask = ~data['padding_mask'][:, self.historical_steps:]
+            if reg_mask.sum() == 0:
+                dummy_loss = y_hat.sum() * 0.0
+                self.log("train_skip_batch", 1, on_step=True, prog_bar=False)
+                return dummy_loss
+
+            valid_steps = reg_mask.sum(dim=-1)
+            cls_mask = valid_steps > 0
+            l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)
+            best_mode = l2_norm.argmin(dim=0)
+            y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
+            
+            reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
+            soft_target = F.softmax(-l2_norm[:, cls_mask] / (valid_steps[cls_mask] + 1e-6), dim=0).t().detach()
+            cls_loss = self.cls_loss(pi[cls_mask], soft_target)
+            
+            loss = reg_loss + cls_loss
+            
+            if torch.isfinite(reg_loss):
+                self.log("train_reg_loss", reg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
+            else:
+                self.log("train_reg_loss_nan", 1, on_step=True, prog_bar=False)
+
+            return loss
+
+        # -----------------------------------------------------
+        # Case B: GAN training (manual optimization)
+        # -----------------------------------------------------
+        opts = self.optimizers()
+        opt_g = opts[0]
+        opt_d = opts[1] if len(opts) > 1 else None
+
+        y_hat, pi = self(data)
+        
+        if not torch.isfinite(y_hat).all():
+            return None
+
+        # Calculate supervised components
+        reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
 
         # Build critic inputs
         real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
@@ -322,31 +318,18 @@ class HiVT(pl.LightningModule):
         # If there are no valid actors with future, skip adversarial and train supervised only
         if real_trajs["long"].size(0) == 0:
             g_total = reg_loss + cls_loss
-
             opt_g.zero_grad()
             self.manual_backward(g_total)
             opt_g.step()
-
+            
             if torch.isfinite(reg_loss):
-                self.log(
-                    "train_reg_loss",
-                    reg_loss,
-                    on_step=True,
-                    on_epoch=True,
-                    prog_bar=True,
-                    batch_size=data.num_graphs,
-                    sync_dist=True,
-                )
-            else:
-                self.log("train_reg_loss_nan", 1, on_step=True, prog_bar=False)
-            self.log('train_cls_loss', cls_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+                self.log("train_reg_loss", reg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
             self.log('train_g_total', g_total, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
             return g_total
 
-        # 2) Update critics multiple times
+        # 2) Update critics
         for _ in range(self.critic_steps):
             d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs)
-
             opt_d.zero_grad()
             self.manual_backward(d_loss)
             opt_d.step()
@@ -356,29 +339,18 @@ class HiVT(pl.LightningModule):
 
         # 4) Total generator loss
         g_total = reg_loss + cls_loss + g_adv
-
         opt_g.zero_grad()
         self.manual_backward(g_total)
         opt_g.step()
 
-        # Logging
+        # Logging for GAN mode
         if torch.isfinite(reg_loss):
-            self.log(
-                "train_reg_loss",
-                reg_loss,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                batch_size=data.num_graphs,
-                sync_dist=True,
-            )
-        else:
-            self.log("train_reg_loss_nan", 1, on_step=True, prog_bar=False)
-        self.log('train_cls_loss', cls_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('train_g_adv', g_adv, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log("train_reg_loss", reg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
+        
         self.log('train_g_total', g_total, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
         self.log('train_d_loss', d_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
 
+        # Log extra GAN metrics
         for k, v in d_logs.items():
             self.log(f"train_{k}", v, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         for k, v in g_logs.items():
