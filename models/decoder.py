@@ -120,9 +120,15 @@ class MLPDecoder(nn.Module):
                                 global_embed), dim=-1)).squeeze(-1).t()
         out = self.aggr_embed(torch.cat((global_embed, local_embed.expand(self.num_modes, *local_embed.shape)), dim=-1))
         loc = self.loc(out).view(self.num_modes, -1, self.future_steps, 2)  # [F, N, H, 2]
-        if self.uncertain:
-            scale = F.elu_(self.scale(out), alpha=1.0).view(self.num_modes, -1, self.future_steps, 2) + 1.0
-            scale = scale + self.min_scale  # [F, N, H, 2]
-            return torch.cat((loc, scale), dim=-1), pi  # [F, N, H, 4], [N, F]
+        if not self.uncertain:
+            scale_raw = self.scale(out)
+            scale = F.softplus(scale_raw).view(
+                self.num_modes, -1, self.future_steps, 2
+            )
+
+            scale = scale + self.min_scale  # e.g. 1e-3 or 1e-2
+
+            return torch.cat((loc, scale), dim=-1), pi     
+    
         else:
             return loc, pi  # [F, N, H, 2], [N, F]
