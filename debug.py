@@ -63,28 +63,40 @@ model = HiVT(
     critic_steps=1,
 )
 
+# ... (DataModule and Model setup remains the same)
+
 # --------------------------------------------------
-# Trainer — SANITY MODE
+# PRE-FLIGHT DATA CHECK
+# --------------------------------------------------
+train_loader = datamodule.train_dataloader()
+sample_batch = next(iter(train_loader))
+print(f"Checking first batch... y has NaNs: {torch.isnan(sample_batch.y).any()}")
+print(f"Checking first batch... x has NaNs: {torch.isnan(sample_batch.x).any()}")
+
+# --------------------------------------------------
+# Trainer — ENHANCED DEBUG MODE
 # --------------------------------------------------
 trainer = Trainer(
     accelerator="gpu",
-    devices=1,                 # SINGLE GPU ONLY
+    devices=1,
     max_epochs=1,
-
     limit_train_batches=LIMIT_TRAIN_BATCHES,
     limit_val_batches=LIMIT_VAL_BATCHES,
-
     log_every_n_steps=1,
     enable_checkpointing=False,
-    enable_progress_bar=True,
-    enable_model_summary=False,
+    # Use 32-bit precision to rule out underflow/overflow issues
+    precision=32, 
 )
 
 # --------------------------------------------------
-# RUN
+# RUN WITH ANOMALY DETECTION
 # --------------------------------------------------
-print("\n🚀 Running HiVT-GAN sanity check (5 train / 5 val batches)...\n")
+print("\n🚀 Running HiVT-GAN sanity check with Anomaly Detection...\n")
 
-trainer.fit(model, datamodule)
-
-print("\n✅ Sanity check finished successfully\n")
+# This will identify the exact line in losses.py or hivt.py causing NaNs
+try:
+    with torch.autograd.set_detect_anomaly(True):
+        trainer.fit(model, datamodule)
+    print("\n✅ Sanity check finished successfully (No NaNs detected)\n")
+except Exception as e:
+    print(f"\n❌ Sanity check failed with error:\n{e}\n")
