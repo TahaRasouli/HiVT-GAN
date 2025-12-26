@@ -16,6 +16,9 @@ class LaplaceNLLLoss(nn.Module):
                 target: torch.Tensor) -> torch.Tensor:
         loc, scale = pred.chunk(2, dim=-1)
         scale = scale.clone()
+        if not torch.isfinite(scale).all():
+            scale = torch.ones_like(scale)
+
         with torch.no_grad():
             scale.clamp_(min=self.eps)
         nll = torch.log(2 * scale) + torch.abs(target - loc) / scale

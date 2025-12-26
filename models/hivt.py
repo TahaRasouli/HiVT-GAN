@@ -173,19 +173,42 @@ class HiVT(pl.LightningModule):
     # ---------------------------------------------------------
     def _supervised_losses(self, data: TemporalData, y_hat: torch.Tensor, pi: torch.Tensor):
         reg_mask = ~data['padding_mask'][:, self.historical_steps:]  # [N, H]
-        valid_steps = reg_mask.sum(dim=-1)                           # [N]
+
+        # ⚠️ CRITICAL FIX: never return None
+        if reg_mask.sum() == 0:
+            zero = y_hat.sum() * 0.0
+            best_mode = torch.zeros(
+                data.num_nodes,
+                dtype=torch.long,
+                device=y_hat.device,
+            )
+            return zero, zero, best_mode
+
+        valid_steps = reg_mask.sum(dim=-1)
         cls_mask = valid_steps > 0
 
-        l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
+        l2_norm = (
+            torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1)
+            * reg_mask
+        ).sum(dim=-1)  # [F, N]
+
         best_mode = l2_norm.argmin(dim=0)
         y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
 
-        reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
+        reg_loss = self.reg_loss(
+            y_hat_best[reg_mask],
+            data.y[reg_mask]
+        )
 
-        soft_target = F.softmax(-l2_norm[:, cls_mask] / valid_steps[cls_mask], dim=0).t().detach()
+        soft_target = F.softmax(
+            -l2_norm[:, cls_mask] / valid_steps[cls_mask],
+            dim=0
+        ).t().detach()
+
         cls_loss = self.cls_loss(pi[cls_mask], soft_target)
 
         return reg_loss, cls_loss, best_mode
+
 
     # ---------------------------------------------------------
     # Helper: build critic inputs
@@ -245,9 +268,11 @@ class HiVT(pl.LightningModule):
             y_hat, pi = self(data)
             reg_mask = ~data['padding_mask'][:, self.historical_steps:]
             if reg_mask.sum() == 0:
-                zero = torch.zeros((), device=self.device, requires_grad=True)
+                # Safe no-op loss that keeps DDP in sync
+                dummy_loss = y_hat.sum() * 0.0
                 self.log("train_skip_batch", 1, on_step=True, prog_bar=False)
-                return zero
+                return dummy_loss
+
 
             valid_steps = reg_mask.sum(dim=-1)
             cls_mask = valid_steps > 0
