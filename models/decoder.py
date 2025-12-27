@@ -113,22 +113,30 @@ class MLPDecoder(nn.Module):
             nn.Linear(self.hidden_size, 1))
         self.apply(init_weights)
 
-    def forward(self,
-                local_embed: torch.Tensor,
-                global_embed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        pi = self.pi(torch.cat((local_embed.expand(self.num_modes, *local_embed.shape),
-                                global_embed), dim=-1)).squeeze(-1).t()
-        out = self.aggr_embed(torch.cat((global_embed, local_embed.expand(self.num_modes, *local_embed.shape)), dim=-1))
-        loc = self.loc(out).view(self.num_modes, -1, self.future_steps, 2)  # [F, N, H, 2]
-        if not self.uncertain:
-            scale_raw = self.scale(out)
-            scale = F.softplus(scale_raw).view(
-                self.num_modes, -1, self.future_steps, 2
+    def forward(
+        self,
+        local_embed: torch.Tensor,
+        global_embed: torch.Tensor):
+        pi = self.pi(torch.cat((local_embed.expand(self.num_modes, *local_embed.shape), global_embed), dim=-1)).squeeze(-1).t()
+
+        out = self.aggr_embed(
+            torch.cat(
+                (global_embed, local_embed.expand(self.num_modes, *local_embed.shape)),
+                dim=-1
             )
+                            )
 
-            scale = scale + self.min_scale  # e.g. 1e-3 or 1e-2
+        loc = self.loc(out).view(self.num_modes, -1, self.future_steps, 2)
 
-            return torch.cat((loc, scale), dim=-1), pi     
-    
+        if self.uncertain:
+            # ✅ Stable probabilistic head
+            scale = F.elu(self.scale(out), alpha=1.0) + 1.0
+            scale = scale.view(self.num_modes, -1, self.future_steps, 2)
+            scale = torch.clamp(scale, min=0.05)
+
+            return torch.cat((loc, scale), dim=-1), pi
         else:
-            return loc, pi  # [F, N, H, 2], [N, F]
+            return loc, pi
+
+            # e.g. 1e-3 or 1e-2
+            # [F, N, H, 2], [N, F]
