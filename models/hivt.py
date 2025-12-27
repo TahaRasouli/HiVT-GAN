@@ -366,11 +366,21 @@ class HiVT(pl.LightningModule):
         y_hat, pi = self(data)
 
         reg_mask = ~data['padding_mask'][:, self.historical_steps:]
-        l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
+        
+        # --- CRITICAL SAFETY CHECK ---
+        if reg_mask.sum() == 0:
+            # If there are no valid future steps to evaluate, don't log reg_loss
+            return 
+
+        # Calculate L2 for mode selection
+        l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)
         best_mode = l2_norm.argmin(dim=0)
         y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
+        # Calculate Regression Loss
         reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
-        self.log('val_reg_loss', reg_loss, prog_bar=True, on_epoch=True, sync_dist=True)
+        
+        if torch.isfinite(reg_loss):
+            self.log('val_reg_loss', reg_loss, prog_bar=True, on_epoch=True, sync_dist=True)
 
         # Standard agent metrics
         y_hat_agent = y_hat[:, data['agent_index'], :, :2]
