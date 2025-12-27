@@ -261,19 +261,18 @@ class HiVT(pl.LightningModule):
     def training_step(self, data, batch_idx):
         # 1. Data Integrity Guard
         # DDP Safe Guard: If data is bad, we must still return a tensor to keep GPUs in sync
+        # 1. Data Integrity Guard - Always return a dummy to keep DDP rings alive
         if torch.isnan(data.y).any():
-            # Return a 0 loss that is connected to the model parameters
-            # This keeps the DDP communication alive without changing weights
-            return self.dummy_loss_fn()
+            return self.local_encoder.parameters().__next__().sum() * 0.0
 
         # -----------------------------------------------------
         # Case A: Standard supervised training (no GAN)
         # -----------------------------------------------------
         if not self.use_gan:
+            # Case A: Standard supervised code... (keep as is, but use the dummy return instead of None)
             y_hat, pi = self(data)
-            
             if not torch.isfinite(y_hat).all():
-                return None
+                return self.local_encoder.parameters().__next__().sum() * 0.0
 
             reg_mask = ~data['padding_mask'][:, self.historical_steps:]
             if reg_mask.sum() == 0:
@@ -304,55 +303,45 @@ class HiVT(pl.LightningModule):
         # Case B: GAN training (manual optimization)
         # -----------------------------------------------------
         opts = self.optimizers()
-        opt_g = opts[0]
-        opt_d = opts[1] if len(opts) > 1 else None
+        opt_g, opt_d = opts[0], opts[1]
 
         y_hat, pi = self(data)
         
         if not torch.isfinite(y_hat).all():
-            return None
+            return self.local_encoder.parameters().__next__().sum() * 0.0
 
-        # Calculate supervised components
         reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
-
-        # Build critic inputs
         real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
 
-        # If there are no valid actors with future, skip adversarial and train supervised only
-        has_valid_local = real_trajs["long"].size(0) > 0
+        # REMOVED: self.trainer.strategy.broadcast (Causes hangs)
+        # NEW: Local check. If this specific GPU has no valid trajectories, 
+        # it will still participate in the backward pass but with 0 values.
+        has_valid = real_trajs["long"].size(0) > 0
 
-        # Synchronize decision across all GPUs
-        has_valid = self.trainer.strategy.broadcast(has_valid_local)
-
-        # In case of NO valid future trajectories
         if not has_valid:
             g_total = reg_loss + cls_loss
-
             opt_g.zero_grad()
             self.manual_backward(g_total)
             opt_g.step()
-
-            self.log(
-                "train_reg_loss",
-                reg_loss,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                batch_size=data.num_graphs,
-                sync_dist=True,
-            )
-
-            self.log(
-                "train_g_total",
-                g_total,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                batch_size=data.num_graphs,
-                sync_dist=True,
-            )
-
             return g_total
+
+        # 2) Update critics
+        d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs)
+        opt_d.zero_grad()
+        self.manual_backward(d_loss)
+        opt_d.step()
+
+        # 3) Generator adversarial loss
+        g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
+
+        # 4) Total generator loss
+        g_total = reg_loss + cls_loss + g_adv
+        opt_g.zero_grad()
+        self.manual_backward(g_total)
+        opt_g.step()
+
+        # Logging... (keep your existing sync_dist=True logging)
+        return g_total
 
         # 2) Update critics
         for _ in range(self.critic_steps):

@@ -59,15 +59,16 @@ def main():
     # -----------------------------
     # Trainer
     # -----------------------------
+    # train.py
+    strategy = DDPStrategy(find_unused_parameters=True) # Always True for GANs
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        devices=args.devices,       
-        strategy=pl.strategies.DDPStrategy(
-        find_unused_parameters=False
-        ),
+        devices=args.devices,
+        strategy=strategy,
+        # Add gradient clipping here for GAN stability
+        gradient_clip_val=0.5,
         max_epochs=args.max_epochs,
-        log_every_n_steps=1,
     )
 
 
