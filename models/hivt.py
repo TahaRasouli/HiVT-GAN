@@ -182,7 +182,7 @@ class HiVT(pl.LightningModule):
                 dtype=torch.long,
                 device=y_hat.device,
             )
-            return zero, zero, best_mode
+            return zero, best_mode
 
         valid_steps = reg_mask.sum(dim=-1)
         cls_mask = valid_steps > 0
@@ -319,15 +319,39 @@ class HiVT(pl.LightningModule):
         real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
 
         # If there are no valid actors with future, skip adversarial and train supervised only
-        if real_trajs["long"].size(0) == 0:
+        has_valid_local = real_trajs["long"].size(0) > 0
+
+        # Synchronize decision across all GPUs
+        has_valid = self.trainer.strategy.broadcast(has_valid_local)
+
+        # In case of NO valid future trajectories
+        if not has_valid:
             g_total = reg_loss + cls_loss
+
             opt_g.zero_grad()
             self.manual_backward(g_total)
             opt_g.step()
-            
-            if torch.isfinite(reg_loss):
-                self.log("train_reg_loss", reg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
-            self.log('train_g_total', g_total, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+
+            self.log(
+                "train_reg_loss",
+                reg_loss,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=data.num_graphs,
+                sync_dist=True,
+            )
+
+            self.log(
+                "train_g_total",
+                g_total,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=data.num_graphs,
+                sync_dist=True,
+            )
+
             return g_total
 
         # 2) Update critics

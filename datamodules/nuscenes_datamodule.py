@@ -94,4 +94,5 @@ class NuScenesHiVTDataModule(LightningDataModule):
             shuffle=False,   # IMPORTANT
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=False
         )
