@@ -59,12 +59,13 @@ def main():
     # -----------------------------
     # Trainer
     # -----------------------------
-    strategy = DDPStrategy(find_unused_parameters=True) if args.use_gan else "ddp"
 
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=args.devices,       
-        strategy=strategy,
+        strategy=pl.strategies.DDPStrategy(
+        find_unused_parameters=False
+        ),
         max_epochs=args.max_epochs,
         log_every_n_steps=1,
     )

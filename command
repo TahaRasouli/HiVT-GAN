@@ -1,0 +1,1 @@
+python train.py   --root /mount/arbeitsdaten/analysis/rasoulta/nuscenes/nuscenes-hivt/   --embed_dim 128   --devices 2   --max_epochs 30   --use_gan   --lambda_adv 0.01   --lambda_r1 10.0  --critic_steps 1
