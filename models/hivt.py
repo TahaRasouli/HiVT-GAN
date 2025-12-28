@@ -259,118 +259,87 @@ class HiVT(pl.LightningModule):
     # Training step
     # ---------------------------------------------------------
     def training_step(self, data, batch_idx):
-        # 1. Data Integrity Guard
-        # DDP Safe Guard: If data is bad, we must still return a tensor to keep GPUs in sync
-        # 1. Data Integrity Guard - Always return a dummy to keep DDP rings alive
-        if torch.isnan(data.y).any():
-            return self.local_encoder.parameters().__next__().sum() * 0.0
+            # 1. Global Data Integrity Guard
+            # We return a dummy value to keep all GPUs in the NCCL ring synchronized.
+            if torch.isnan(data.y).any():
+                return self.local_encoder.parameters().__next__().sum() * 0.0
 
-        # -----------------------------------------------------
-        # Case A: Standard supervised training (no GAN)
-        # -----------------------------------------------------
-        if not self.use_gan:
-            # Case A: Standard supervised code... (keep as is, but use the dummy return instead of None)
+            # -----------------------------------------------------
+            # Case A: Standard supervised training (no GAN)
+            # -----------------------------------------------------
+            if not self.use_gan:
+                y_hat, pi = self(data)
+                if not torch.isfinite(y_hat).all():
+                    return self.local_encoder.parameters().__next__().sum() * 0.0
+
+                reg_mask = ~data['padding_mask'][:, self.historical_steps:]
+                if reg_mask.sum() == 0:
+                    return y_hat.sum() * 0.0
+
+                # Calculate metrics/loss for Case A
+                reg_loss, cls_loss, _ = self._supervised_losses(data, y_hat, pi)
+                loss = reg_loss + cls_loss
+
+                if torch.isfinite(loss):
+                    self.log("train_reg_loss", reg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
+                return loss
+
+            # -----------------------------------------------------
+            # Case B: GAN training (Manual Optimization)
+            # -----------------------------------------------------
+            opts = self.optimizers()
+            opt_g, opt_d = opts[0], opts[1]
+
             y_hat, pi = self(data)
             if not torch.isfinite(y_hat).all():
                 return self.local_encoder.parameters().__next__().sum() * 0.0
 
-            reg_mask = ~data['padding_mask'][:, self.historical_steps:]
-            if reg_mask.sum() == 0:
-                dummy_loss = y_hat.sum() * 0.0
-                self.log("train_skip_batch", 1, on_step=True, prog_bar=False)
-                return dummy_loss
+            # Calculate supervised components
+            reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
+            real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
 
-            valid_steps = reg_mask.sum(dim=-1)
-            cls_mask = valid_steps > 0
-            l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)
-            best_mode = l2_norm.argmin(dim=0)
-            y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
-            
-            reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
-            soft_target = F.softmax(-l2_norm[:, cls_mask] / (valid_steps[cls_mask] + 1e-6), dim=0).t().detach()
-            cls_loss = self.cls_loss(pi[cls_mask], soft_target)
-            
-            loss = reg_loss + cls_loss
-            
-            if torch.isfinite(reg_loss):
-                self.log("train_reg_loss", reg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
+            # Safety: Every rank must participate in ALL backward/step calls to avoid deadlocks
+            has_valid = (real_trajs["long"].size(0) > 0)
+
+            # 2) Update critics (Discriminator)
+            for _ in range(self.critic_steps):
+                if has_valid:
+                    d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs)
+                else:
+                    d_loss = y_hat.sum() * 0.0
+                    d_logs = {}
+
+                opt_d.zero_grad()
+                self.manual_backward(d_loss)
+                opt_d.step()
+
+            # 3) Generator adversarial loss
+            if has_valid:
+                g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
             else:
-                self.log("train_reg_loss_nan", 1, on_step=True, prog_bar=False)
+                g_adv = y_hat.sum() * 0.0
+                g_logs = {}
 
-            return loss
-
-        # -----------------------------------------------------
-        # Case B: GAN training (manual optimization)
-        # -----------------------------------------------------
-        opts = self.optimizers()
-        opt_g, opt_d = opts[0], opts[1]
-
-        y_hat, pi = self(data)
-        
-        if not torch.isfinite(y_hat).all():
-            return self.local_encoder.parameters().__next__().sum() * 0.0
-
-        reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
-        real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
-
-        # REMOVED: self.trainer.strategy.broadcast (Causes hangs)
-        # NEW: Local check. If this specific GPU has no valid trajectories, 
-        # it will still participate in the backward pass but with 0 values.
-        has_valid = real_trajs["long"].size(0) > 0
-
-        if not has_valid:
-            g_total = reg_loss + cls_loss
+            # 4) Total generator loss
+            g_total = reg_loss + cls_loss + g_adv
             opt_g.zero_grad()
             self.manual_backward(g_total)
             opt_g.step()
+
+            # Logging (Rank 0 and Rank 1 both log, sync_dist averages them)
+            if has_valid:
+                if torch.isfinite(reg_loss):
+                    self.log("train_reg_loss", reg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
+                
+                self.log('train_g_total', g_total, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                self.log('train_d_loss', d_loss, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+
+                for k, v in d_logs.items():
+                    self.log(f"train_{k}", v, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+                for k, v in g_logs.items():
+                    self.log(f"train_{k}", v, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+
             return g_total
-
-        # 2) Update critics
-        d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs)
-        opt_d.zero_grad()
-        self.manual_backward(d_loss)
-        opt_d.step()
-
-        # 3) Generator adversarial loss
-        g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
-
-        # 4) Total generator loss
-        g_total = reg_loss + cls_loss + g_adv
-        opt_g.zero_grad()
-        self.manual_backward(g_total)
-        opt_g.step()
-
-        # Logging... (keep your existing sync_dist=True logging)
-        return g_total
-
-        # 2) Update critics
-        for _ in range(self.critic_steps):
-            d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs)
-            opt_d.zero_grad()
-            self.manual_backward(d_loss)
-            opt_d.step()
-
-        # 3) Generator adversarial loss
-        g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
-
-        # 4) Total generator loss
-        g_total = reg_loss + cls_loss + g_adv
-        opt_g.zero_grad()
-        self.manual_backward(g_total)
-        opt_g.step()
-
-        # Logging for GAN mode
-        if torch.isfinite(reg_loss):
-            self.log("train_reg_loss", reg_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
-        
-        self.log('train_g_total', g_total, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
-        self.log('train_d_loss', d_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-
-        # Log extra GAN metrics
-        for k, v in d_logs.items():
-            self.log(f"train_{k}", v, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        for k, v in g_logs.items():
-            self.log(f"train_{k}", v, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
 
     # ---------------------------------------------------------
     # Validation (unchanged + optional realism metrics)
