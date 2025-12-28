@@ -3,10 +3,14 @@ from argparse import ArgumentParser
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
+import torch
 
 
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.hivt import HiVT
+
+# gives a significant speed boost on Nvidia-A6000
+torch.set_float32_matmul_precision('medium') # or 'high'
 
 
 def main():
@@ -25,6 +29,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--pin_memory", type=bool, default=True)
     parser.add_argument("--persistent_workers", type=bool, default=True)
+    parser.add_argument("--ckpt_path", type=str, default=None)
+
 
     # -----------------------------
     # Training arguments
@@ -93,7 +99,7 @@ def main():
     # -----------------------------
     # Train
     # -----------------------------
-    trainer.fit(model, datamodule)
+    trainer.fit(model, datamodule, ckpt_path=args.ckpt_path)
 
 
 if __name__ == "__main__":
