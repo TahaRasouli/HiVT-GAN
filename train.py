@@ -82,24 +82,30 @@ def main():
     # -----------------------------
     model = HiVT(**vars(args))
 
-    # Determine if we are doing a "Weights-Only" load or a "Full Resume"
-    # If the checkpoint is from a non-GAN run, we must load weights only.
-    is_warm_start = False
+    # We use a temporary variable to hold the path for manual loading
+    manual_ckpt_path = args.ckpt_path
     
-    if args.ckpt_path and args.use_gan:
-        print(f"--- Performing Warm Start from {args.ckpt_path} ---")
-        # Load to CPU first to avoid OOM before DDP starts
-        ckpt = torch.load(args.ckpt_path, map_location="cpu")
+    # We must set this to None so the Trainer doesn't try to resume optimizers
+    # from a non-GAN checkpoint.
+    actual_fit_path = None
+
+    if manual_ckpt_path and args.use_gan:
+        print(f"--- Manual weight loading from {manual_ckpt_path} ---")
+        # Load to CPU first to avoid memory spikes
+        ckpt = torch.load(manual_ckpt_path, map_location="cpu")
         
-        # Check if this checkpoint has GAN critics. If not, we MUST use strict=False
-        has_critics = any("D_short" in k for k in ckpt['state_dict'].keys())
+        # Check if it's a GAN checkpoint or original HiVT
+        is_gan_ckpt = any("D_short" in k for k in ckpt['state_dict'].keys())
         
-        if not has_critics:
-            print("Target checkpoint is non-GAN. Loading backbone weights only.")
+        if not is_gan_ckpt:
+            # ORIGINAL HiVT CHECKPOINT: Load weights only, optimizers start fresh
+            print("Detected non-GAN checkpoint. Loading backbone weights with strict=False.")
             model.load_state_dict(ckpt['state_dict'], strict=False)
-            is_warm_start = True
+            actual_fit_path = None 
         else:
-            print("Target checkpoint is a GAN run. Trainer will resume fully.")
+            # GAN CHECKPOINT: We can safely let Lightning handle the full resume
+            print("Detected GAN checkpoint. Enabling full state restoration.")
+            actual_fit_path = manual_ckpt_path
 
     # -----------------------------
     # DataModule
@@ -121,7 +127,7 @@ def main():
     # If it's a standard resume, we pass the original path.
     fit_ckpt = None if is_warm_start else args.ckpt_path
 
-    trainer.fit(model, datamodule, ckpt_path=args.ckpt_path)
-
+    trainer.fit(model, datamodule, ckpt_path=actual_fit_path)
+    
 if __name__ == "__main__":
     main()
