@@ -82,30 +82,29 @@ def main():
     # -----------------------------
     model = HiVT(**vars(args))
 
-    # We use a temporary variable to hold the path for manual loading
-    manual_ckpt_path = args.ckpt_path
-    
-    # We must set this to None so the Trainer doesn't try to resume optimizers
-    # from a non-GAN checkpoint.
-    actual_fit_path = None
+    is_warm_start = False
+    actual_fit_path = args.ckpt_path
 
-    if manual_ckpt_path and args.use_gan:
-        print(f"--- Manual weight loading from {manual_ckpt_path} ---")
-        # Load to CPU first to avoid memory spikes
-        ckpt = torch.load(manual_ckpt_path, map_location="cpu")
+    if args.ckpt_path and args.use_gan:
+        print(f"--- Checking checkpoint: {args.ckpt_path} ---")
+        # Load to CPU first to avoid DDP memory spikes
+        ckpt = torch.load(args.ckpt_path, map_location="cpu")
         
-        # Check if it's a GAN checkpoint or original HiVT
-        is_gan_ckpt = any("D_short" in k for k in ckpt['state_dict'].keys())
+        # Check if this checkpoint already contains GAN critic weights
+        has_critics = any("D_short" in k for k in ckpt['state_dict'].keys())
         
-        if not is_gan_ckpt:
-            # ORIGINAL HiVT CHECKPOINT: Load weights only, optimizers start fresh
-            print("Detected non-GAN checkpoint. Loading backbone weights with strict=False.")
+        if not has_critics:
+            print("Detected non-GAN checkpoint. Performing manual weight load (strict=False).")
+            # This loads HiVT backbone and leaves Critics randomly initialized
             model.load_state_dict(ckpt['state_dict'], strict=False)
+            
+            # This is the "magic" fix:
+            # We tell Lightning NOT to resume, so it doesn't look for old optimizers
+            is_warm_start = True
             actual_fit_path = None 
         else:
-            # GAN CHECKPOINT: We can safely let Lightning handle the full resume
-            print("Detected GAN checkpoint. Enabling full state restoration.")
-            actual_fit_path = manual_ckpt_path
+            print("Detected GAN checkpoint. Proceeding with full training state restoration.")
+            actual_fit_path = args.ckpt_path
 
     # -----------------------------
     # DataModule
@@ -125,9 +124,7 @@ def main():
     # -----------------------------
     # If it was a warm start, we pass None to ckpt_path so optimizers start fresh.
     # If it's a standard resume, we pass the original path.
-    fit_ckpt = None if is_warm_start else args.ckpt_path
-
     trainer.fit(model, datamodule, ckpt_path=actual_fit_path)
-    
+
 if __name__ == "__main__":
     main()
