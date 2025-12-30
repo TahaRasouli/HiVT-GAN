@@ -83,6 +83,13 @@ def main():
     # -----------------------------
     model = HiVT(**vars(args))
 
+    if args.ckpt_path:
+        print(f"--- Loading weights from {args.ckpt_path} (Strict=False for GAN transition) ---")
+        # This loads the weights for the LocalEncoder, GlobalInteractor, and Decoder
+        # It will ignore the missing Critic weights
+        checkpoint = torch.load(args.ckpt_path, map_location=model.device)
+        model.load_state_dict(checkpoint['state_dict'], strict=False)
+
     # -----------------------------
     # DataModule
     # -----------------------------
@@ -99,7 +106,7 @@ def main():
     # -----------------------------
     # Train
     # -----------------------------
-    trainer.fit(model, datamodule, ckpt_path=args.ckpt_path)
+    trainer.fit(model, datamodule)
 
 
 if __name__ == "__main__":
