@@ -65,7 +65,6 @@ def main():
     # -----------------------------
     # Trainer
     # -----------------------------
-    # train.py
     strategy = DDPStrategy(find_unused_parameters=True) # Always True for GANs
 
     trainer = pl.Trainer(
@@ -83,14 +82,24 @@ def main():
     # -----------------------------
     model = HiVT(**vars(args))
 
+    # Determine if we are doing a "Weights-Only" load or a "Full Resume"
+    # If the checkpoint is from a non-GAN run, we must load weights only.
+    is_warm_start = False
+    
     if args.ckpt_path and args.use_gan:
-        # Manual weight loading to bridge the non-GAN -> GAN gap
-        print(f"Loading pre-trained HiVT weights from {args.ckpt_path}")
-        ckpt = torch.load(args.ckpt_path, map_location=model.device)
-        # strict=False is KEY: it loads HiVT weights and ignores missing Critic weights
-        model.load_state_dict(ckpt['state_dict'], strict=False)
-        # We clear ckpt_path so trainer.fit doesn't try to restore optimizers
-        args.ckpt_path = None
+        print(f"--- Performing Warm Start from {args.ckpt_path} ---")
+        # Load to CPU first to avoid OOM before DDP starts
+        ckpt = torch.load(args.ckpt_path, map_location="cpu")
+        
+        # Check if this checkpoint has GAN critics. If not, we MUST use strict=False
+        has_critics = any("D_short" in k for k in ckpt['state_dict'].keys())
+        
+        if not has_critics:
+            print("Target checkpoint is non-GAN. Loading backbone weights only.")
+            model.load_state_dict(ckpt['state_dict'], strict=False)
+            is_warm_start = True
+        else:
+            print("Target checkpoint is a GAN run. Trainer will resume fully.")
 
     # -----------------------------
     # DataModule
@@ -108,6 +117,10 @@ def main():
     # -----------------------------
     # Train
     # -----------------------------
+    # If it was a warm start, we pass None to ckpt_path so optimizers start fresh.
+    # If it's a standard resume, we pass the original path.
+    fit_ckpt = None if is_warm_start else args.ckpt_path
+
     trainer.fit(model, datamodule, ckpt_path=args.ckpt_path)
 
 if __name__ == "__main__":
