@@ -3,24 +3,9 @@ from .base_critic import BaseTrajectoryCritic
 
 
 class LongScaleCritic(BaseTrajectoryCritic):
-    """
-    Full-horizon critic
-    Focus: goal realism, intent consistency
-    """
+    """Focuses on the full horizon. Target: Goal reached/Intent."""
+    def __init__(self, horizon=None, **kwargs):
+        super().__init__(input_dim=4, hidden_dim=256, num_layers=4)
 
-    def __init__(
-        self,
-        horizon: int,
-        input_dim: int = 2,
-        hidden_dim: int = 256,
-    ):
-        self.horizon = horizon
-        super().__init__(
-            input_dim=horizon * input_dim,
-            hidden_dim=hidden_dim,
-            num_layers=4,
-        )
-
-    def forward(self, traj: torch.Tensor) -> torch.Tensor:
-        traj = traj[:, : self.horizon]
+    def forward(self, traj: torch.Tensor):
         return super().forward(traj)

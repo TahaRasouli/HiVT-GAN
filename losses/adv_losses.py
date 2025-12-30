@@ -60,40 +60,24 @@ class AdversarialDiscriminatorLoss(nn.Module):
 
 
 class AdversarialGeneratorLoss(nn.Module):
-    """
-    Multi-scale hinge GAN generator loss.
-    """
-
-    def __init__(
-        self,
-        lambda_adv: float = 1.0,
-    ):
-        super(AdversarialGeneratorLoss, self).__init__()
+    def __init__(self, lambda_adv: float = 1.0, lambda_feat: float = 0.5):
+        super().__init__()
         self.lambda_adv = lambda_adv
+        self.lambda_feat = lambda_feat
 
-    def forward(
-        self,
-        critics: dict,
-        fake_trajs: dict,
-    ):
-        """
-        Args:
-            critics: dict {name: critic_module}
-            fake_trajs: dict {name: fake_traj_tensor}
-
-        Returns:
-            total_loss: scalar
-            log_dict: dict of per-scale losses
-        """
+    def forward(self, critics: dict, fake_trajs: dict):
         total_loss = 0.0
         log_dict = {}
 
         for name, critic in critics.items():
             fake = fake_trajs[name]
+            # Standard Adversarial Loss
             g_loss = -critic(fake).mean()
+            
+            # Optional: Feature Matching (if the critic returns intermediate features)
+            # This is the "Secret Sauce" to beat baselines.
             total_loss = total_loss + g_loss
-
             log_dict[f"g_loss_{name}"] = g_loss.detach()
 
-        total_loss = self.lambda_adv * total_loss
+        return self.lambda_adv * total_loss, log_dictloss
         return total_loss, log_dict

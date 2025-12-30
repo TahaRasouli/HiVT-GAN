@@ -3,24 +3,10 @@ from .base_critic import BaseTrajectoryCritic
 
 
 class MidScaleCritic(BaseTrajectoryCritic):
-    """
-    Mid-horizon critic (e.g., first 20 steps)
-    Focus: interaction realism
-    """
-
-    def __init__(
-        self,
-        horizon: int = 20,
-        input_dim: int = 2,
-        hidden_dim: int = 256,
-    ):
+    """Focuses on the first 30 steps (0-3 sec). Target: Lane following/Flow."""
+    def __init__(self, horizon=30, **kwargs):
+        super().__init__(input_dim=4, hidden_dim=256, num_layers=3)
         self.horizon = horizon
-        super().__init__(
-            input_dim=horizon * input_dim,
-            hidden_dim=hidden_dim,
-            num_layers=3,
-        )
 
-    def forward(self, traj: torch.Tensor) -> torch.Tensor:
-        traj = traj[:, : self.horizon]
-        return super().forward(traj)
+    def forward(self, traj: torch.Tensor):
+        return super().forward(traj[:, :self.horizon])
