@@ -5,79 +5,58 @@ from losses.r1_regularization import R1Regularization
 
 
 class AdversarialDiscriminatorLoss(nn.Module):
-    """
-    Multi-scale hinge GAN discriminator loss with R1 regularization.
-    """
-
-    def __init__(
-        self,
-        lambda_r1: float = 1.0,
-    ):
+    def __init__(self, lambda_r1: float = 1.0):
         super(AdversarialDiscriminatorLoss, self).__init__()
         self.lambda_r1 = lambda_r1
         self.r1_reg = R1Regularization()
+        self.bce = nn.BCEWithLogitsLoss()
 
-    def forward(
-        self,
-        critics: dict,
-        real_trajs: dict,
-        fake_trajs: dict,
-    ):
-        """
-        Args:
-            critics: dict {name: critic_module}
-            real_trajs: dict {name: real_traj_tensor}
-            fake_trajs: dict {name: fake_traj_tensor}
-
-        Returns:
-            total_loss: scalar
-            log_dict: dict of per-scale losses
-        """
+    def forward(self, critics: dict, real_trajs: dict, fake_trajs: dict):
         total_loss = 0.0
-        log_dict = {}
+        logs = {}
 
-        for name, critic in critics.items():
-            real = real_trajs[name].requires_grad_(True)
-            fake = fake_trajs[name].detach()
+        for scale in critics.keys():
+            # 1. Real Data Forward Pass
+            # We must enable gradients on input for R1 to work
+            real_in = real_trajs[scale].detach().requires_grad_(True)
+            d_real = critics[scale](real_in)
+            
+            # 2. Fake Data Forward Pass
+            d_fake = critics[scale](fake_trajs[scale])
 
-            d_real = critic(real)
-            d_fake = critic(fake)
+            # 3. Standard GAN Loss (Hinge or BCE)
+            # Using BCE here for stability with your setup
+            real_loss = self.bce(d_real, torch.ones_like(d_real))
+            fake_loss = self.bce(d_fake, torch.zeros_like(d_fake))
+            
+            # 4. R1 Regularization
+            # (Only applied to real data)
+            r1_loss = self.r1_reg(d_real, real_in)
+            
+            # Combine
+            scale_loss = real_loss + fake_loss + (self.lambda_r1 * r1_loss)
+            total_loss += scale_loss
+            
+            logs[f"d_loss_{scale}"] = scale_loss.detach()
+            logs[f"d_r1_{scale}"] = r1_loss.detach()
 
-            loss_real = F.relu(1.0 - d_real).mean()
-            loss_fake = F.relu(1.0 + d_fake).mean()
-            d_loss = loss_real + loss_fake
-
-            r1 = self.r1_reg(d_real, real)
-            d_loss = d_loss + self.lambda_r1 * r1
-
-            total_loss = total_loss + d_loss
-
-            log_dict[f"d_loss_{name}"] = d_loss.detach()
-            log_dict[f"r1_{name}"] = r1.detach()
-
-        return total_loss, log_dict
-
-
+        return total_loss, logs
 
 class AdversarialGeneratorLoss(nn.Module):
-    def __init__(self, lambda_adv: float = 1.0, lambda_feat: float = 0.5):
-        super().__init__()
-        self.lambda_adv = lambda_adv
-        self.lambda_feat = lambda_feat
+    def __init__(self, lambda_adv: float = 1.0):
+        super(AdversarialGeneratorLoss, self).__init__()
+        self.lambda_adv = lambda_adv # Note: usually handled in training_step, but kept here for consistency
+        self.bce = nn.BCEWithLogitsLoss()
 
     def forward(self, critics: dict, fake_trajs: dict):
         total_loss = 0.0
-        log_dict = {}
+        logs = {}
 
-        for name, critic in critics.items():
-            fake = fake_trajs[name]
-            # Standard Adversarial Loss
-            g_loss = -critic(fake).mean()
-            
-            # Optional: Feature Matching (if the critic returns intermediate features)
-            # This is the "Secret Sauce" to beat baselines.
-            total_loss = total_loss + g_loss
-            log_dict[f"g_loss_{name}"] = g_loss.detach()
+        for scale in critics.keys():
+            d_fake = critics[scale](fake_trajs[scale])
+            # Generator wants Discriminator to output 1 (Real)
+            scale_loss = self.bce(d_fake, torch.ones_like(d_fake))
+            total_loss += scale_loss
+            logs[f"g_loss_{scale}"] = scale_loss.detach()
 
-        return self.lambda_adv * total_loss, log_dictloss
-        return total_loss, log_dict
+        return total_loss, logs
