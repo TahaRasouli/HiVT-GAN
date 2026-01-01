@@ -19,7 +19,7 @@ from models.critics import ShortScaleCritic, MidScaleCritic, LongScaleCritic
 from utils import TemporalData
 
 class HiVT(pl.LightningModule):
-def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs) -> None:
         super(HiVT, self).__init__()
         self.save_hyperparameters()
         
