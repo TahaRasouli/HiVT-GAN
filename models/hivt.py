@@ -142,26 +142,25 @@ class HiVT(pl.LightningModule):
         return real_trajs, fake_trajs, keep
 
     def training_step(self, data, batch_idx):
-        # -----------------------------------------------------
-        # 1. SETUP & INTEGRITY CHECKS
-        # -----------------------------------------------------
-        # We calculate validity flags but DO NOT return early.
-        # We must keep running to satisfy DDP synchronization.
+        # 1. Setup flags
+        # We calculate these but DO NOT branch yet.
         has_nans = torch.isnan(data.y).any()
         
         # -----------------------------------------------------
-        # Case A: Supervised Only (No GAN)
+        # Case A: Supervised Only
         # -----------------------------------------------------
         if not self.use_gan:
             if has_nans:
                 # Dummy loss to keep DDP in sync
                 dummy_loss = sum(p.sum() for p in self.parameters()) * 0.0
+                # Log 0.0 to keep sync_dist happy
+                self.log("train_reg_loss", 0.0, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
                 return dummy_loss
             
             y_hat, pi = self(data)
             reg_loss, cls_loss, _ = self._supervised_losses(data, y_hat, pi)
             loss = reg_loss + cls_loss
-            self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=data.num_graphs)
+            self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=data.num_graphs, sync_dist=True)
             return loss
 
         # -----------------------------------------------------
@@ -169,85 +168,94 @@ class HiVT(pl.LightningModule):
         # -----------------------------------------------------
         opt_g, opt_d = self.optimizers()
         
-        # Forward pass
-        # We wrap this in a try-except block or check nans to prevent crashing on bad data
+        # Initialize variables to ensure they exist for logging later
+        d_loss_val = torch.tensor(0.0, device=self.device)
+        reg_loss_val = torch.tensor(0.0, device=self.device)
+        
+        # -----------------------------------------------------
+        # 1. Forward Pass & Validity Check
+        # -----------------------------------------------------
+        # We wrap forward pass to prevent crashing on NaNs
         if not has_nans:
             y_hat, pi = self(data)
             reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
             real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
-            # Check if we have enough valid agents in this batch
-            is_batch_valid = (real_trajs["long"].size(0) > 0)
+            is_valid = (real_trajs["long"].size(0) > 0)
+            
+            if is_valid:
+                reg_loss_val = reg_loss.detach()
         else:
-            # Set defaults for invalid path
-            is_batch_valid = False
-            y_hat = None # Placeholder
+            is_valid = False
+            y_hat = None
 
         # -----------------------------------------------------
-        # D Step (Discriminator)
+        # 2. D Step (Discriminator)
         # -----------------------------------------------------
-        d_loss_val = torch.tensor(0.0, device=self.device)
-        
-        # We loop exactly 'critic_steps' times on ALL ranks
         for _ in range(self.critic_steps):
             opt_d.zero_grad()
             
-            if is_batch_valid and not has_nans:
-                # VALID PATH: Detach fake samples and calc real loss
-                fake_trajs_detached = {k: v.detach().requires_grad_(True) for k, v in fake_trajs.items()}
-                d_loss, _ = self.d_loss_fn(self.critics, real_trajs, fake_trajs_detached)
+            if is_valid:
+                # Valid Path: Detach and Calculate
+                fake_detached = {k: v.detach().requires_grad_(True) for k, v in fake_trajs.items()}
+                d_loss, _ = self.d_loss_fn(self.critics, real_trajs, fake_detached)
                 self.manual_backward(d_loss)
                 self.clip_gradients(opt_d, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
-                opt_d.step()
                 d_loss_val = d_loss.detach()
             else:
-                # DEADLOCK PREVENTION PATH:
-                # Calculate a dummy loss attached to D's parameters so DDP syncs happen
-                dummy_loss = sum(p.sum() for p in self.D_short.parameters()) * 0.0
-                self.manual_backward(dummy_loss)
-                opt_d.step() # Step with 0 gradient (harmless)
+                # Dummy Path: Touch parameters to satisfy DDP
+                # We sum *all* critic params to ensure DDP buckets are happy
+                dummy = sum(p.sum() for p in self.D_short.parameters()) 
+                dummy += sum(p.sum() for p in self.D_mid.parameters())
+                dummy += sum(p.sum() for p in self.D_long.parameters())
+                self.manual_backward(dummy * 0.0)
+            
+            # ALWAYS STEP
+            opt_d.step()
 
         # -----------------------------------------------------
-        # G Step (Generator)
+        # 3. G Step (Generator)
         # -----------------------------------------------------
         opt_g.zero_grad()
         
-        if is_batch_valid and not has_nans:
-            # VALID PATH
+        if is_valid:
+            # Valid Path
             g_adv, _ = self.g_loss_fn(self.critics, fake_trajs)
             g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
-            
             self.manual_backward(g_total)
             self.clip_gradients(opt_g, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
-            opt_g.step()
         else:
-            # DEADLOCK PREVENTION PATH
-            # Dummy loss attached to G's parameters
-            dummy_loss = sum(p.sum() for p in self.local_encoder.parameters()) * 0.0
-            self.manual_backward(dummy_loss)
-            opt_g.step()
-            g_total = dummy_loss # for logging return
+            # Dummy Path
+            dummy = sum(p.sum() for p in self.local_encoder.parameters()) * 0.0
+            self.manual_backward(dummy)
+            g_total = dummy
+            
+        # ALWAYS STEP
+        opt_g.step()
 
         # -----------------------------------------------------
-        # Scheduler & Logging
+        # 4. Scheduler Step
         # -----------------------------------------------------
         if self.trainer.is_last_batch:
             sch = self.lr_schedulers()
             if sch is not None:
                 sch.step()
 
-        # Only log valid metrics to avoid skewing graphs with zeros
-        if is_batch_valid and not has_nans:
-            self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=data.num_graphs)
-            self.log("train_d_loss", d_loss_val, on_epoch=True, sync_dist=True, batch_size=data.num_graphs)
-            
-            if _HAS_REALISM_METRICS:
-                self.val_endpoint_diversity.update(
-                    y_hat[:, data['agent_index'], :, :2].detach(), 
-                    pi[data['agent_index']].detach()
-                )
+        # -----------------------------------------------------
+        # 5. Logging (UNCONDITIONAL)
+        # -----------------------------------------------------
+        # The logging call happens NO MATTER WHAT.
+        # This prevents the synchronization deadlock.
+        self.log("train_reg_loss", reg_loss_val, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=data.num_graphs)
+        self.log("train_d_loss", d_loss_val, on_epoch=True, sync_dist=True, batch_size=data.num_graphs)
+        
+        # Realism metrics are local (no sync needed), so we can keep them conditional
+        if _HAS_REALISM_METRICS and is_valid:
+             self.val_endpoint_diversity.update(
+                y_hat[:, data['agent_index'], :, :2].detach(), 
+                pi[data['agent_index']].detach()
+            )
 
         return g_total
-
     def validation_step(self, data, batch_idx):
         y_hat, pi = self(data)
         reg_mask = ~data['padding_mask'][:, self.historical_steps:]
