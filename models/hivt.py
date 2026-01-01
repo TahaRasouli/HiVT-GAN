@@ -175,32 +175,32 @@ class HiVT(pl.LightningModule):
             return [opt_g, opt_d], [{"scheduler": sch_g, "interval": "epoch"}]
 
     @staticmethod
-        def add_model_specific_args(parent_parser):
-            parser = parent_parser.add_argument_group('HiVT')
-            parser.add_argument('--historical_steps', type=int, default=20)
-            parser.add_argument('--future_steps', type=int, default=30)
-            parser.add_argument('--num_modes', type=int, default=6)
-            parser.add_argument('--rotate', type=bool, default=True)
-            parser.add_argument('--node_dim', type=int, default=2)
-            parser.add_argument('--edge_dim', type=int, default=2)
-            parser.add_argument('--embed_dim', type=int, default=128)
-            parser.add_argument('--num_heads', type=int, default=8)
-            parser.add_argument('--dropout', type=float, default=0.1)
-            parser.add_argument('--num_temporal_layers', type=int, default=4)
-            parser.add_argument('--num_global_layers', type=int, default=3)
-            parser.add_argument('--local_radius', type=float, default=50)
-            parser.add_argument('--parallel', type=bool, default=False)
-            parser.add_argument('--lr', type=float, default=5e-4)
-            parser.add_argument('--weight_decay', type=float, default=1e-4)
-            parser.add_argument('--T_max', type=int, default=64)
+    def add_model_specific_args(parent_parser):
+        parser = parent_parser.add_argument_group('HiVT')
+        parser.add_argument('--historical_steps', type=int, default=20)
+        parser.add_argument('--future_steps', type=int, default=30)
+        parser.add_argument('--num_modes', type=int, default=6)
+        parser.add_argument('--rotate', type=bool, default=True)
+        parser.add_argument('--node_dim', type=int, default=2)
+        parser.add_argument('--edge_dim', type=int, default=2)
+        parser.add_argument('--embed_dim', type=int, default=128)
+        parser.add_argument('--num_heads', type=int, default=8)
+        parser.add_argument('--dropout', type=float, default=0.1)
+        parser.add_argument('--num_temporal_layers', type=int, default=4)
+        parser.add_argument('--num_global_layers', type=int, default=3)
+        parser.add_argument('--local_radius', type=float, default=50)
+        parser.add_argument('--parallel', type=bool, default=False)
+        parser.add_argument('--lr', type=float, default=5e-4)
+        parser.add_argument('--weight_decay', type=float, default=1e-4)
+        parser.add_argument('--T_max', type=int, default=64)
 
-            # GAN Arguments
-            parser.add_argument('--use_gan', action='store_true')
-            parser.add_argument('--lambda_adv', type=float, default=0.1)
-            parser.add_argument('--lambda_r1', type=float, default=1.0)
-            parser.add_argument('--critic_steps', type=int, default=1)
-            parser.add_argument('--critic_lr', type=float, default=1e-4)
-            parser.add_argument('--short_horizon', type=int, default=10)
-            parser.add_argument('--mid_horizon', type=int, default=20)
-            
-            return parent_parser
+        # GAN Arguments
+        parser.add_argument('--use_gan', action='store_true')
+        parser.add_argument('--lambda_adv', type=float, default=0.1)
+        parser.add_argument('--lambda_r1', type=float, default=1.0)
+        parser.add_argument('--critic_steps', type=int, default=1)
+        parser.add_argument('--critic_lr', type=float, default=1e-4)
+        parser.add_argument('--short_horizon', type=int, default=10)
+        parser.add_argument('--mid_horizon', type=int, default=20)
+        
+        return parent_parser
