@@ -142,10 +142,13 @@ class HiVT(pl.LightningModule):
         return real_trajs, fake_trajs, keep
 
     def training_step(self, data, batch_idx):
+        # 1. Global Data Integrity Guard
         if torch.isnan(data.y).any(): 
             return self.local_encoder.parameters().__next__().sum() * 0.0
         
-        # --- Case A: Supervised Only ---
+        # -----------------------------------------------------
+        # Case A: Standard supervised training (no GAN)
+        # -----------------------------------------------------
         if not self.use_gan:
             y_hat, pi = self(data)
             reg_loss, cls_loss, _ = self._supervised_losses(data, y_hat, pi)
@@ -153,23 +156,26 @@ class HiVT(pl.LightningModule):
             self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=data.num_graphs)
             return loss
 
-        # --- Case B: GAN training ---
+        # -----------------------------------------------------
+        # Case B: GAN training (Manual Optimization)
+        # -----------------------------------------------------
         opt_g, opt_d = self.optimizers()
         
-        # 1. Forward Pass
+        # 1. Forward Pass (creates the computation graph)
         y_hat, pi = self(data)
         
         # 2. Compute Supervised Losses
         reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
         
-        # 3. Build Real/Fake Dicts
+        # 3. Build Real/Fake Tensors
         real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
         has_valid = (real_trajs["long"].size(0) > 0)
 
-        # --- Update Discriminator (D) ---
+        # --- D Step (Discriminator Update) ---
         d_loss_val = 0.0
         if has_valid:
-            # DETACH fake trajectories so D-step doesn't clear G's graph
+            # DETACH the fake trajectories to prevent clearing the Generator's graph
+            # This allows opt_d to update without affecting the graph needed for opt_g
             fake_trajs_detached = {k: v.detach().requires_grad_(True) for k, v in fake_trajs.items()}
             
             for _ in range(self.critic_steps):
@@ -177,28 +183,34 @@ class HiVT(pl.LightningModule):
                 
                 opt_d.zero_grad()
                 self.manual_backward(d_loss)
+                
+                # Manual Gradient Clipping for D
                 self.clip_gradients(opt_d, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
+                
                 opt_d.step()
                 d_loss_val = d_loss.detach()
 
-        # --- Update Generator (G) ---
+        # --- G Step (Generator Update) ---
         if has_valid:
-            # Here we use the ORIGINAL fake_trajs (not detached)
+            # Use the ORIGINAL fake_trajs (not detached) so gradients flow back to HiVT
             g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
             
-            # Combine losses
+            # Combine losses: Supervised + Adversarial
             g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
             
             opt_g.zero_grad()
             self.manual_backward(g_total)
+            
+            # Manual Gradient Clipping for G
             self.clip_gradients(opt_g, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
+            
             opt_g.step()
         else:
             g_total = reg_loss + cls_loss
 
-        # --- Logging ---
+        # --- Metrics & Logging ---
         if _HAS_REALISM_METRICS and has_valid:
-            # Use .detach() on metric inputs to prevent memory leaks
+            # Pass detached tensors to metrics to prevent memory accumulation
             self.val_endpoint_diversity.update(
                 y_hat[:, data['agent_index'], :, :2].detach(), 
                 pi[data['agent_index']].detach()
