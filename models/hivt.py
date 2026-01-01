@@ -20,76 +20,76 @@ from utils import TemporalData
 
 class HiVT(pl.LightningModule):
     def __init__(self, **kwargs) -> None:
-            super(HiVT, self).__init__()
-            self.save_hyperparameters()
-            
-            # 1. Extract Core Params and remove them from kwargs
-            self.historical_steps = kwargs.pop("historical_steps", 20)
-            self.future_steps = kwargs.pop("future_steps", 30)
-            self.num_modes = kwargs.pop("num_modes", 6)
-            self.rotate = kwargs.pop("rotate", True)
-            self.lr = kwargs.pop("lr", 5e-4)
-            self.weight_decay = kwargs.pop("weight_decay", 1e-4)
-            self.T_max = kwargs.pop("T_max", 64)
-            
-            embed_dim = kwargs.pop("embed_dim", 128)
-            node_dim = kwargs.pop("node_dim", 2)
-            edge_dim = kwargs.pop("edge_dim", 2)
+        super(HiVT, self).__init__()
+        self.save_hyperparameters()
+        
+        # 1. Extract Core Params and remove them from kwargs
+        self.historical_steps = kwargs.pop("historical_steps", 20)
+        self.future_steps = kwargs.pop("future_steps", 30)
+        self.num_modes = kwargs.pop("num_modes", 6)
+        self.rotate = kwargs.pop("rotate", True)
+        self.lr = kwargs.pop("lr", 5e-4)
+        self.weight_decay = kwargs.pop("weight_decay", 1e-4)
+        self.T_max = kwargs.pop("T_max", 64)
+        
+        embed_dim = kwargs.pop("embed_dim", 128)
+        node_dim = kwargs.pop("node_dim", 2)
+        edge_dim = kwargs.pop("edge_dim", 2)
 
-            # 2. GAN settings
-            self.use_gan = kwargs.pop("use_gan", False)
-            self.lambda_adv = kwargs.pop("lambda_adv", 0.1)
-            self.lambda_r1 = kwargs.pop("lambda_r1", 1.0)
-            self.critic_steps = kwargs.pop("critic_steps", 1)
-            self.critic_lr = kwargs.pop("critic_lr", 1e-4)
-            
-            # 3. CLEAN KWARGS: Remove Trainer/Data arguments that Encoders don't need
-            # This prevents the "unexpected keyword argument 'root'" error
-            for key in ['root', 'train_batch_size', 'val_batch_size', 'shuffle', 
-                        'num_workers', 'pin_memory', 'persistent_workers', 
-                        'devices', 'max_epochs', 'monitor', 'save_top_k', 'ckpt_path']:
-                kwargs.pop(key, None)
+        # 2. GAN settings
+        self.use_gan = kwargs.pop("use_gan", False)
+        self.lambda_adv = kwargs.pop("lambda_adv", 0.1)
+        self.lambda_r1 = kwargs.pop("lambda_r1", 1.0)
+        self.critic_steps = kwargs.pop("critic_steps", 1)
+        self.critic_lr = kwargs.pop("critic_lr", 1e-4)
+        
+        # 3. CLEAN KWARGS: Remove Trainer/Data arguments that Encoders don't need
+        # This prevents the "unexpected keyword argument 'root'" error
+        for key in ['root', 'train_batch_size', 'val_batch_size', 'shuffle', 
+                    'num_workers', 'pin_memory', 'persistent_workers', 
+                    'devices', 'max_epochs', 'monitor', 'save_top_k', 'ckpt_path']:
+            kwargs.pop(key, None)
 
-            # 4. Modules
-            # Now kwargs only contains relevant HiVT params (dropout, num_layers, etc.)
-            self.local_encoder = LocalEncoder(
-                historical_steps=self.historical_steps,
-                node_dim=node_dim,
-                edge_dim=edge_dim,
-                embed_dim=embed_dim,
-                **kwargs
-            )
-            self.global_interactor = GlobalInteractor(
-                historical_steps=self.historical_steps,
-                embed_dim=embed_dim,
-                edge_dim=edge_dim,
-                num_modes=self.num_modes,
-                **kwargs
-            )
-            self.decoder = MLPDecoder(
-                local_channels=embed_dim,
-                global_channels=embed_dim,
-                future_steps=self.future_steps,
-                num_modes=self.num_modes
-            )
+        # 4. Modules
+        # Now kwargs only contains relevant HiVT params (dropout, num_layers, etc.)
+        self.local_encoder = LocalEncoder(
+            historical_steps=self.historical_steps,
+            node_dim=node_dim,
+            edge_dim=edge_dim,
+            embed_dim=embed_dim,
+            **kwargs
+        )
+        self.global_interactor = GlobalInteractor(
+            historical_steps=self.historical_steps,
+            embed_dim=embed_dim,
+            edge_dim=edge_dim,
+            num_modes=self.num_modes,
+            **kwargs
+        )
+        self.decoder = MLPDecoder(
+            local_channels=embed_dim,
+            global_channels=embed_dim,
+            future_steps=self.future_steps,
+            num_modes=self.num_modes
+        )
 
         self.reg_loss = LaplaceNLLLoss(reduction='mean')
         self.cls_loss = SoftTargetCrossEntropyLoss(reduction='mean')
 
-        # 4. Metrics
-        self.minADE, self.minFDE, self.minMR = ADE(), FDE(), MR()
-        if _HAS_REALISM_METRICS:
-            self.val_jerk = Jerk()
-            self.val_speed_violation = SpeedViolation()
-            self.val_endpoint_diversity = EndpointDiversity()
+    # 4. Metrics
+    self.minADE, self.minFDE, self.minMR = ADE(), FDE(), MR()
+    if _HAS_REALISM_METRICS:
+        self.val_jerk = Jerk()
+        self.val_speed_violation = SpeedViolation()
+        self.val_endpoint_diversity = EndpointDiversity()
 
-        if self.use_gan:
-            self.D_short = ShortScaleCritic(horizon=kwargs.get("short_horizon", 10))
-            self.D_mid = MidScaleCritic(horizon=kwargs.get("mid_horizon", 20))
-            self.D_long = LongScaleCritic(horizon=self.future_steps)
-            self.critics = {"short": self.D_short, "mid": self.D_mid, "long": self.D_long}
-            self.d_loss_fn = AdversarialDiscriminatorLoss(lambda_r1=self.lambda_r1)
-            self.g_loss_fn = AdversarialGeneratorLoss(lambda_adv=1.0)
+    if self.use_gan:
+        self.D_short = ShortScaleCritic(horizon=kwargs.get("short_horizon", 10))
+        self.D_mid = MidScaleCritic(horizon=kwargs.get("mid_horizon", 20))
+        self.D_long = LongScaleCritic(horizon=self.future_steps)
+        self.critics = {"short": self.D_short, "mid": self.D_mid, "long": self.D_long}
+        self.d_loss_fn = AdversarialDiscriminatorLoss(lambda_r1=self.lambda_r1)
+        self.g_loss_fn = AdversarialGeneratorLoss(lambda_adv=1.0)
 
     def forward(self, data: TemporalData):
         if self.rotate:
