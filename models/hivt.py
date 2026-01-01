@@ -142,77 +142,109 @@ class HiVT(pl.LightningModule):
         return real_trajs, fake_trajs, keep
 
     def training_step(self, data, batch_idx):
-        # 1. Integrity Guard
-        if torch.isnan(data.y).any(): 
-            return self.local_encoder.parameters().__next__().sum() * 0.0
+        # -----------------------------------------------------
+        # 1. SETUP & INTEGRITY CHECKS
+        # -----------------------------------------------------
+        # We calculate validity flags but DO NOT return early.
+        # We must keep running to satisfy DDP synchronization.
+        has_nans = torch.isnan(data.y).any()
         
-        # Capture batch size for logging
-        # We use num_graphs because 'train_batch_size=1' actually contains many graphs in PyG
-        bs = data.num_graphs 
-
-        # --- Case A: Supervised Only ---
+        # -----------------------------------------------------
+        # Case A: Supervised Only (No GAN)
+        # -----------------------------------------------------
         if not self.use_gan:
+            if has_nans:
+                # Dummy loss to keep DDP in sync
+                dummy_loss = sum(p.sum() for p in self.parameters()) * 0.0
+                return dummy_loss
+            
             y_hat, pi = self(data)
             reg_loss, cls_loss, _ = self._supervised_losses(data, y_hat, pi)
             loss = reg_loss + cls_loss
-            self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=bs)
+            self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=data.num_graphs)
             return loss
 
-        # --- Case B: GAN training ---
+        # -----------------------------------------------------
+        # Case B: GAN training (Manual Optimization)
+        # -----------------------------------------------------
         opt_g, opt_d = self.optimizers()
         
         # Forward pass
-        y_hat, pi = self(data)
-        
-        # Supervised Losses
-        reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
-        
-        # Build Real/Fake Dicts
-        real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
-        has_valid = (real_trajs["long"].size(0) > 0)
+        # We wrap this in a try-except block or check nans to prevent crashing on bad data
+        if not has_nans:
+            y_hat, pi = self(data)
+            reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
+            real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
+            # Check if we have enough valid agents in this batch
+            is_batch_valid = (real_trajs["long"].size(0) > 0)
+        else:
+            # Set defaults for invalid path
+            is_batch_valid = False
+            y_hat = None # Placeholder
 
-        # --- D Step ---
+        # -----------------------------------------------------
+        # D Step (Discriminator)
+        # -----------------------------------------------------
         d_loss_val = torch.tensor(0.0, device=self.device)
-        if has_valid:
-            fake_trajs_detached = {k: v.detach().requires_grad_(True) for k, v in fake_trajs.items()}
+        
+        # We loop exactly 'critic_steps' times on ALL ranks
+        for _ in range(self.critic_steps):
+            opt_d.zero_grad()
             
-            for _ in range(self.critic_steps):
-                d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs_detached)
-                
-                opt_d.zero_grad()
+            if is_batch_valid and not has_nans:
+                # VALID PATH: Detach fake samples and calc real loss
+                fake_trajs_detached = {k: v.detach().requires_grad_(True) for k, v in fake_trajs.items()}
+                d_loss, _ = self.d_loss_fn(self.critics, real_trajs, fake_trajs_detached)
                 self.manual_backward(d_loss)
                 self.clip_gradients(opt_d, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
                 opt_d.step()
                 d_loss_val = d_loss.detach()
+            else:
+                # DEADLOCK PREVENTION PATH:
+                # Calculate a dummy loss attached to D's parameters so DDP syncs happen
+                dummy_loss = sum(p.sum() for p in self.D_short.parameters()) * 0.0
+                self.manual_backward(dummy_loss)
+                opt_d.step() # Step with 0 gradient (harmless)
 
-        # --- G Step ---
-        if has_valid:
-            g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
+        # -----------------------------------------------------
+        # G Step (Generator)
+        # -----------------------------------------------------
+        opt_g.zero_grad()
+        
+        if is_batch_valid and not has_nans:
+            # VALID PATH
+            g_adv, _ = self.g_loss_fn(self.critics, fake_trajs)
             g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
             
-            opt_g.zero_grad()
             self.manual_backward(g_total)
             self.clip_gradients(opt_g, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
             opt_g.step()
         else:
-            g_total = reg_loss + cls_loss
+            # DEADLOCK PREVENTION PATH
+            # Dummy loss attached to G's parameters
+            dummy_loss = sum(p.sum() for p in self.local_encoder.parameters()) * 0.0
+            self.manual_backward(dummy_loss)
+            opt_g.step()
+            g_total = dummy_loss # for logging return
 
-        # --- Scheduler Step ---
+        # -----------------------------------------------------
+        # Scheduler & Logging
+        # -----------------------------------------------------
         if self.trainer.is_last_batch:
             sch = self.lr_schedulers()
             if sch is not None:
                 sch.step()
 
-        # --- Logging (Now clean!) ---
-        # We pass batch_size=bs to silence the warnings
-        self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=bs)
-        self.log("train_d_loss", d_loss_val, on_epoch=True, sync_dist=True, batch_size=bs)
-        
-        if _HAS_REALISM_METRICS and has_valid:
-            self.val_endpoint_diversity.update(
-                y_hat[:, data['agent_index'], :, :2].detach(), 
-                pi[data['agent_index']].detach()
-            )
+        # Only log valid metrics to avoid skewing graphs with zeros
+        if is_batch_valid and not has_nans:
+            self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=data.num_graphs)
+            self.log("train_d_loss", d_loss_val, on_epoch=True, sync_dist=True, batch_size=data.num_graphs)
+            
+            if _HAS_REALISM_METRICS:
+                self.val_endpoint_diversity.update(
+                    y_hat[:, data['agent_index'], :, :2].detach(), 
+                    pi[data['agent_index']].detach()
+                )
 
         return g_total
 
