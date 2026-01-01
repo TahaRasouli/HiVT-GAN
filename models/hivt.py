@@ -105,18 +105,102 @@ class HiVT(pl.LightningModule):
         return g_total
 
     def validation_step(self, data, batch_idx):
-        y_hat, pi = self(data)
-        # (Calculate metrics as before)
-        # ...
-        if _HAS_REALISM_METRICS:
-            self.val_endpoint_diversity.update(y_hat[:, data['agent_index'], :, :2], pi[data['agent_index']])
-        # (Log metrics)
+            y_hat, pi = self(data)
+
+            reg_mask = ~data['padding_mask'][:, self.historical_steps:]
+            if reg_mask.sum() == 0:
+                return 
+
+            # 1. Best-mode selection for regression loss
+            l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)
+            best_mode = l2_norm.argmin(dim=0)
+            y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
+            
+            reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
+            self.log('val_reg_loss', reg_loss, prog_bar=True, on_epoch=True, sync_dist=True)
+
+            # 2. Agent-specific metrics (minADE/minFDE)
+            y_hat_agent = y_hat[:, data['agent_index'], :, :2]
+            y_agent = data.y[data['agent_index']]
+            
+            fde_agent = torch.norm(y_hat_agent[:, :, -1] - y_agent[:, -1], p=2, dim=-1)
+            best_mode_agent = fde_agent.argmin(dim=0)
+            y_hat_best_agent = y_hat_agent[best_mode_agent, torch.arange(data.num_graphs)]
+
+            self.minADE.update(y_hat_best_agent, y_agent)
+            self.minFDE.update(y_hat_best_agent, y_agent)
+            self.minMR.update(y_hat_best_agent, y_agent)
+            
+            self.log('val_minADE', self.minADE, prog_bar=True, on_epoch=True, sync_dist=True)
+            self.log('val_minFDE', self.minFDE, prog_bar=True, on_epoch=True, sync_dist=True)
+            self.log('val_minMR', self.minMR, prog_bar=True, on_epoch=True, sync_dist=True)
+
+            # 3. Realism Metrics
+            if _HAS_REALISM_METRICS:
+                self.val_jerk.update(y_hat_best_agent)
+                self.val_speed_violation.update(y_hat_best_agent)
+                # Weighted diversity using mode probabilities
+                pi_agent = pi[data['agent_index']]
+                self.val_endpoint_diversity.update(y_hat_agent, pi_agent)
+
+                self.log('val_jerk', self.val_jerk, on_epoch=True, sync_dist=True)
+                self.log('val_speed_violation', self.val_speed_violation, on_epoch=True, sync_dist=True)
+                self.log('val_endpoint_diversity', self.val_endpoint_diversity, on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):
-        # (Use the TTUR logic with betas=(0.5, 0.9) we discussed)
-        pass
+            if not self.use_gan:
+                opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+                sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.T_max, eta_min=1e-6)
+                return {
+                    "optimizer": opt,
+                    "lr_scheduler": {"scheduler": sch, "interval": "epoch"},
+                }
+
+            # GAN Optimizers
+            gen_params = (list(self.local_encoder.parameters()) + 
+                        list(self.global_interactor.parameters()) + 
+                        list(self.decoder.parameters()))
+            
+            disc_params = (list(self.D_short.parameters()) + 
+                        list(self.D_mid.parameters()) + 
+                        list(self.D_long.parameters()))
+
+            # Generator Optimizer (betas 0.5, 0.9 for stability)
+            opt_g = torch.optim.AdamW(gen_params, lr=self.lr, weight_decay=self.weight_decay, betas=(0.5, 0.9))
+            # Discriminator Optimizer (Higher learning rate often helps)
+            opt_d = torch.optim.AdamW(disc_params, lr=self.critic_lr, weight_decay=1e-4, betas=(0.5, 0.9))
+
+            sch_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=self.T_max, eta_min=1e-6)
+
+            return [opt_g, opt_d], [{"scheduler": sch_g, "interval": "epoch"}]
 
     @staticmethod
-    def add_model_specific_args(parent_parser):
-        # (Keep your existing ArgParser logic)
-        return parent_parser
+        def add_model_specific_args(parent_parser):
+            parser = parent_parser.add_argument_group('HiVT')
+            parser.add_argument('--historical_steps', type=int, default=20)
+            parser.add_argument('--future_steps', type=int, default=30)
+            parser.add_argument('--num_modes', type=int, default=6)
+            parser.add_argument('--rotate', type=bool, default=True)
+            parser.add_argument('--node_dim', type=int, default=2)
+            parser.add_argument('--edge_dim', type=int, default=2)
+            parser.add_argument('--embed_dim', type=int, default=128)
+            parser.add_argument('--num_heads', type=int, default=8)
+            parser.add_argument('--dropout', type=float, default=0.1)
+            parser.add_argument('--num_temporal_layers', type=int, default=4)
+            parser.add_argument('--num_global_layers', type=int, default=3)
+            parser.add_argument('--local_radius', type=float, default=50)
+            parser.add_argument('--parallel', type=bool, default=False)
+            parser.add_argument('--lr', type=float, default=5e-4)
+            parser.add_argument('--weight_decay', type=float, default=1e-4)
+            parser.add_argument('--T_max', type=int, default=64)
+
+            # GAN Arguments
+            parser.add_argument('--use_gan', action='store_true')
+            parser.add_argument('--lambda_adv', type=float, default=0.1)
+            parser.add_argument('--lambda_r1', type=float, default=1.0)
+            parser.add_argument('--critic_steps', type=int, default=1)
+            parser.add_argument('--critic_lr', type=float, default=1e-4)
+            parser.add_argument('--short_horizon', type=int, default=10)
+            parser.add_argument('--mid_horizon', type=int, default=20)
+            
+            return parent_parser
