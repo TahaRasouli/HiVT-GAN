@@ -19,53 +19,58 @@ from models.critics import ShortScaleCritic, MidScaleCritic, LongScaleCritic
 from utils import TemporalData
 
 class HiVT(pl.LightningModule):
-    def __init__(self, **kwargs) -> None:
+def __init__(self, **kwargs) -> None:
         super(HiVT, self).__init__()
         self.save_hyperparameters()
         
-        # 1. Extract Core Params and remove them from kwargs
-        self.historical_steps = kwargs.pop("historical_steps", 20)
-        self.future_steps = kwargs.pop("future_steps", 30)
-        self.num_modes = kwargs.pop("num_modes", 6)
-        self.rotate = kwargs.pop("rotate", True)
-        self.lr = kwargs.pop("lr", 5e-4)
-        self.weight_decay = kwargs.pop("weight_decay", 1e-4)
-        self.T_max = kwargs.pop("T_max", 64)
+        # 1. Extract HiVT Core Parameters
+        self.historical_steps = kwargs.get("historical_steps", 20)
+        self.future_steps = kwargs.get("future_steps", 30)
+        self.num_modes = kwargs.get("num_modes", 6)
+        self.rotate = kwargs.get("rotate", True)
+        self.lr = kwargs.get("lr", 5e-4)
+        self.weight_decay = kwargs.get("weight_decay", 1e-4)
+        self.T_max = kwargs.get("T_max", 64)
         
-        embed_dim = kwargs.pop("embed_dim", 128)
-        node_dim = kwargs.pop("node_dim", 2)
-        edge_dim = kwargs.pop("edge_dim", 2)
+        embed_dim = kwargs.get("embed_dim", 128)
+        node_dim = kwargs.get("node_dim", 2)
+        edge_dim = kwargs.get("edge_dim", 2)
+        dropout = kwargs.get("dropout", 0.1)
+        num_heads = kwargs.get("num_heads", 8)
 
         # 2. GAN settings
-        self.use_gan = kwargs.pop("use_gan", False)
-        self.lambda_adv = kwargs.pop("lambda_adv", 0.1)
-        self.lambda_r1 = kwargs.pop("lambda_r1", 1.0)
-        self.critic_steps = kwargs.pop("critic_steps", 1)
-        self.critic_lr = kwargs.pop("critic_lr", 1e-4)
-        
-        # 3. CLEAN KWARGS: Remove Trainer/Data arguments that Encoders don't need
-        # This prevents the "unexpected keyword argument 'root'" error
-        for key in ['root', 'train_batch_size', 'val_batch_size', 'shuffle', 
-                    'num_workers', 'pin_memory', 'persistent_workers', 
-                    'devices', 'max_epochs', 'monitor', 'save_top_k', 'ckpt_path']:
-            kwargs.pop(key, None)
+        self.use_gan = kwargs.get("use_gan", False)
+        self.lambda_adv = kwargs.get("lambda_adv", 0.1)
+        self.lambda_r1 = kwargs.get("lambda_r1", 1.0)
+        self.critic_steps = kwargs.get("critic_steps", 1)
+        self.critic_lr = kwargs.get("critic_lr", 1e-4)
+        self.automatic_optimization = not self.use_gan
 
-        # 4. Modules
-        # Now kwargs only contains relevant HiVT params (dropout, num_layers, etc.)
+        # 3. Initialize Modules with STRICT arguments
+        # We no longer pass **kwargs to avoid "unexpected keyword argument" errors
         self.local_encoder = LocalEncoder(
             historical_steps=self.historical_steps,
             node_dim=node_dim,
             edge_dim=edge_dim,
             embed_dim=embed_dim,
-            **kwargs
+            num_heads=num_heads,
+            dropout=dropout,
+            num_temporal_layers=kwargs.get("num_temporal_layers", 4),
+            local_radius=kwargs.get("local_radius", 50),
+            parallel=kwargs.get("parallel", False)
         )
+        
         self.global_interactor = GlobalInteractor(
             historical_steps=self.historical_steps,
             embed_dim=embed_dim,
             edge_dim=edge_dim,
             num_modes=self.num_modes,
-            **kwargs
+            num_heads=num_heads,
+            num_layers=kwargs.get("num_global_layers", 3),
+            dropout=dropout,
+            rotate=self.rotate
         )
+        
         self.decoder = MLPDecoder(
             local_channels=embed_dim,
             global_channels=embed_dim,
@@ -73,6 +78,7 @@ class HiVT(pl.LightningModule):
             num_modes=self.num_modes
         )
 
+        # (Rest of your supervised losses and metrics initialization stays the same)
         self.reg_loss = LaplaceNLLLoss(reduction='mean')
         self.cls_loss = SoftTargetCrossEntropyLoss(reduction='mean')
 
