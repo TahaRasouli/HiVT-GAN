@@ -142,13 +142,10 @@ class HiVT(pl.LightningModule):
         return real_trajs, fake_trajs, keep
 
     def training_step(self, data, batch_idx):
-        # 1. Global Data Integrity Guard
         if torch.isnan(data.y).any(): 
             return self.local_encoder.parameters().__next__().sum() * 0.0
         
-        # -----------------------------------------------------
-        # Case A: Standard supervised training (no GAN)
-        # -----------------------------------------------------
+        # --- Case A: Supervised Only ---
         if not self.use_gan:
             y_hat, pi = self(data)
             reg_loss, cls_loss, _ = self._supervised_losses(data, y_hat, pi)
@@ -156,57 +153,56 @@ class HiVT(pl.LightningModule):
             self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=data.num_graphs)
             return loss
 
-        # -----------------------------------------------------
-        # Case B: GAN training (Manual Optimization)
-        # -----------------------------------------------------
+        # --- Case B: GAN training ---
         opt_g, opt_d = self.optimizers()
         
-        # Forward pass - This creates the graph shared by both G and D
+        # 1. Forward Pass
         y_hat, pi = self(data)
         
-        # Calculate supervised components
+        # 2. Compute Supervised Losses
         reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
         
-        # WTA: Critics only see the best mode to preserve minFDE accuracy
+        # 3. Build Real/Fake Dicts
         real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
         has_valid = (real_trajs["long"].size(0) > 0)
 
-        # --- D Step (Discriminator Update) ---
+        # --- Update Discriminator (D) ---
         d_loss_val = 0.0
-        for _ in range(self.critic_steps):
-            if has_valid:
-                d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs)
+        if has_valid:
+            # DETACH fake trajectories so D-step doesn't clear G's graph
+            fake_trajs_detached = {k: v.detach().requires_grad_(True) for k, v in fake_trajs.items()}
+            
+            for _ in range(self.critic_steps):
+                d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs_detached)
                 
                 opt_d.zero_grad()
-                
-                # CRITICAL CHANGE: Use retain_graph=True because y_hat is needed for opt_g later
-                self.manual_backward(d_loss, retain_graph=True)
-                
+                self.manual_backward(d_loss)
                 self.clip_gradients(opt_d, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
                 opt_d.step()
                 d_loss_val = d_loss.detach()
-            else:
-                d_loss_val = 0.0
 
-        # --- G Step (Generator Update) ---
+        # --- Update Generator (G) ---
         if has_valid:
+            # Here we use the ORIGINAL fake_trajs (not detached)
             g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
-            # Total loss: Regression + Classification + Weighted Adversarial
+            
+            # Combine losses
             g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
             
             opt_g.zero_grad()
-            
-            # No retain_graph=True here (this is the final backward pass for this batch)
             self.manual_backward(g_total)
-            
             self.clip_gradients(opt_g, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
             opt_g.step()
         else:
             g_total = reg_loss + cls_loss
 
-        # --- Metrics & Logging ---
+        # --- Logging ---
         if _HAS_REALISM_METRICS and has_valid:
-            self.val_endpoint_diversity.update(y_hat[:, data['agent_index'], :, :2].detach(), pi[data['agent_index']].detach())
+            # Use .detach() on metric inputs to prevent memory leaks
+            self.val_endpoint_diversity.update(
+                y_hat[:, data['agent_index'], :, :2].detach(), 
+                pi[data['agent_index']].detach()
+            )
 
         self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("train_d_loss", d_loss_val, on_epoch=True, sync_dist=True)
