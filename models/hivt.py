@@ -161,7 +161,7 @@ class HiVT(pl.LightningModule):
         # -----------------------------------------------------
         opt_g, opt_d = self.optimizers()
         
-        # Forward pass
+        # Forward pass - This creates the graph shared by both G and D
         y_hat, pi = self(data)
         
         # Calculate supervised components
@@ -172,19 +172,21 @@ class HiVT(pl.LightningModule):
         has_valid = (real_trajs["long"].size(0) > 0)
 
         # --- D Step (Discriminator Update) ---
+        d_loss_val = 0.0
         for _ in range(self.critic_steps):
             if has_valid:
                 d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs)
                 
                 opt_d.zero_grad()
-                self.manual_backward(d_loss)
                 
-                # Manual Gradient Clipping for D
+                # CRITICAL CHANGE: Use retain_graph=True because y_hat is needed for opt_g later
+                self.manual_backward(d_loss, retain_graph=True)
+                
                 self.clip_gradients(opt_d, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
-                
                 opt_d.step()
+                d_loss_val = d_loss.detach()
             else:
-                d_loss, d_logs = (y_hat.sum() * 0.0, {})
+                d_loss_val = 0.0
 
         # --- G Step (Generator Update) ---
         if has_valid:
@@ -193,24 +195,21 @@ class HiVT(pl.LightningModule):
             g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
             
             opt_g.zero_grad()
+            
+            # No retain_graph=True here (this is the final backward pass for this batch)
             self.manual_backward(g_total)
             
-            # Manual Gradient Clipping for G
-            # This protects your pre-trained weights from aggressive GAN gradients
             self.clip_gradients(opt_g, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
-            
             opt_g.step()
         else:
-            g_total, g_logs = (reg_loss + cls_loss, {})
+            g_total = reg_loss + cls_loss
 
         # --- Metrics & Logging ---
         if _HAS_REALISM_METRICS and has_valid:
-            # Pass both trajectory and probability for weighted diversity
-            self.val_endpoint_diversity.update(y_hat[:, data['agent_index'], :, :2], pi[data['agent_index']])
+            self.val_endpoint_diversity.update(y_hat[:, data['agent_index'], :, :2].detach(), pi[data['agent_index']].detach())
 
         self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("train_g_adv", g_logs.get("g_loss_long", 0.0), on_epoch=True, sync_dist=True)
-        self.log("train_d_loss", d_loss, on_epoch=True, sync_dist=True)
+        self.log("train_d_loss", d_loss_val, on_epoch=True, sync_dist=True)
 
         return g_total
 
