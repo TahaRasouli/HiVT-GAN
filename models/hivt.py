@@ -258,29 +258,47 @@ class HiVT(pl.LightningModule):
         return g_total
     def validation_step(self, data, batch_idx):
         y_hat, pi = self(data)
-        reg_mask = ~data['padding_mask'][:, self.historical_steps:]
-        if reg_mask.sum() == 0: return 
 
-        l2_norm = (torch.norm(y_hat[:, :, :, :2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)
+        # 1. Standard Regression Logic
+        reg_mask = ~data['padding_mask'][:, self.historical_steps:]
+        l2_norm = (torch.norm(y_hat[:, :, :, : 2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)
         best_mode = l2_norm.argmin(dim=0)
         y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
         
+        # Log Loss
         reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
-        self.log('val_reg_loss', reg_loss, prog_bar=True, on_epoch=True, sync_dist=True)
+        self.log('val_reg_loss', reg_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
-        y_hat_agent = y_hat[:, data['agent_index'], :, :2]
+        # 2. Slice for Agent (The "Interesting" Vehicle)
+        y_hat_agent = y_hat[:, data['agent_index'], :, : 2]
         y_agent = data.y[data['agent_index']]
+        
+        # Calculate ADE/FDE
         fde_agent = torch.norm(y_hat_agent[:, :, -1] - y_agent[:, -1], p=2, dim=-1)
         best_mode_agent = fde_agent.argmin(dim=0)
         y_hat_best_agent = y_hat_agent[best_mode_agent, torch.arange(data.num_graphs)]
 
-        self.minADE.update(y_hat_best_agent, y_agent); self.minFDE.update(y_hat_best_agent, y_agent); self.minMR.update(y_hat_best_agent, y_agent)
-        self.log('val_minADE', self.minADE, prog_bar=True, on_epoch=True); self.log('val_minFDE', self.minFDE, prog_bar=True, on_epoch=True); self.log('val_minMR', self.minMR, prog_bar=True, on_epoch=True)
+        # Update Standard Metrics
+        self.minADE.update(y_hat_best_agent, y_agent)
+        self.minFDE.update(y_hat_best_agent, y_agent)
+        self.minMR.update(y_hat_best_agent, y_agent)
+        
+        self.log('val_minADE', self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
+        self.log('val_minFDE', self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
+        self.log('val_minMR', self.minMR, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
 
+        # 3. REALISM METRICS (Enable this NOW)
         if _HAS_REALISM_METRICS:
-            self.val_jerk.update(y_hat_best_agent); self.val_speed_violation.update(y_hat_best_agent)
+            # Jerk & Speed: Check if the "best" trajectory is physically realistic
+            self.val_jerk.update(y_hat_best_agent, y_agent)
+            self.val_speed_violation.update(y_hat_best_agent, y_agent)
+            
+            # Diversity: Check if the 6 modes are distinct (Crucial for GANs)
             self.val_endpoint_diversity.update(y_hat_agent, pi[data['agent_index']])
-            self.log('val_jerk', self.val_jerk, on_epoch=True); self.log('val_endpoint_diversity', self.val_endpoint_diversity, on_epoch=True)
+
+            self.log('val_jerk', self.val_jerk, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
+            self.log('val_speed', self.val_speed_violation, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
+            self.log('val_div', self.val_endpoint_diversity, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics
