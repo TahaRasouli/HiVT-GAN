@@ -142,13 +142,11 @@ class HiVT(pl.LightningModule):
         return real_trajs, fake_trajs, keep
 
     def training_step(self, data, batch_idx):
-        # 1. Global Data Integrity Guard
+        # 1. Integrity Guard
         if torch.isnan(data.y).any(): 
             return self.local_encoder.parameters().__next__().sum() * 0.0
         
-        # -----------------------------------------------------
-        # Case A: Standard supervised training (no GAN)
-        # -----------------------------------------------------
+        # --- Case A: Supervised Only ---
         if not self.use_gan:
             y_hat, pi = self(data)
             reg_loss, cls_loss, _ = self._supervised_losses(data, y_hat, pi)
@@ -156,26 +154,23 @@ class HiVT(pl.LightningModule):
             self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=data.num_graphs)
             return loss
 
-        # -----------------------------------------------------
-        # Case B: GAN training (Manual Optimization)
-        # -----------------------------------------------------
+        # --- Case B: GAN training (Manual Optimization) ---
         opt_g, opt_d = self.optimizers()
         
-        # 1. Forward Pass - Creates the graph shared by both G and D
+        # Forward pass (creates the graph shared by G and D)
         y_hat, pi = self(data)
         
-        # 2. Compute Supervised Losses
+        # Calculate supervised components
         reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
         
-        # 3. Build Real/Fake Dicts
+        # WTA: Build trajectories for critics
         real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
         has_valid = (real_trajs["long"].size(0) > 0)
 
         # --- D Step (Discriminator Update) ---
-        d_loss_val = 0.0
+        d_loss_val = torch.tensor(0.0, device=self.device)
         if has_valid:
-            # CRITICAL FIX: Detach the fake trajectories for the Discriminator update.
-            # This prevents opt_d from trying to backward through the Generator's graph.
+            # DETACH: This prevents clearing the backbone's graph during the D update
             fake_trajs_detached = {k: v.detach().requires_grad_(True) for k, v in fake_trajs.items()}
             
             for _ in range(self.critic_steps):
@@ -183,35 +178,32 @@ class HiVT(pl.LightningModule):
                 
                 opt_d.zero_grad()
                 self.manual_backward(d_loss)
-                
-                # Manual Gradient Clipping for D
                 self.clip_gradients(opt_d, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
-                
                 opt_d.step()
                 d_loss_val = d_loss.detach()
 
         # --- G Step (Generator Update) ---
         if has_valid:
-            # Here we use the ORIGINAL fake_trajs (NOT detached) 
-            # so that gradients flow back to the HiVT backbone.
+            # Use ORIGINAL fake_trajs (not detached) so gradients flow back to the backbone
             g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
-            
-            # Combine losses: Regression + Classification + Adversarial
             g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
             
             opt_g.zero_grad()
             self.manual_backward(g_total)
-            
-            # Manual Gradient Clipping for G
             self.clip_gradients(opt_g, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
-            
             opt_g.step()
         else:
             g_total = reg_loss + cls_loss
 
+        # --- Manual Scheduler Step (Required for manual_optimization=True) ---
+        # Only step at the end of the epoch
+        if self.trainer.is_last_batch:
+            sch = self.lr_schedulers()
+            if sch is not None:
+                sch.step()
+
         # --- Metrics & Logging ---
         if _HAS_REALISM_METRICS and has_valid:
-            # Use .detach() on metric inputs to ensure no gradients are held in memory
             self.val_endpoint_diversity.update(
                 y_hat[:, data['agent_index'], :, :2].detach(), 
                 pi[data['agent_index']].detach()
