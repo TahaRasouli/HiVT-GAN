@@ -76,20 +76,20 @@ class HiVT(pl.LightningModule):
         self.reg_loss = LaplaceNLLLoss(reduction='mean')
         self.cls_loss = SoftTargetCrossEntropyLoss(reduction='mean')
 
-    # 4. Metrics
-    self.minADE, self.minFDE, self.minMR = ADE(), FDE(), MR()
-    if _HAS_REALISM_METRICS:
-        self.val_jerk = Jerk()
-        self.val_speed_violation = SpeedViolation()
-        self.val_endpoint_diversity = EndpointDiversity()
+        # 4. Metrics
+        self.minADE, self.minFDE, self.minMR = ADE(), FDE(), MR()
+        if _HAS_REALISM_METRICS:
+            self.val_jerk = Jerk()
+            self.val_speed_violation = SpeedViolation()
+            self.val_endpoint_diversity = EndpointDiversity()
 
-    if self.use_gan:
-        self.D_short = ShortScaleCritic(horizon=kwargs.get("short_horizon", 10))
-        self.D_mid = MidScaleCritic(horizon=kwargs.get("mid_horizon", 20))
-        self.D_long = LongScaleCritic(horizon=self.future_steps)
-        self.critics = {"short": self.D_short, "mid": self.D_mid, "long": self.D_long}
-        self.d_loss_fn = AdversarialDiscriminatorLoss(lambda_r1=self.lambda_r1)
-        self.g_loss_fn = AdversarialGeneratorLoss(lambda_adv=1.0)
+        if self.use_gan:
+            self.D_short = ShortScaleCritic(horizon=kwargs.get("short_horizon", 10))
+            self.D_mid = MidScaleCritic(horizon=kwargs.get("mid_horizon", 20))
+            self.D_long = LongScaleCritic(horizon=self.future_steps)
+            self.critics = {"short": self.D_short, "mid": self.D_mid, "long": self.D_long}
+            self.d_loss_fn = AdversarialDiscriminatorLoss(lambda_r1=self.lambda_r1)
+            self.g_loss_fn = AdversarialGeneratorLoss(lambda_adv=1.0)
 
     def forward(self, data: TemporalData):
         if self.rotate:
