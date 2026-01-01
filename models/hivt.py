@@ -289,11 +289,11 @@ class HiVT(pl.LightningModule):
 
         # 3. REALISM METRICS (Enable this NOW)
         if _HAS_REALISM_METRICS:
-            # Jerk & Speed: Check if the "best" trajectory is physically realistic
-            self.val_jerk.update(y_hat_best_agent, y_agent)
-            self.val_speed_violation.update(y_hat_best_agent, y_agent)
+            # FIX: Remove 'y_agent' from these two calls
+            self.val_jerk.update(y_hat_best_agent)            # <--- Was (y_hat_best_agent, y_agent)
+            self.val_speed_violation.update(y_hat_best_agent) # <--- Was (y_hat_best_agent, y_agent)
             
-            # Diversity: Check if the 6 modes are distinct (Crucial for GANs)
+            # Diversity needs both (predictions and probabilities)
             self.val_endpoint_diversity.update(y_hat_agent, pi[data['agent_index']])
 
             self.log('val_jerk', self.val_jerk, prog_bar=True, on_step=False, on_epoch=True, batch_size=y_agent.size(0))
