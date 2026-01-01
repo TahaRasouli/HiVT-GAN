@@ -161,21 +161,21 @@ class HiVT(pl.LightningModule):
         # -----------------------------------------------------
         opt_g, opt_d = self.optimizers()
         
-        # 1. Forward Pass (creates the computation graph)
+        # 1. Forward Pass - Creates the graph shared by both G and D
         y_hat, pi = self(data)
         
         # 2. Compute Supervised Losses
         reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
         
-        # 3. Build Real/Fake Tensors
+        # 3. Build Real/Fake Dicts
         real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
         has_valid = (real_trajs["long"].size(0) > 0)
 
         # --- D Step (Discriminator Update) ---
         d_loss_val = 0.0
         if has_valid:
-            # DETACH the fake trajectories to prevent clearing the Generator's graph
-            # This allows opt_d to update without affecting the graph needed for opt_g
+            # CRITICAL FIX: Detach the fake trajectories for the Discriminator update.
+            # This prevents opt_d from trying to backward through the Generator's graph.
             fake_trajs_detached = {k: v.detach().requires_grad_(True) for k, v in fake_trajs.items()}
             
             for _ in range(self.critic_steps):
@@ -192,10 +192,11 @@ class HiVT(pl.LightningModule):
 
         # --- G Step (Generator Update) ---
         if has_valid:
-            # Use the ORIGINAL fake_trajs (not detached) so gradients flow back to HiVT
+            # Here we use the ORIGINAL fake_trajs (NOT detached) 
+            # so that gradients flow back to the HiVT backbone.
             g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
             
-            # Combine losses: Supervised + Adversarial
+            # Combine losses: Regression + Classification + Adversarial
             g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
             
             opt_g.zero_grad()
@@ -210,7 +211,7 @@ class HiVT(pl.LightningModule):
 
         # --- Metrics & Logging ---
         if _HAS_REALISM_METRICS and has_valid:
-            # Pass detached tensors to metrics to prevent memory accumulation
+            # Use .detach() on metric inputs to ensure no gradients are held in memory
             self.val_endpoint_diversity.update(
                 y_hat[:, data['agent_index'], :, :2].detach(), 
                 pi[data['agent_index']].detach()
@@ -268,6 +269,27 @@ class HiVT(pl.LightningModule):
         )
         sch_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=self.T_max, eta_min=1e-6)
         return [opt_g, opt_d], [{"scheduler": sch_g, "interval": "epoch"}]
+
+    def _build_real_fake_dicts(self, data, y_hat, best_mode):
+        # Ensure we only take the (x, y) coordinates for the critics
+        real = data.y
+        fake = y_hat[best_mode, torch.arange(data.num_nodes), :, :2]
+        
+        # Do NOT use .item() or .numpy() here, stay in torch.Tensor
+        reg_mask = ~data['padding_mask'][:, self.historical_steps:]
+        keep = reg_mask.any(dim=1)
+        
+        real_trajs = {
+            "short": real[keep, :10],
+            "mid": real[keep, :20],
+            "long": real[keep]
+        }
+        fake_trajs = {
+            "short": fake[keep, :10],
+            "mid": fake[keep, :20],
+            "long": fake[keep]
+        }
+        return real_trajs, fake_trajs, keep
 
     @staticmethod
     def add_model_specific_args(parent_parser):
