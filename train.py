@@ -10,6 +10,7 @@ from models.hivt import HiVT
 
 # speed boost on Nvidia-A6000
 torch.set_float32_matmul_precision('medium')
+mp.set_start_method('spawn', force=True)
 
 def main():
     pl.seed_everything(2022)
@@ -68,7 +69,7 @@ def main():
         accelerator="gpu",
         devices=args.devices,
         strategy=strategy,
-        gradient_clip_val=0.5,
+        # gradient_clip_val=0.5,
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback], # Critical to include this
     )

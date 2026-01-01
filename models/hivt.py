@@ -142,8 +142,13 @@ class HiVT(pl.LightningModule):
         return real_trajs, fake_trajs, keep
 
     def training_step(self, data, batch_idx):
-        if torch.isnan(data.y).any(): return self.local_encoder.parameters().__next__().sum() * 0.0
+        # 1. Global Data Integrity Guard
+        if torch.isnan(data.y).any(): 
+            return self.local_encoder.parameters().__next__().sum() * 0.0
         
+        # -----------------------------------------------------
+        # Case A: Standard supervised training (no GAN)
+        # -----------------------------------------------------
         if not self.use_gan:
             y_hat, pi = self(data)
             reg_loss, cls_loss, _ = self._supervised_losses(data, y_hat, pi)
@@ -151,26 +156,62 @@ class HiVT(pl.LightningModule):
             self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=data.num_graphs)
             return loss
 
-        # Manual Optimization for GAN
+        # -----------------------------------------------------
+        # Case B: GAN training (Manual Optimization)
+        # -----------------------------------------------------
         opt_g, opt_d = self.optimizers()
+        
+        # Forward pass
         y_hat, pi = self(data)
+        
+        # Calculate supervised components
         reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
+        
+        # WTA: Critics only see the best mode to preserve minFDE accuracy
         real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
         has_valid = (real_trajs["long"].size(0) > 0)
 
-        # D Step
+        # --- D Step (Discriminator Update) ---
         for _ in range(self.critic_steps):
-            d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs) if has_valid else (y_hat.sum()*0, {})
-            opt_d.zero_grad(); self.manual_backward(d_loss); opt_d.step()
+            if has_valid:
+                d_loss, d_logs = self.d_loss_fn(self.critics, real_trajs, fake_trajs)
+                
+                opt_d.zero_grad()
+                self.manual_backward(d_loss)
+                
+                # Manual Gradient Clipping for D
+                self.clip_gradients(opt_d, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
+                
+                opt_d.step()
+            else:
+                d_loss, d_logs = (y_hat.sum() * 0.0, {})
 
-        # G Step
-        g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs) if has_valid else (y_hat.sum()*0, {})
-        g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
-        opt_g.zero_grad(); self.manual_backward(g_total); opt_g.step()
+        # --- G Step (Generator Update) ---
+        if has_valid:
+            g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
+            # Total loss: Regression + Classification + Weighted Adversarial
+            g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
+            
+            opt_g.zero_grad()
+            self.manual_backward(g_total)
+            
+            # Manual Gradient Clipping for G
+            # This protects your pre-trained weights from aggressive GAN gradients
+            self.clip_gradients(opt_g, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
+            
+            opt_g.step()
+        else:
+            g_total, g_logs = (reg_loss + cls_loss, {})
 
+        # --- Metrics & Logging ---
         if _HAS_REALISM_METRICS and has_valid:
+            # Pass both trajectory and probability for weighted diversity
             self.val_endpoint_diversity.update(y_hat[:, data['agent_index'], :, :2], pi[data['agent_index']])
+
         self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train_g_adv", g_logs.get("g_loss_long", 0.0), on_epoch=True, sync_dist=True)
+        self.log("train_d_loss", d_loss, on_epoch=True, sync_dist=True)
+
         return g_total
 
     def validation_step(self, data, batch_idx):
