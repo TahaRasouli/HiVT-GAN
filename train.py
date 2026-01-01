@@ -72,6 +72,7 @@ def main():
         # gradient_clip_val=0.5,
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback], # Critical to include this
+        log_every_n_steps=50,
     )
 
     datamodule = NuScenesHiVTDataModule(

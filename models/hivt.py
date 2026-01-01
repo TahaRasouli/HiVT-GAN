@@ -146,32 +146,34 @@ class HiVT(pl.LightningModule):
         if torch.isnan(data.y).any(): 
             return self.local_encoder.parameters().__next__().sum() * 0.0
         
+        # Capture batch size for logging
+        # We use num_graphs because 'train_batch_size=1' actually contains many graphs in PyG
+        bs = data.num_graphs 
+
         # --- Case A: Supervised Only ---
         if not self.use_gan:
             y_hat, pi = self(data)
             reg_loss, cls_loss, _ = self._supervised_losses(data, y_hat, pi)
             loss = reg_loss + cls_loss
-            self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=data.num_graphs)
+            self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, batch_size=bs)
             return loss
 
-        # --- Case B: GAN training (Manual Optimization) ---
+        # --- Case B: GAN training ---
         opt_g, opt_d = self.optimizers()
         
-        # Forward pass (creates the graph shared by G and D)
+        # Forward pass
         y_hat, pi = self(data)
         
-        # Calculate supervised components
+        # Supervised Losses
         reg_loss, cls_loss, best_mode = self._supervised_losses(data, y_hat, pi)
         
-        # WTA: Build trajectories for critics
+        # Build Real/Fake Dicts
         real_trajs, fake_trajs, keep = self._build_real_fake_dicts(data, y_hat, best_mode)
         has_valid = (real_trajs["long"].size(0) > 0)
 
-        # --- D Step (Discriminator Update) ---
+        # --- D Step ---
         d_loss_val = torch.tensor(0.0, device=self.device)
         if has_valid:
-            # CRITICAL FIX: Detach the fake trajectories for the Discriminator update.
-            # This prevents opt_d from trying to backward through the Generator's graph.
             fake_trajs_detached = {k: v.detach().requires_grad_(True) for k, v in fake_trajs.items()}
             
             for _ in range(self.critic_steps):
@@ -179,49 +181,38 @@ class HiVT(pl.LightningModule):
                 
                 opt_d.zero_grad()
                 self.manual_backward(d_loss)
-                
-                # Manual Gradient Clipping for D
                 self.clip_gradients(opt_d, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
-                
                 opt_d.step()
                 d_loss_val = d_loss.detach()
 
-        # --- G Step (Generator Update) ---
+        # --- G Step ---
         if has_valid:
-            # Here we use the ORIGINAL fake_trajs (NOT detached) 
-            # so that gradients flow back to the HiVT backbone.
             g_adv, g_logs = self.g_loss_fn(self.critics, fake_trajs)
-            
-            # Combine losses: Regression + Classification + Adversarial
             g_total = reg_loss + cls_loss + (self.lambda_adv * g_adv)
             
             opt_g.zero_grad()
             self.manual_backward(g_total)
-            
-            # Manual Gradient Clipping for G
             self.clip_gradients(opt_g, gradient_clip_val=0.5, gradient_clip_algorithm="norm")
-            
             opt_g.step()
         else:
             g_total = reg_loss + cls_loss
 
-        # --- Manual Scheduler Step ---
-        # Schedulers don't step automatically when automatic_optimization=False
+        # --- Scheduler Step ---
         if self.trainer.is_last_batch:
             sch = self.lr_schedulers()
             if sch is not None:
                 sch.step()
 
-        # --- Metrics & Logging ---
+        # --- Logging (Now clean!) ---
+        # We pass batch_size=bs to silence the warnings
+        self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log("train_d_loss", d_loss_val, on_epoch=True, sync_dist=True, batch_size=bs)
+        
         if _HAS_REALISM_METRICS and has_valid:
-            # Detach tensors for metrics to prevent memory accumulation
             self.val_endpoint_diversity.update(
                 y_hat[:, data['agent_index'], :, :2].detach(), 
                 pi[data['agent_index']].detach()
             )
-
-        self.log("train_reg_loss", reg_loss, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("train_d_loss", d_loss_val, on_epoch=True, sync_dist=True)
 
         return g_total
 
