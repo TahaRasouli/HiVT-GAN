@@ -53,7 +53,9 @@ def main():
     # 2. Model Initialization (Branch Logic)
     if args.train_diffusion:
         print("--- initializing DiVT Model ---")
-        # Ensure diff_steps is passed
+        # FORCE num_modes=1 for Diffusion
+        # This tells GlobalInteractor to output a single context vector [1, N, 128]
+        args.num_modes = 1 
         model = DiVT(**vars(args))
     else:
         print(f"--- initializing Standard HiVT (GAN={args.use_gan}) ---")

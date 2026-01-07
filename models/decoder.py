@@ -191,6 +191,7 @@ class DiffusionDecoder(nn.Module):
         t: [Batch]
         context: [Batch, EmbedDim] (From HiVT Global Interactor)
         """
+
         B, T, _ = x_noisy.shape
         
         # A. Embed Time
@@ -199,8 +200,8 @@ class DiffusionDecoder(nn.Module):
         
         # B. Embed Context (Global features from HiVT)
         # Context is originally [B, Embed], expand to [B, T, Embed]
-        ctx_emb = context.unsqueeze(1).expand(-1, T, -1)
-        
+        ctx_emb = context.unsqueeze(1).expand(-1, T, -1) 
+               
         # C. Embed Trajectory
         x_emb = self.traj_emb(x_noisy) # [B, T, Embed]
         

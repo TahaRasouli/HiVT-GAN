@@ -65,6 +65,11 @@ class DiVT(pl.LightningModule):
     def training_step(self, data, batch_idx):
         # A. Get Context (The Condition)
         context = self(data) # [Batch, Embed_Dim]
+
+        # We just want [Total_Nodes, 128]
+        if context.dim() > 2:
+            context = context.reshape(data.num_nodes, -1) 
+            # Since num_modes=1, this reshapes [1, 1, N, 128] -> [N, 128] safely.
         
         # B. Get Ground Truth Future
         y_gt = data.y # [Batch, 30, 2]
