@@ -24,7 +24,7 @@ class DiVT(pl.LightningModule):
         )
         self.global_interactor = GlobalInteractor(
             historical_steps=self.historical_steps,
-            embed_dim=embed_dim, edge_dim=2, num_modes=6,
+            embed_dim=embed_dim, edge_dim=2, num_modes=1,
             num_heads=8, num_layers=3, dropout=0.1
         )
         
