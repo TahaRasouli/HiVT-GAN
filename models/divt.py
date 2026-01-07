@@ -96,23 +96,17 @@ class DiVT(pl.LightningModule):
     @torch.no_grad()
     def validation_step(self, data, batch_idx):
         context = self(data)
-
-        if context.dim() == 4:
-            context = context.view(-1, self.hparams.embed_dim)
-
+        # Robust Reshape
+        context = context.reshape(-1, self.hparams.embed_dim)
         B = context.size(0)
         
-        # SAMPLING LOOP (The Slow Part)
-        # Start with pure noise
+        # SAMPLING LOOP
         x = torch.randn(B, 30, 2, device=self.device)
         
         for t in reversed(range(self.diff_steps)):
             t_batch = torch.full((B,), t, device=self.device, dtype=torch.long)
-            
-            # Predict noise
             noise_pred = self.decoder(x, t_batch, context)
             
-            # Mathematical update (DDPM)
             alpha = self.scheduler.alphas[t]
             alpha_cumprod = self.scheduler.alphas_cumprod[t]
             beta = self.scheduler.betas[t]
@@ -126,14 +120,32 @@ class DiVT(pl.LightningModule):
                 sigma = torch.sqrt(beta)
                 x = mean + sigma * noise
             else:
-                x = mean # Final denoised result
+                x = mean
 
-        # Validation Metrics
-        # Diffusion generates 1 mode per run. To act like HiVT (6 modes),
-        # we treat this single prediction as the "Best Mode" for now.
-        # Ideally, you run this loop 6 times to generate 6 modes.
-        self.val_minADE.update(x.unsqueeze(0), data.y)
-        self.val_minFDE.update(x.unsqueeze(0), data.y)
+        # --- METRICS FIX ---
+        # 1. Masking: Only evaluate on valid (non-padding) nodes
+        # 'padding_mask' is [Batch, Total_Steps]. We need the future part.
+        valid_mask = ~data['padding_mask'][:, self.historical_steps:] # [Batch, 30]
+        # We need to filter based on whether the *entire* future is valid or valid at last step
+        # FDE only cares about the last step.
+        valid_mask_fde = valid_mask[:, -1] # [Batch]
+        
+        # 2. Filter Tensors
+        # x is [Batch, 30, 2]
+        # data.y is [Batch, 30, 2]
+        
+        x_filtered = x[valid_mask_fde]       # [N_valid, 30, 2]
+        y_filtered = data.y[valid_mask_fde]  # [N_valid, 30, 2]
+        
+        # 3. Add Mode Dimension manually because Metric expects [Modes, Batch, Time, 2]
+        # We have 1 mode.
+        x_filtered = x_filtered.unsqueeze(0) # [1, N_valid, 30, 2]
+        
+        # 4. Update Metrics
+        # Note: We use the filtered data to avoid shape mismatches with padding
+        if x_filtered.size(1) > 0: # Check if we have valid agents
+            self.val_minADE.update(x_filtered, y_filtered)
+            self.val_minFDE.update(x_filtered, y_filtered)
         
         self.log("val_minADE", self.val_minADE, prog_bar=True, batch_size=B)
         self.log("val_minFDE", self.val_minFDE, prog_bar=True, batch_size=B)
