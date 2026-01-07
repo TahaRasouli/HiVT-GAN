@@ -40,13 +40,26 @@ class DiVT(pl.LightningModule):
         self.val_minFDE = FDE()
 
     def forward(self, data):
-        # We only use forward to get the Context Embedding
         if self.hparams.rotate:
-            # (Insert rotation logic here from original hivt.py if needed)
-            pass
+            rotate_mat = torch.empty(data.num_nodes, 2, 2, device=self.device)
+            sin_vals = torch.sin(data['rotate_angles'])
+            cos_vals = torch.cos(data['rotate_angles'])
+            rotate_mat[:, 0, 0] = cos_vals
+            rotate_mat[:, 0, 1] = -sin_vals
+            rotate_mat[:, 1, 0] = sin_vals
+            rotate_mat[:, 1, 1] = cos_vals
             
-        local_embed = self.local_encoder(data)
-        global_embed = self.global_interactor(data, local_embed)
+            # Rotate ground truth if available (crucial for loss calc later)
+            if data.y is not None:
+                data.y = torch.bmm(data.y, rotate_mat)
+            
+            data['rotate_mat'] = rotate_mat
+        else:
+            data['rotate_mat'] = None
+
+        # Now it is safe to call LocalEncoder
+        local_embed = self.local_encoder(data=data)
+        global_embed = self.global_interactor(data=data, local_embed=local_embed)
         return global_embed
 
     def training_step(self, data, batch_idx):
