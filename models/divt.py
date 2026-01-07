@@ -96,7 +96,6 @@ class DiVT(pl.LightningModule):
     @torch.no_grad()
     def validation_step(self, data, batch_idx):
         context = self(data)
-        # Robust Reshape
         context = context.reshape(-1, self.hparams.embed_dim)
         B = context.size(0)
         
@@ -123,27 +122,17 @@ class DiVT(pl.LightningModule):
                 x = mean
 
         # --- METRICS FIX ---
-        # 1. Masking: Only evaluate on valid (non-padding) nodes
-        # 'padding_mask' is [Batch, Total_Steps]. We need the future part.
-        valid_mask = ~data['padding_mask'][:, self.historical_steps:] # [Batch, 30]
-        # We need to filter based on whether the *entire* future is valid or valid at last step
-        # FDE only cares about the last step.
-        valid_mask_fde = valid_mask[:, -1] # [Batch]
+        valid_mask = ~data['padding_mask'][:, self.historical_steps:]
+        valid_mask_fde = valid_mask[:, -1]
         
-        # 2. Filter Tensors
-        # x is [Batch, 30, 2]
-        # data.y is [Batch, 30, 2]
+        # Filter predictions and targets
+        x_filtered = x[valid_mask_fde]       # Shape: [N_valid, 30, 2]
+        y_filtered = data.y[valid_mask_fde]  # Shape: [N_valid, 30, 2]
         
-        x_filtered = x[valid_mask_fde]       # [N_valid, 30, 2]
-        y_filtered = data.y[valid_mask_fde]  # [N_valid, 30, 2]
+        # REMOVED: x_filtered = x_filtered.unsqueeze(0) 
+        # We pass 3D tensors directly because your metric expects [Batch, Time, 2]
         
-        # 3. Add Mode Dimension manually because Metric expects [Modes, Batch, Time, 2]
-        # We have 1 mode.
-        x_filtered = x_filtered.unsqueeze(0) # [1, N_valid, 30, 2]
-        
-        # 4. Update Metrics
-        # Note: We use the filtered data to avoid shape mismatches with padding
-        if x_filtered.size(1) > 0: # Check if we have valid agents
+        if x_filtered.size(0) > 0: 
             self.val_minADE.update(x_filtered, y_filtered)
             self.val_minFDE.update(x_filtered, y_filtered)
         
