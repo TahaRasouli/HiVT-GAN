@@ -66,10 +66,10 @@ class DiVT(pl.LightningModule):
         # A. Get Context (The Condition)
         context = self(data) # [Batch, Embed_Dim]
 
-        # We just want [Total_Nodes, 128]
-        if context.dim() > 2:
-            context = context.reshape(data.num_nodes, -1) 
-            # Since num_modes=1, this reshapes [1, 1, N, 128] -> [N, 128] safely.
+        # If we have [Modes, Batch, Nodes, Embed], we want [Nodes, Embed]
+        if context.dim() == 4:
+            # Squeeze dim 0 (Modes) and dim 1 (Batch)
+            context = context.view(-1, self.hparams.embed_dim)
         
         # B. Get Ground Truth Future
         y_gt = data.y # [Batch, 30, 2]
@@ -96,6 +96,10 @@ class DiVT(pl.LightningModule):
     @torch.no_grad()
     def validation_step(self, data, batch_idx):
         context = self(data)
+
+        if context.dim() == 4:
+            context = context.view(-1, self.hparams.embed_dim)
+
         B = context.size(0)
         
         # SAMPLING LOOP (The Slow Part)
