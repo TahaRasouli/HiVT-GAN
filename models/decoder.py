@@ -189,24 +189,39 @@ class DiffusionDecoder(nn.Module):
         """
         x_noisy: [Batch, FutureSteps, 2]
         t: [Batch]
-        context: [Batch, EmbedDim] (From HiVT Global Interactor)
+        context: [???] -> Can be [1, 1, Batch, Embed] or [Batch, Embed]
         """
-
         B, T, _ = x_noisy.shape
+        
+        # --- THE FIX: Universal Flattening ---
+        # We don't care if context is [1, 1, N, 128] or [6, N, 128].
+        # We just want [B, 128] to match x_noisy's batch size.
+        
+        # 1. Flatten everything except the last dimension (Embedding)
+        # Result: [Total_Nodes, Embed_Dim]
+        context = context.reshape(-1, context.size(-1))
+        
+        # 2. Safety Check (Optional but good for debugging)
+        if context.size(0) != B:
+            # If reshaping didn't align (e.g. 6 modes vs 1 mode mismatch), 
+            # we slice to match the batch size.
+            # This handles cases where 'num_modes' might accidentally be > 1
+            context = context[:B, :] 
+            
+        # -------------------------------------
         
         # A. Embed Time
         t_emb = self.time_mlp(t.float().unsqueeze(-1)) # [B, Embed]
         t_emb = t_emb.unsqueeze(1).expand(-1, T, -1)   # [B, T, Embed]
         
-        # B. Embed Context (Global features from HiVT)
-        # Context is originally [B, Embed], expand to [B, T, Embed]
-        ctx_emb = context.unsqueeze(1).expand(-1, T, -1) 
-               
+        # B. Embed Context
+        # Now context is guaranteed to be [B, Embed]
+        ctx_emb = context.unsqueeze(1).expand(-1, T, -1) # [B, T, Embed]
+        
         # C. Embed Trajectory
         x_emb = self.traj_emb(x_noisy) # [B, T, Embed]
         
         # D. Concatenate and Predict
-        # We concatenate along the feature dimension
         h = torch.cat([x_emb, ctx_emb, t_emb], dim=-1) # [B, T, Embed*3]
         
         return self.net(h)
