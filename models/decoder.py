@@ -145,3 +145,67 @@ class MLPDecoder(nn.Module):
             return torch.cat((loc, scale), dim=-1), pi
         else:
             return loc, pi
+
+
+class DiffusionDecoder(nn.Module):
+    """
+    The Neural Network that predicts the noise.
+    Input: Noisy Trajectory + Timestep + HiVT Context
+    Output: Predicted Noise
+    """
+    def __init__(self, embed_dim=128, future_steps=30, out_dim=2):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.future_steps = future_steps
+        
+        # 1. Time Embedding (Sinusoidal like Transformer)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, embed_dim),
+            nn.Mish(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+        # 2. Trajectory Embedding
+        # We map the 2D coordinates to a higher dimension
+        self.traj_emb = nn.Linear(out_dim, embed_dim)
+        
+        # 3. Main Denoising Network (ResNet-style MLP)
+        # Input size = Traj_Emb + Context_Emb + Time_Emb = 3 * Embed_Dim
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim * 3, embed_dim * 2),
+            nn.LayerNorm(embed_dim * 2),
+            nn.Mish(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(embed_dim * 2, embed_dim * 2),
+            nn.LayerNorm(embed_dim * 2),
+            nn.Mish(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(embed_dim * 2, out_dim) # Predicts pure noise (epsilon)
+        )
+
+    def forward(self, x_noisy, t, context):
+        """
+        x_noisy: [Batch, FutureSteps, 2]
+        t: [Batch]
+        context: [Batch, EmbedDim] (From HiVT Global Interactor)
+        """
+        B, T, _ = x_noisy.shape
+        
+        # A. Embed Time
+        t_emb = self.time_mlp(t.float().unsqueeze(-1)) # [B, Embed]
+        t_emb = t_emb.unsqueeze(1).expand(-1, T, -1)   # [B, T, Embed]
+        
+        # B. Embed Context (Global features from HiVT)
+        # Context is originally [B, Embed], expand to [B, T, Embed]
+        ctx_emb = context.unsqueeze(1).expand(-1, T, -1)
+        
+        # C. Embed Trajectory
+        x_emb = self.traj_emb(x_noisy) # [B, T, Embed]
+        
+        # D. Concatenate and Predict
+        # We concatenate along the feature dimension
+        h = torch.cat([x_emb, ctx_emb, t_emb], dim=-1) # [B, T, Embed*3]
+        
+        return self.net(h)

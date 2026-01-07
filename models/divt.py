@@ -1,0 +1,139 @@
+import pytorch_lightning as pl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from metrics import ADE, FDE, MR
+from models import GlobalInteractor, LocalEncoder
+from models import DiffusionDecoder
+from utils import VarianceSchedule
+
+class DiVT(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        # 1. Reuse HiVT Encoders
+        self.historical_steps = kwargs.get("historical_steps", 20)
+        embed_dim = kwargs.get("embed_dim", 128)
+        
+        self.local_encoder = LocalEncoder(
+            historical_steps=self.historical_steps,
+            node_dim=2, edge_dim=2, embed_dim=embed_dim,
+            num_heads=8, dropout=0.1, num_temporal_layers=4,
+            local_radius=50
+        )
+        self.global_interactor = GlobalInteractor(
+            historical_steps=self.historical_steps,
+            embed_dim=embed_dim, edge_dim=2, num_modes=6,
+            num_heads=8, num_layers=3, dropout=0.1
+        )
+        
+        # 2. Diffusion Specifics
+        self.diff_steps = kwargs.get("diff_steps", 100)
+        self.scheduler = VarianceSchedule(num_steps=self.diff_steps)
+        self.decoder = DiffusionDecoder(embed_dim=embed_dim, future_steps=30)
+        
+        # 3. Metrics
+        self.minADE = ADE()
+        self.minFDE = FDE()
+        self.val_minADE = ADE() # Separate instance for validation logging
+        self.val_minFDE = FDE()
+
+    def forward(self, data):
+        # We only use forward to get the Context Embedding
+        if self.hparams.rotate:
+            # (Insert rotation logic here from original hivt.py if needed)
+            pass
+            
+        local_embed = self.local_encoder(data)
+        global_embed = self.global_interactor(data, local_embed)
+        return global_embed
+
+    def training_step(self, data, batch_idx):
+        # A. Get Context (The Condition)
+        context = self(data) # [Batch, Embed_Dim]
+        
+        # B. Get Ground Truth Future
+        y_gt = data.y # [Batch, 30, 2]
+        
+        # C. Sample Random Noise & Timestep
+        noise = torch.randn_like(y_gt)
+        t = torch.randint(0, self.diff_steps, (y_gt.size(0),), device=self.device)
+        
+        # D. Add Noise (Forward Diffusion)
+        x_noisy = self.scheduler.add_noise(y_gt, noise, t)
+        
+        # E. Predict Noise (Reverse Diffusion)
+        # The model tries to guess what noise was added
+        noise_pred = self.decoder(x_noisy, t, context)
+        
+        # F. Loss: Simple MSE
+        # Mask out padding to avoid learning from zeros
+        reg_mask = ~data['padding_mask'][:, self.historical_steps:]
+        loss = F.mse_loss(noise_pred[reg_mask], noise[reg_mask])
+        
+        self.log("train_diff_loss", loss, prog_bar=True, batch_size=data.num_graphs)
+        return loss
+
+    @torch.no_grad()
+    def validation_step(self, data, batch_idx):
+        context = self(data)
+        B = context.size(0)
+        
+        # SAMPLING LOOP (The Slow Part)
+        # Start with pure noise
+        x = torch.randn(B, 30, 2, device=self.device)
+        
+        for t in reversed(range(self.diff_steps)):
+            t_batch = torch.full((B,), t, device=self.device, dtype=torch.long)
+            
+            # Predict noise
+            noise_pred = self.decoder(x, t_batch, context)
+            
+            # Mathematical update (DDPM)
+            alpha = self.scheduler.alphas[t]
+            alpha_cumprod = self.scheduler.alphas_cumprod[t]
+            beta = self.scheduler.betas[t]
+            
+            coef1 = 1 / torch.sqrt(alpha)
+            coef2 = (1 - alpha) / torch.sqrt(1 - alpha_cumprod)
+            mean = coef1 * (x - coef2 * noise_pred)
+            
+            if t > 0:
+                noise = torch.randn_like(x)
+                sigma = torch.sqrt(beta)
+                x = mean + sigma * noise
+            else:
+                x = mean # Final denoised result
+
+        # Validation Metrics
+        # Diffusion generates 1 mode per run. To act like HiVT (6 modes),
+        # we treat this single prediction as the "Best Mode" for now.
+        # Ideally, you run this loop 6 times to generate 6 modes.
+        self.val_minADE.update(x.unsqueeze(0), data.y)
+        self.val_minFDE.update(x.unsqueeze(0), data.y)
+        
+        self.log("val_minADE", self.val_minADE, prog_bar=True, batch_size=B)
+        self.log("val_minFDE", self.val_minFDE, prog_bar=True, batch_size=B)
+
+    def on_validation_epoch_end(self):
+        """
+        Prints a clean summary of the epoch's performance to the terminal,
+        keeping a permanent log visible to the user.
+        """
+        metrics = self.trainer.callback_metrics
+        if self.global_rank == 0:
+            # We fetch the metrics from the trainer's dictionary
+            ade = metrics.get('val_minADE', 0.0)
+            fde = metrics.get('val_minFDE', 0.0)
+            loss = metrics.get('train_diff_loss', 0.0)
+            
+            print(f"\nEpoch {self.current_epoch:03d} | "
+                  f"Train Loss: {loss:.4f} | "
+                  f"val_minADE: {ade:.4f} | "
+                  f"val_minFDE: {fde:.4f}")
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=5e-4, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=64)
+        return [optimizer], [scheduler]

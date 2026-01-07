@@ -1,5 +1,6 @@
 from models.decoder import GRUDecoder
 from models.decoder import MLPDecoder
+from models.decoder import DiffusionDecoder
 from models.embedding import MultipleInputEmbedding
 from models.embedding import SingleInputEmbedding
 from models.global_interactor import GlobalInteractor

@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
+import torch.nn.functional as F
 
 
 class TemporalData(Data):
@@ -144,3 +145,38 @@ def init_weights(m: nn.Module) -> None:
                 nn.init.zeros_(param)
             elif 'bias_hh' in name:
                 nn.init.zeros_(param)
+
+
+class VarianceSchedule(nn.Module):
+    """
+    Handles the math for adding noise (Forward Process) and removing it (Reverse Process).
+    Using a standard linear beta schedule.
+    """
+    def __init__(self, num_steps=100, beta_1=1e-4, beta_T=0.02):
+        super().__init__()
+        self.num_steps = num_steps
+        
+        # Define schedule parameters
+        betas = torch.linspace(beta_1, beta_T, num_steps)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
+
+        # Register buffers (automatically moves to GPU with the model)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
+        
+        # Calculations for posterior q(x_{t-1} | x_t, x_0)
+        self.register_buffer("posterior_variance", betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod))
+
+    def add_noise(self, x_start, x_noise, t):
+        """
+        Forward process: x_t = sqrt(alpha_bar) * x_0 + sqrt(1-alpha_bar) * epsilon
+        """
+        # Broadcast coefficients to match x shape [Batch, Steps, 2]
+        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1, 1)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1)
+        return sqrt_alpha * x_start + sqrt_one_minus_alpha * x_noise
