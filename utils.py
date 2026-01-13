@@ -77,6 +77,40 @@ class DistanceDropEdge(object):
         edge_attr = edge_attr[mask]
         return edge_index, edge_attr
 
+class SimpleTokenizer:
+    def __init__(self):
+        # Based on your examples, the vocab is tiny (~20-30 words)
+        self.word2idx = {"<PAD>": 0, "<SOS>": 1, "<EOS>": 2}
+        self.idx2word = {0: "<PAD>", 1: "<SOS>", 2: "<EOS>"}
+        self.idx = 3
+
+    def fit(self, captions_list):
+        for cap in captions_list:
+            # Clean and split
+            words = cap.lower().replace(".", "").split()
+            for w in words:
+                if w not in self.word2idx:
+                    self.word2idx[w] = self.idx
+                    self.idx2word[self.idx] = w
+                    self.idx += 1
+                    
+    def encode(self, caption, max_len=15):
+        words = caption.lower().replace(".", "").split()
+        ids = [self.word2idx.get(w, 0) for w in words]
+        ids = [1] + ids + [2] # Add SOS and EOS
+        
+        # Padding
+        if len(ids) < max_len:
+            ids += [0] * (max_len - len(ids))
+        return ids[:max_len]
+        
+    def decode(self, ids):
+        words = []
+        for i in ids:
+            if i == 2: break # EOS
+            if i not in [0, 1]:
+                words.append(self.idx2word.get(i, ""))
+        return " ".join(words)
 
 def init_weights(m: nn.Module) -> None:
     if isinstance(m, nn.Linear):
