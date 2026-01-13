@@ -1,35 +1,40 @@
 import os
+import sys
 import torch
 import json
 import random
 from tqdm import tqdm
 
+# --- 1. SETUP IMPORTS (CRITICAL FOR TORCH.LOAD) ---
+# Add the current directory (project root) to sys.path to find utils
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir) # Go up one level from 'datasets/'
+sys.path.append(project_root)
+
+# We MUST import TemporalData so torch.load knows how to reconstruct the object
+try:
+    from utils import TemporalData
+except ImportError:
+    print("WARNING: Could not import TemporalData. Torch.load might fail if the objects use this class.")
+
 # CONFIG
 DATA_DIR = "/mount/studenten/projects/rasoulta/dataset/captioned"
 OUTPUT_FILE = "balanced_splits.json"
-VAL_SPLIT_RATIO = 0.1 # 10% for validation
+VAL_SPLIT_RATIO = 0.1 
 
 def get_behavior_type(caption):
-    """Classifies caption into 'Common' (Drop) or 'Rare' (Keep)"""
     text = caption.lower()
     
-    # Rare behaviors (Keep ALL of these)
-    if "turn" in text: return "rare"
-    if "change lane" in text: return "rare"
-    if "intersection" in text: return "rare"
-    if "roundabout" in text: return "rare"
+    # Rare behaviors (Keep ALL)
+    if any(x in text for x in ["turn", "change lane", "intersection", "roundabout", "merge"]):
+        return "rare"
     
-    # Common behaviors (Downsample these)
-    if "continue straight" in text: return "common"
-    if "stop" in text: return "common"
-    if "stationary" in text: return "common"
-    
+    # Common behaviors (Downsample)
     return "common"
 
 def main():
     print(f"Scanning files in {DATA_DIR}...")
     
-    # 1. Collect all PT files
     all_files = []
     for root, _, files in os.walk(DATA_DIR):
         for f in files:
@@ -38,35 +43,63 @@ def main():
                 
     print(f"Found {len(all_files)} files. Analyzing content...")
     
-    # 2. Categorize
     rare_files = []
     common_files = []
+    errors = 0
     
+    # DEBUG: Check the first file to ensure structure is correct
+    if len(all_files) > 0:
+        try:
+            test_data = torch.load(all_files[0])
+            print("\n[DEBUG] Inspecting first file structure:")
+            print(f"Type: {type(test_data)}")
+            if hasattr(test_data, 'caption_dict'):
+                print(f"Caption Dict: {test_data.caption_dict}")
+            else:
+                print("(!) 'caption_dict' attribute MISSING on first file.")
+                print(f"Available keys/attributes: {test_data.__dict__.keys()}")
+        except Exception as e:
+            print(f"\n[CRITICAL] Failed to load first file: {e}")
+            return
+
     for fpath in tqdm(all_files):
         try:
-            # We assume the file has 'caption_dict'
-            # To be fast, we rely on the fact that torch.load loads the whole object. 
-            # If this is too slow, we just have to wait once.
             data = torch.load(fpath)
             
-            if not hasattr(data, 'caption_dict'): continue
+            # Robust extraction
+            caption = ""
+            if hasattr(data, 'caption_dict'):
+                caption = data.caption_dict.get('driving_behavior', "")
             
-            caption = data.caption_dict.get('driving_behavior', "")
+            if not caption:
+                # Fallback: maybe it didn't save correctly?
+                continue
+
             b_type = get_behavior_type(caption)
             
             if b_type == "rare":
                 rare_files.append(fpath)
             else:
                 common_files.append(fpath)
-        except:
+        except Exception as e:
+            errors += 1
             continue
 
+    print("\n--- Analysis Results ---")
     print(f"Rare Cases (Turns/LaneChange): {len(rare_files)}")
     print(f"Common Cases (Straight/Stop): {len(common_files)}")
+    print(f"Errors/Skipped: {errors}")
     
-    # 3. Balance
-    # Strategy: Keep ALL rare files. Keep equal amount of common files.
-    target_common_count = len(rare_files) * 2 # Allow 2:1 ratio (Straight is still important)
+    if len(rare_files) == 0 and len(common_files) == 0:
+        print("ERROR: No valid data found. Check the DEBUG output above.")
+        return
+
+    # Balancing Strategy
+    # We want at least a 30/70 split if possible, or 50/50
+    target_common_count = len(rare_files) * 2 
+    
+    # If we have very few rare cases, don't delete all common files, keep a minimum floor
+    target_common_count = max(target_common_count, 1000) 
     
     if len(common_files) > target_common_count:
         print(f"Downsampling Common files from {len(common_files)} to {target_common_count}...")
@@ -78,7 +111,7 @@ def main():
     
     print(f"Final Balanced Dataset Size: {len(final_dataset)}")
     
-    # 4. Split Train/Val
+    # Split
     val_size = int(len(final_dataset) * VAL_SPLIT_RATIO)
     val_set = final_dataset[:val_size]
     train_set = final_dataset[val_size:]
