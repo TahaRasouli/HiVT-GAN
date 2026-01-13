@@ -8,39 +8,34 @@ from utils import TemporalData
 class NuScenesHiVTDataset(Dataset):
     """
     HiVT-compatible dataset that loads specific files from a JSON split list.
-    Used for balanced training (Captioning).
     """
 
     def __init__(
         self,
-        split_file: str,          # <--- The new argument causing the crash
-        split: str = "train",     # 'train' or 'val'
+        split_file: str,
+        split: str = "train",
         tokenizer=None,
         transform=None,
-        # Kept for compatibility but unused if split_file is provided
-        root: str = None,         
+        root: str = None, # Unused
         max_samples: Optional[int] = None,
     ):
         self.split = split
         self.transform = transform
         self.tokenizer = tokenizer
         
-        # Load the specific file list from JSON
         if not os.path.exists(split_file):
             raise FileNotFoundError(f"Split file not found: {split_file}")
             
         with open(split_file, 'r') as f:
             splits = json.load(f)
             
-        self._file_paths = splits[split] # List of absolute paths
+        self._file_paths = splits[split]
         
-        # Optional: Limit samples for debugging
         if max_samples is not None:
             self._file_paths = self._file_paths[:max_samples]
             
         print(f"[{split.upper()}] Loaded {len(self._file_paths)} samples from split file.")
 
-        # Initialize Dataset with no root (since we use absolute paths)
         super().__init__(root=None, transform=transform)
 
     def len(self) -> int:
@@ -54,12 +49,14 @@ class NuScenesHiVTDataset(Dataset):
         # Tokenization Logic
         if self.tokenizer is not None:
             caption_dict = getattr(data, 'caption_dict', {})
-            # We strictly use 'driving_behavior' as planned
             raw_text = caption_dict.get('driving_behavior', "")
             
             # Encode using the tokenizer
             ids = self.tokenizer.encode(raw_text)
-            data.caption_ids = torch.LongTensor(ids)
+            
+            # --- THE FIX IS HERE ---
+            # Unsqueeze to [1, Seq_Len] so PyG collates to [Batch, Seq_Len]
+            data.caption_ids = torch.LongTensor(ids).unsqueeze(0) 
         
         return data
 
