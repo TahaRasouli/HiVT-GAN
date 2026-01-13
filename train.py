@@ -23,6 +23,7 @@ import torch
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.hivt import HiVT
 from models.cvae_gan import CVAE_GAN
+from models.hivt_x import HiVTX  # <--- NEW IMPORT
 
 # speed boost on Nvidia-A6000
 torch.set_float32_matmul_precision('medium')
@@ -45,77 +46,104 @@ def main():
     # Training arguments
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--max_epochs", type=int, default=64)
-    parser.add_argument("--monitor", type=str, default="val_minFDE", choices=["val_minADE", "val_minFDE", "val_minMR"])
+    parser.add_argument("--monitor", type=str, default="val_minFDE", choices=["val_minADE", "val_minFDE", "val_minMR", "val_cap_loss"]) # Added val_cap_loss
     parser.add_argument("--save_top_k", type=int, default=5)
     
-    # --- NEW ARGUMENTS (Ensure these appear only ONCE) ---
+    # --- MODEL FLAGS ---
     parser.add_argument("--train_cvae_gan", action="store_true")
-    parser.add_argument("--grad_clip", type=float, default=None)   # <--- Check for duplicates of this
+    parser.add_argument("--train_caption", action="store_true") # <--- NEW FLAG
+    
+    parser.add_argument("--grad_clip", type=float, default=None)
     parser.add_argument("--freeze_encoder", action="store_true")
-    # -----------------------------------------------------
 
     # HiVT model specific args
     parser = HiVT.add_model_specific_args(parser)
     args = parser.parse_args()
 
-    # 1. Lower the Learning Rate for fine-tuning if a checkpoint is provided
+    # 1. Lower the Learning Rate for fine-tuning
     if args.ckpt_path:
         print(f"Fine-tuning detected. Lowering Learning Rate to 1e-4")
         args.lr = 1e-4 
 
-    # 2. Model Initialization
-    if args.train_cvae_gan:
+    # =====================================================
+    # 2. DATA MODULE (Moved UP to get vocab_size)
+    # =====================================================
+    datamodule = NuScenesHiVTDataModule(
+        root=args.root,
+        train_batch_size=args.train_batch_size,
+        val_batch_size=args.val_batch_size,
+        shuffle=args.shuffle,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+    )
+    # Ensure vocab is built/loaded so we can get the size
+    datamodule.prepare_data() 
+    vocab_size = len(datamodule.tokenizer.word2idx)
+    print(f"--- DataModule Ready. Vocab Size: {vocab_size} ---")
+
+    # =====================================================
+    # 3. MODEL INITIALIZATION
+    # =====================================================
+    actual_fit_path = args.ckpt_path
+    
+    # CASE A: Captioning (HiVT-X)
+    if args.train_caption:
+        print("--- initializing HiVT-X (Captioning) Model ---")
+        if not args.ckpt_path:
+            raise ValueError("Caption training requires --ckpt_path to load the CVAE-GAN backbone!")
+        
+        # Initialize HiVT-X with the backbone path and vocab size
+        model = HiVTX(cvae_gan_ckpt=args.ckpt_path, vocab_size=vocab_size, **vars(args))
+        
+        # We start a NEW training session for the captioner, so we don't pass ckpt_path to trainer.fit
+        # (The backbone weights are already loaded inside HiVTX.__init__)
+        actual_fit_path = None
+        
+        # Override monitor for captioning
+        if args.monitor == "val_minFDE": 
+            args.monitor = "val_cap_loss"
+
+    # CASE B: CVAE-GAN
+    elif args.train_cvae_gan:
         print("--- initializing CVAE_GAN Model ---")
-        # Ensure num_modes is 1 for the Generator part of CVAE-GAN
         args.num_modes = 1 
         model = CVAE_GAN(**vars(args))
+        
+    # CASE C: Standard HiVT
     else:
         print("--- initializing Standard HiVT Model ---")
         model = HiVT(**vars(args))
 
-    # --- WARM START / TRANSFER LEARNING LOGIC ---
-    actual_fit_path = args.ckpt_path
-    
-    if args.ckpt_path:
+    # =====================================================
+    # 4. WARM START / TRANSFER LOGIC (For Cases B & C)
+    # =====================================================
+    if args.ckpt_path and not args.train_caption:
         print(f"--- Loading Weights from: {args.ckpt_path} ---")
         
-        # === FIX STARTS HERE ===
-        # If we are freezing the encoder, we CANNOT load the optimizer state 
-        # because the parameter groups have changed. We must force a fresh start.
         if args.freeze_encoder:
             print("(!) Freezing Enabled: Loading weights manually and resetting optimizer.")
             ckpt = torch.load(args.ckpt_path, map_location="cpu")
             model.load_state_dict(ckpt['state_dict'], strict=False)
-            
-            # Set this to None so Lightning doesn't try to load the old optimizer
             actual_fit_path = None 
-            
-        # ... (Keep the rest of your logic below, usually in an 'else' block now) ...
         else:
+            # Smart Transfer Logic (Keep your existing logic here)
             ckpt = torch.load(args.ckpt_path, map_location="cpu")
             state_dict = ckpt['state_dict']
-            
-            # Check if we are resuming a GAN run or starting fresh from CVAE
             is_gan_checkpoint = any("critic" in k for k in state_dict.keys())
             
             if not is_gan_checkpoint and args.train_cvae_gan:
-                # ... (Your existing logic) ...
                 print("Detected CVAE checkpoint -> Transferring to CVAE_GAN.")
                 model.load_state_dict(state_dict, strict=False)
                 actual_fit_path = None 
-                
             elif not is_gan_checkpoint and not args.train_cvae_gan:
-                # ... (Your existing logic) ...
                 print("Detected CVAE checkpoint -> Transferring to Standard HiVT.")
                 keys_to_remove = [k for k in state_dict.keys() if "decoder" in k or "multihead_proj" in k]
-                for k in keys_to_remove:
-                    del state_dict[k]
+                for k in keys_to_remove: del state_dict[k]
                 model.load_state_dict(state_dict, strict=False)
                 actual_fit_path = None
-                
             else:
                 print("Detected matching checkpoint type. Full resume enabled.")
-                # This keeps actual_fit_path set, which is what we want ONLY for normal resumes
 
     # Callbacks
     checkpoint_callback = ModelCheckpoint(
@@ -135,16 +163,6 @@ def main():
         callbacks=[checkpoint_callback],
         log_every_n_steps=50,
         num_sanity_val_steps=0,
-        # gradient_clip_val=args.grad_clip  <--- REMOVE THIS LINE, we do it in the model now
-    )
-    datamodule = NuScenesHiVTDataModule(
-        root=args.root,
-        train_batch_size=args.train_batch_size,
-        val_batch_size=args.val_batch_size,
-        shuffle=args.shuffle,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
-        persistent_workers=args.persistent_workers,
     )
 
     trainer.fit(model, datamodule, ckpt_path=actual_fit_path)
