@@ -71,59 +71,76 @@ def visualize():
     loader = datamodule.val_dataloader()
     
     # 3. Find interesting samples
-    print("Searching for turns/lane changes...")
+    print("Searching for HIGH VELOCITY turns/lane changes...")
     count = 0
     
     for batch in loader:
-        if count >= 3: break # Generate 3 examples
+        if count >= 3: break 
         
+        # Move to device first to check values
+        data = batch.to(model.device)
+        
+        # --- NEW FILTERING LOGIC ---
+        # 1. Get Ground Truth Trajectory of Ego (Node 0)
+        gt_traj = data.y[0] # [30, 2]
+        
+        # 2. Calculate Displacement (Distance between start and end)
+        displacement = torch.norm(gt_traj[-1] - gt_traj[0]).item()
+        
+        # 3. Filter: Must move at least 10 meters (to avoid stationary cars)
+        if displacement < 10.0:
+            continue
+            
+        # 4. Check Caption for "turn" or "change"
         gt_ids = batch.caption_ids[0]
         gt_text = model.tokenizer.decode(gt_ids)
         
-        # Filter for interesting maneuvers
-        if "turn" in gt_text or "change" in gt_text:
-            data = batch.to(model.device)
-            
-            with torch.no_grad():
-                # A. Get Context
-                global_embed, _ = model._get_ego_features(data) # [1, 128]
-                
-                # B. Generate Trajectory (Single Mode for clarity in attention map)
-                # We force the CVAE to give us the BEST reconstruction (z=0 or Mean)
-                # For visualization, let's just use the Ground Truth trajectory to see 
-                # if the captioner understands the PERFECT path.
-                traj_input = data.y[0].unsqueeze(0) # [1, 30, 2]
-                
-                # C. Generate Caption + Attention
-                # Note: We added return_attn=True to the captioner forward method!
-                logits, attn_weights = model.captioner(
-                    global_embed, traj_input, captions=None, return_attn=True
-                )
-                
-                # Decode Words
-                pred_ids = logits.argmax(dim=-1)[0]
-                pred_text = model.tokenizer.decode(pred_ids)
-                
-                # Clean up words list for plotting
-                words = []
-                for idx in pred_ids:
-                    word = model.tokenizer.idx2word[idx.item()]
-                    if word == "<EOS>": break
-                    if word not in ["<PAD>", "<SOS>"]:
-                        words.append(word)
-                        
-                # Extract relevant attention weights [Len_Words, 30]
-                # attn_weights is [1, Seq, 30] -> [Seq, 30]
-                relevant_attn = attn_weights[0, :len(words), :]
+        if "turn" not in gt_text and "change" not in gt_text:
+            continue
 
-                print(f"Sample {count}: {pred_text}")
-                plot_attention(
-                    traj_input[0], 
-                    words, 
-                    relevant_attn, 
-                    f"attention_viz_{count}.png"
-                )
-                count += 1
+        # If we reach here, we have a Fast Moving Car doing a Turn!
+        print(f"Found Sample: {gt_text} | Displacement: {displacement:.2f}m")
+            
+        with torch.no_grad():
+            # A. Get Context
+            global_embed, _ = model._get_ego_features(data) # [1, 128]
+            
+            # B. Generate Trajectory (Single Mode for clarity in attention map)
+            # We force the CVAE to give us the BEST reconstruction (z=0 or Mean)
+            # For visualization, let's just use the Ground Truth trajectory to see 
+            # if the captioner understands the PERFECT path.
+            traj_input = data.y[0].unsqueeze(0) # [1, 30, 2]
+            
+            # C. Generate Caption + Attention
+            # Note: We added return_attn=True to the captioner forward method!
+            logits, attn_weights = model.captioner(
+                global_embed, traj_input, captions=None, return_attn=True
+            )
+            
+            # Decode Words
+            pred_ids = logits.argmax(dim=-1)[0]
+            pred_text = model.tokenizer.decode(pred_ids)
+            
+            # Clean up words list for plotting
+            words = []
+            for idx in pred_ids:
+                word = model.tokenizer.idx2word[idx.item()]
+                if word == "<EOS>": break
+                if word not in ["<PAD>", "<SOS>"]:
+                    words.append(word)
+                    
+            # Extract relevant attention weights [Len_Words, 30]
+            # attn_weights is [1, Seq, 30] -> [Seq, 30]
+            relevant_attn = attn_weights[0, :len(words), :]
+
+            print(f"Sample {count}: {pred_text}")
+            plot_attention(
+                traj_input[0], 
+                words, 
+                relevant_attn, 
+                f"attention_viz_{count}.png"
+            )
+            count += 1
 
 if __name__ == "__main__":
     visualize()
