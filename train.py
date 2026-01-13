@@ -23,7 +23,7 @@ import torch
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.hivt import HiVT
 from models.cvae_gan import CVAE_GAN
-from models.hivt_x import HiVTX  # <--- NEW IMPORT
+from models.hivt-x import HiVTX  # <--- NEW IMPORT
 
 # speed boost on Nvidia-A6000
 torch.set_float32_matmul_precision('medium')
