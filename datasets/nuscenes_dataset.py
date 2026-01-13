@@ -1,115 +1,99 @@
 import os
-from typing import Optional, List
-
+import json
 import torch
+from typing import List, Optional
 from torch_geometric.data import Dataset, Batch
-
 from utils import TemporalData
 
 class NuScenesHiVTDataset(Dataset):
     """
-    HiVT-compatible nuScenes dataset with Captioning support.
+    HiVT-compatible dataset that loads specific files from a JSON split list.
+    Used for balanced training (Captioning).
     """
 
     def __init__(
         self,
-        root: str,
-        split: str = "train",
+        split_file: str,          # <--- The new argument causing the crash
+        split: str = "train",     # 'train' or 'val'
+        tokenizer=None,
         transform=None,
+        # Kept for compatibility but unused if split_file is provided
+        root: str = None,         
         max_samples: Optional[int] = None,
-        tokenizer=None, # <--- NEW ARGUMENT
     ):
         self.split = split
-        self._directory = f"{split}_processed"
-        self.root = root
         self.transform = transform
-        self.tokenizer = tokenizer # <--- STORE TOKENIZER
-
-        self._processed_dir = os.path.join(self.root, self._directory)
-        if not os.path.isdir(self._processed_dir):
-            raise FileNotFoundError(f"Processed directory not found: {self._processed_dir}")
-
-        self._processed_file_names = sorted(
-            f for f in os.listdir(self._processed_dir) if f.endswith(".pt")
-        )
-
-        if max_samples is not None:
-            self._processed_file_names = self._processed_file_names[:max_samples]
-
-        super().__init__(root, transform=transform)
-
-    @property
-    def processed_dir(self) -> str:
-        return self._processed_dir
-
-    @property
-    def processed_file_names(self) -> List[str]:
-        return self._processed_file_names
-
-    def _sanitize(self, data):
-        # ... (Keep your existing sanitation logic here) ...
-        # [Copy-paste the previous _sanitize method body here]
+        self.tokenizer = tokenizer
         
-        # Always [2, E]
-        if hasattr(data, "lane_actor_index"):
-            lai = data.lane_actor_index
-            if not torch.is_tensor(lai):
-                data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
-            elif lai.numel() == 0:
-                data.lane_actor_index = lai.reshape(2, 0)
-            elif lai.dim() == 1 and lai.size(0) == 2:
-                data.lane_actor_index = lai.reshape(2, 1)
+        # Load the specific file list from JSON
+        if not os.path.exists(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
+            
+        with open(split_file, 'r') as f:
+            splits = json.load(f)
+            
+        self._file_paths = splits[split] # List of absolute paths
+        
+        # Optional: Limit samples for debugging
+        if max_samples is not None:
+            self._file_paths = self._file_paths[:max_samples]
+            
+        print(f"[{split.upper()}] Loaded {len(self._file_paths)} samples from split file.")
 
-        # Always [E, 2]
-        if hasattr(data, "lane_actor_vectors"):
-            lav = data.lane_actor_vectors
-            if not torch.is_tensor(lav):
-                data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
-            elif lav.numel() == 0:
-                data.lane_actor_vectors = lav.reshape(0, 2)
-
-        # Always [L, 2]
-        if hasattr(data, "lane_vectors"):
-            lv = data.lane_vectors
-            if not torch.is_tensor(lv):
-                data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
-            elif lv.numel() == 0:
-                data.lane_vectors = lv.reshape(0, 2)
-
-        # Always [2, E]
-        if hasattr(data, "edge_index"):
-            ei = data.edge_index
-            if ei.numel() == 0:
-                data.edge_index = ei.reshape(2, 0)
-            elif ei.dim() == 1 and ei.size(0) == 2:
-                data.edge_index = ei.reshape(2, 1)
-
-        return data
+        # Initialize Dataset with no root (since we use absolute paths)
+        super().__init__(root=None, transform=transform)
 
     def len(self) -> int:
-        return len(self._processed_file_names)
+        return len(self._file_paths)
 
     def get(self, idx: int) -> TemporalData:
-        path = os.path.join(self.processed_dir, self._processed_file_names[idx])
+        path = self._file_paths[idx]
         data = torch.load(path)
         data = self._sanitize(data)
         
-        # --- NEW CAPTION LOGIC ---
+        # Tokenization Logic
         if self.tokenizer is not None:
-            # Extract caption or use empty string if missing
             caption_dict = getattr(data, 'caption_dict', {})
             # We strictly use 'driving_behavior' as planned
             raw_text = caption_dict.get('driving_behavior', "")
             
-            # Tokenize
+            # Encode using the tokenizer
             ids = self.tokenizer.encode(raw_text)
-            
-            # Store as LongTensor
             data.caption_ids = torch.LongTensor(ids)
         
-        assert isinstance(data, TemporalData)
+        return data
+
+    def _sanitize(self, data):
+        # 1. Check Lane Actor Index [2, E]
+        if hasattr(data, "lane_actor_index"):
+             lai = data.lane_actor_index
+             if not torch.is_tensor(lai) or lai.numel() == 0:
+                 data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
+             elif lai.dim() == 1: 
+                 data.lane_actor_index = lai.reshape(2, 1)
+
+        # 2. Check Lane Actor Vectors [E, 2]
+        if hasattr(data, "lane_actor_vectors"):
+             lav = data.lane_actor_vectors
+             if not torch.is_tensor(lav) or lav.numel() == 0:
+                 data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
+
+        # 3. Check Lane Vectors [L, 2]
+        if hasattr(data, "lane_vectors"):
+             lv = data.lane_vectors
+             if not torch.is_tensor(lv) or lv.numel() == 0:
+                 data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
+                 
+        # 4. Check Edge Index [2, E]
+        if hasattr(data, "edge_index"):
+             ei = data.edge_index
+             if ei.numel() == 0: 
+                 data.edge_index = ei.reshape(2, 0)
+             elif ei.dim() == 1: 
+                 data.edge_index = ei.reshape(2, 1)
+             
         return data
 
     @staticmethod
-    def collate_fn(batch: List[TemporalData]) -> Batch:
+    def collate_fn(batch):
         return Batch.from_data_list(batch)
