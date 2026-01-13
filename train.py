@@ -69,7 +69,8 @@ def main():
     # 2. DATA MODULE (Moved UP to get vocab_size)
     # =====================================================
     datamodule = NuScenesHiVTDataModule(
-        root=args.root,
+        split_file="balanced_splits.json", # Ensure this file is generated
+        root=args.root
         train_batch_size=args.train_batch_size,
         val_batch_size=args.val_batch_size,
         shuffle=args.shuffle,
