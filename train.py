@@ -70,7 +70,7 @@ def main():
     # =====================================================
     datamodule = NuScenesHiVTDataModule(
         split_file="balanced_splits.json", # Ensure this file is generated
-        root=args.root
+        root=args.root,
         train_batch_size=args.train_batch_size,
         val_batch_size=args.val_batch_size,
         shuffle=args.shuffle,
