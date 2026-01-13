@@ -2,7 +2,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from models.cvae_gan import CVAE_GAN
-from captioner import TrajectoryCaptioner
+from models import TrajectoryCaptioner
 
 class HiVTX(pl.LightningModule):
     def __init__(self, cvae_gan_ckpt, vocab_size, **kwargs):
