@@ -17,13 +17,16 @@ from argparse import ArgumentParser
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
+from torchmetrics.text import BLEUScore
 import torch.multiprocessing as mp
 import torch
+import torch.nn as nn
 
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.hivt import HiVT
 from models.cvae_gan import CVAE_GAN
-from models.hivt_x import HiVTX  # <--- NEW IMPORT
+from models.hivt_x import HiVTX  
+from utils import SimpleTokenizer
 
 # speed boost on Nvidia-A6000
 torch.set_float32_matmul_precision('medium')

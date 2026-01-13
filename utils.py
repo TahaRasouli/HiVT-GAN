@@ -1,5 +1,6 @@
 from typing import List, Optional, Tuple
-
+import os 
+import json
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
@@ -78,25 +79,31 @@ class DistanceDropEdge(object):
         return edge_index, edge_attr
 
 class SimpleTokenizer:
-    def __init__(self):
-        # Based on your examples, the vocab is tiny (~20-30 words)
-        self.word2idx = {"<PAD>": 0, "<SOS>": 1, "<EOS>": 2}
-        self.idx2word = {0: "<PAD>", 1: "<SOS>", 2: "<EOS>"}
-        self.idx = 3
+    def __init__(self, vocab_file=None):
+        self.word2idx = {"<PAD>": 0, "<SOS>": 1, "<EOS>": 2, "<UNK>": 3}
+        self.idx2word = {0: "<PAD>", 1: "<SOS>", 2: "<EOS>", 3: "<UNK>"}
+        self.idx = 4
+        
+        # If a vocab file exists, load it immediately
+        if vocab_file and os.path.exists(vocab_file):
+            self.load_vocab(vocab_file)
 
     def fit(self, captions_list):
+        """Scans all captions to build the vocabulary."""
+        print(f"Building vocabulary from {len(captions_list)} captions...")
         for cap in captions_list:
-            # Clean and split
-            words = cap.lower().replace(".", "").split()
+            words = self._clean(cap)
             for w in words:
                 if w not in self.word2idx:
                     self.word2idx[w] = self.idx
                     self.idx2word[self.idx] = w
                     self.idx += 1
-                    
-    def encode(self, caption, max_len=15):
-        words = caption.lower().replace(".", "").split()
-        ids = [self.word2idx.get(w, 0) for w in words]
+        print(f"Vocabulary size: {len(self.word2idx)}")
+
+    def encode(self, caption, max_len=20):
+        """Converts text string to list of IDs."""
+        words = self._clean(caption)
+        ids = [self.word2idx.get(w, 3) for w in words] # 3 is UNK
         ids = [1] + ids + [2] # Add SOS and EOS
         
         # Padding
@@ -105,12 +112,28 @@ class SimpleTokenizer:
         return ids[:max_len]
         
     def decode(self, ids):
+        """Converts tensor/list of IDs back to string."""
+        if hasattr(ids, 'tolist'):
+            ids = ids.tolist()
         words = []
         for i in ids:
             if i == 2: break # EOS
             if i not in [0, 1]:
                 words.append(self.idx2word.get(i, ""))
         return " ".join(words)
+
+    def _clean(self, text):
+        return text.lower().replace(".", " .").replace(",", "").split()
+
+    def save_vocab(self, path):
+        with open(path, 'w') as f:
+            json.dump(self.word2idx, f)
+            
+    def load_vocab(self, path):
+        with open(path, 'r') as f:
+            self.word2idx = json.load(f)
+        self.idx2word = {int(k): v for v, k in self.word2idx.items()}
+        self.idx = len(self.word2idx)
 
 def init_weights(m: nn.Module) -> None:
     if isinstance(m, nn.Linear):
