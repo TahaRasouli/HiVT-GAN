@@ -7,7 +7,7 @@ from models.hivt_x import HiVTX
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 
 # --- CONFIGURATION ---
-CKPT_PATH = "/mount/studenten/projects/rasoulta/checkpoints/x-baseline/checkpoints/epoch=29-step=8040.ckpt" # UPDATE THIS!
+CKPT_PATH = "/mount/studenten/projects/rasoulta/checkpoints/x_baseline/checkpoints/epoch=29-step=8040.ckpt" # UPDATE THIS!
 BACKBONE_PATH = "/mount/studenten/projects/rasoulta/checkpoints/vae-gan-baseline/checkpoints/epoch=45-step=60812.ckpt"
 DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset"
 
