@@ -15,52 +15,59 @@ except ImportError:
     sys.exit(1)
 
 # --- CONFIGURATION ---
-CKPT_PATH = "/mount/arbeitsdaten/studenten4/rasoulta/HiVT-GAN/lightning_logs/version_54/checkpoints/epoch=29-step=8040.ckpt" 
+CKPT_PATH = "/mount/arbeitsdaten/studenten4/rasoulta/HiVT-GAN/lightning_logs/version_54/checkpoints/epoch=29-step=8040.ckpt"
 BACKBONE_PATH = "/mount/studenten/projects/rasoulta/checkpoints/vae-gan-baseline/checkpoints/epoch=45-step=60812.ckpt"
 DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset"
-
-# CORRECT ROOT: Points to the parent of 'maps'
 NUSCENES_MAP_ROOT = "/mount/arbeitsdaten/analysis/rasoulta/nuscenes/nuscenes_meta"
 
 MAP_CACHE = {}
 
-def get_local_map_features(city, origin, theta, radius=75):
+def get_local_map_features(city, origin, theta, radius=100):
     """
-    Fetches global lanes AND drivable area, transforms to Agent-Centric frame.
+    Fetches global lanes, transforms to Agent-Centric frame.
     """
     # 1. Load Map
     if city not in MAP_CACHE:
-        print(f"Loading map for {city}...")
-        # REMOVED THE MANUAL os.path.exists CHECK - IT WAS BLOCKING VALID LOADS
         try:
+            print(f"   [DEBUG] Loading Map File for {city}...")
             MAP_CACHE[city] = NuScenesMap(dataroot=NUSCENES_MAP_ROOT, map_name=city)
+            # Verify map has content
+            total_lanes = len(MAP_CACHE[city].lane)
+            print(f"   [DEBUG] Map Loaded Successfully! Total Lanes in Map: {total_lanes}")
         except Exception as e:
-            print(f"CRITICAL ERROR loading map: {e}")
-            print(f"Ensure '{city}.json' is in {NUSCENES_MAP_ROOT}/maps/expansion/ OR {NUSCENES_MAP_ROOT}/maps/")
+            print(f"   [ERROR] Failed to load map: {e}")
             return [], []
     
     nusc_map = MAP_CACHE[city]
     
-    # 2. Define Box
+    # 2. Check Coordinates
     x, y = origin[0], origin[1]
+    print(f"   [DEBUG] Query Origin (Global): ({x:.2f}, {y:.2f})")
+    
+    # If coordinates are suspiciously small (near 0), we have a problem
+    if abs(x) < 50 and abs(y) < 50:
+        print("   [WARNING] Origin seems to be LOCAL (near 0,0). Cannot query Global Map!")
+        return [], []
+
+    # 3. Define Box
     patch_box = (x - radius, y - radius, x + radius, y + radius)
     
-    # 3. Get Records
+    # 4. Get Records (Try multiple layer types)
+    layers_to_check = ['lane', 'road_segment', 'drivable_area', 'ped_crossing']
     try:
-        # We query 'lane' (centerlines) and 'drivable_area' (road polygons)
-        # Note: Some older maps might not have 'drivable_area', so we handle errors
-        records = nusc_map.get_records_in_patch(patch_box, ['lane', 'drivable_area'], mode='intersect')
-    except Exception as e:
-        # Fallback for simpler maps
-        try:
-             records = nusc_map.get_records_in_patch(patch_box, ['lane'], mode='intersect')
-        except:
-             return [], []
+        records = nusc_map.get_records_in_patch(patch_box, layers_to_check, mode='intersect')
+    except:
+        return [], []
     
     local_lanes = []
     local_polygons = []
     
-    # 4. Process Lanes (Centerlines)
+    # Check what we found
+    lane_count = len(records.get('lane', []))
+    poly_count = len(records.get('drivable_area', []))
+    print(f"   [DEBUG] Found in patch: {lane_count} lanes, {poly_count} drivable areas")
+
+    # 5. Process Lanes
     if 'lane' in records:
         for lane_token in records['lane']:
             try:
@@ -69,11 +76,14 @@ def get_local_map_features(city, origin, theta, radius=75):
                 local_lanes.append(transform_to_local(points, x, y, theta))
             except: continue
             
-    # 5. Process Drivable Area (Road Edges/Polygons)
-    if 'drivable_area' in records:
-        for token in records['drivable_area']:
+    # 6. Process Polygons (Drivable Area or Road Segments)
+    # Prefer road_segment if available, else drivable_area
+    poly_layer = 'road_segment' if len(records.get('road_segment', [])) > 0 else 'drivable_area'
+    
+    if poly_layer in records:
+        for token in records[poly_layer]:
             try:
-                poly_record = nusc_map.get('drivable_area', token)
+                poly_record = nusc_map.get(poly_layer, token)
                 if 'exterior_node_tokens' in poly_record:
                     nodes = [nusc_map.get('node', t) for t in poly_record['exterior_node_tokens']]
                     points = np.array([[n['x'], n['y']] for n in nodes])
@@ -83,9 +93,7 @@ def get_local_map_features(city, origin, theta, radius=75):
     return local_lanes, local_polygons
 
 def transform_to_local(global_points, origin_x, origin_y, theta):
-    # Translate
     centered = global_points - np.array([origin_x, origin_y])
-    # Rotate (Negative theta for Global -> Local)
     c, s = np.cos(-theta), np.sin(-theta)
     R = np.array([[c, -s], [s, c]])
     return centered @ R.T
@@ -94,21 +102,17 @@ def plot_thesis_figure(trajectory, caption_words, attn_weights, save_name, gt_te
     fig, ax = plt.subplots(1, 2, figsize=(24, 9), gridspec_kw={'width_ratios': [1, 1.2]})
     
     # --- PLOT 1: BEV SCENE ---
-    # Plot Road Polygons (Light Grey Background)
+    # Plot Polygons
     for poly in polygons:
         ax[0].fill(poly[:, 0], poly[:, 1], color='#E0E0E0', alpha=0.5, zorder=0)
 
-    # Plot Lanes (Darker Grey Lines)
+    # Plot Lanes
     for lane in lanes:
         ax[0].plot(lane[:, 0], lane[:, 1], color='#808080', linewidth=1.5, alpha=0.7, linestyle='--', zorder=1)
 
     # Plot Trajectory
     traj = trajectory.cpu().numpy()
-    
-    # Color logic
-    is_right_turn_geo = traj[-1, 1] < -1.5
-    pred_right_text = "right" in pred_text.lower()
-    path_color = '#1f77b4' if (is_right_turn_geo == pred_right_text) or "continue" in pred_text else '#ff7f0e'
+    path_color = '#1f77b4' 
     
     ax[0].plot(traj[:, 0], traj[:, 1], color=path_color, linewidth=5, label="Predicted Path", zorder=5)
     ax[0].scatter(traj[0, 0], traj[0, 1], color='#2ca02c', s=150, edgecolors='black', label="Start", zorder=6)
@@ -118,9 +122,8 @@ def plot_thesis_figure(trajectory, caption_words, attn_weights, save_name, gt_te
     ax[0].text(0.05, 0.95, box_text, transform=ax[0].transAxes, fontsize=12,
                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
     
-    ax[0].set_title("Agent-Centric View (Map + Trajectory)", fontsize=16)
+    ax[0].set_title("Agent-Centric View", fontsize=16)
     ax[0].axis('equal')
-    ax[0].grid(False)
     
     # Auto Zoom
     margin = 20
@@ -140,22 +143,20 @@ def plot_thesis_figure(trajectory, caption_words, attn_weights, save_name, gt_te
     
     plt.tight_layout()
     plt.savefig(save_name, dpi=150)
-    print(f"Saved {save_name} (Lanes: {len(lanes)})")
+    print(f"Saved {save_name}")
     plt.close()
 
 def visualize():
-    # Load Model
     with open("vocab.json") as f: vocab = json.load(f)
     print(f"Loading Model...")
     model = HiVTX.load_from_checkpoint(CKPT_PATH, cvae_gan_ckpt=BACKBONE_PATH, vocab_size=len(vocab), strict=False)
     model.eval().cuda()
 
-    # Load Data
     datamodule = NuScenesHiVTDataModule(root=DATA_ROOT, split_file="balanced_splits.json", val_batch_size=1, shuffle=True)
     datamodule.setup()
     loader = datamodule.val_dataloader()
     
-    print("Searching for Lane Change / Turn samples...")
+    print("Searching for Right Turns...")
     count = 0
     
     for batch in loader:
@@ -163,10 +164,8 @@ def visualize():
         
         gt_ids = batch.caption_ids[0]
         gt_text = model.tokenizer.decode(gt_ids)
-        
         if "right" not in gt_text and "left" not in gt_text: continue
             
-        # Extract Map Info
         city = batch.city[0]
         origin = batch.origin[0].numpy()
         theta = batch.theta[0].item()
@@ -183,7 +182,7 @@ def visualize():
             
             pred_ids = logits.argmax(dim=-1)[0]
             pred_text = model.tokenizer.decode(pred_ids)
-            words = [model.tokenizer.idx2word[i.item()] for i in pred_ids if i.item() > 1] # Skip PAD/SOS
+            words = [model.tokenizer.idx2word[i.item()] for i in pred_ids if i.item() > 1]
             
             if len(words) > 0:
                 print(f"Plotting Sample {count}: {gt_text}")
