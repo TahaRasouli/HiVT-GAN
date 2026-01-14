@@ -99,8 +99,7 @@ def plot_map_only(trajectory, save_name, gt_text, pred_text, map_feats):
     ax.scatter(traj[0, 0], traj[0, 1], color='#2ca02c', s=250, edgecolors='black', zorder=11)
     ax.scatter(traj[-1, 0], traj[-1, 1], color='#d62728', s=250, edgecolors='black', zorder=11)
 
-    # --- MANUAL LEGEND CONSTRUCTION ---
-    # This guarantees the legend appears even if the loop data is weird
+    # --- MANUAL LEGEND ---
     legend_elements = [
         Line2D([0], [0], color='#1f77b4', lw=4, label='Predicted Path'),
         Line2D([0], [0], marker='o', color='w', markerfacecolor='#2ca02c', markersize=15, markeredgecolor='k', label='Start'),
@@ -156,7 +155,9 @@ def visualize():
         with torch.no_grad():
             global_embed, _ = model._get_ego_features(data)
             traj_input = data.y[0].unsqueeze(0)
-            logits, _ = model.captioner(global_embed, traj_input, captions=None, return_attn=False) # No Attn
+            
+            # --- FIX IS HERE: No unpacking ---
+            logits = model.captioner(global_embed, traj_input, captions=None, return_attn=False) 
             
             pred_ids = logits.argmax(dim=-1)[0]
             pred_text = model.tokenizer.decode(pred_ids)
