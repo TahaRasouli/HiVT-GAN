@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import json
 import os
+import sys
 from models.hivt_x import HiVTX
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 
@@ -14,10 +15,13 @@ except ImportError:
     sys.exit(1)
 
 # --- CONFIGURATION ---
-CKPT_PATH = "/mount/arbeitsdaten/studenten4/rasoulta/HiVT-GAN/lightning_logs/version_54/checkpoints/epoch=29-step=8040.ckpt"
+CKPT_PATH = "/mount/arbeitsdaten/studenten4/rasoulta/HiVT-GAN/lightning_logs/version_54/checkpoints/epoch=29-step=8040.ckpt" 
 BACKBONE_PATH = "/mount/studenten/projects/rasoulta/checkpoints/vae-gan-baseline/checkpoints/epoch=45-step=60812.ckpt"
 DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset"
+
+# CORRECT ROOT: Points to the parent of 'maps'
 NUSCENES_MAP_ROOT = "/mount/arbeitsdaten/analysis/rasoulta/nuscenes/nuscenes_meta"
+
 MAP_CACHE = {}
 
 def get_local_map_features(city, origin, theta, radius=75):
@@ -26,15 +30,14 @@ def get_local_map_features(city, origin, theta, radius=75):
     """
     # 1. Load Map
     if city not in MAP_CACHE:
-        # Verify file exists first
-        json_path = os.path.join(NUSCENES_MAP_ROOT, f"{city}.json")
-        if not os.path.exists(json_path):
-            print(f"ERROR: Map file not found at {json_path}")
-            print(f"Check NUSCENES_MAP_ROOT config!")
-            return [], []
-            
         print(f"Loading map for {city}...")
-        MAP_CACHE[city] = NuScenesMap(dataroot=NUSCENES_MAP_ROOT, map_name=city)
+        # REMOVED THE MANUAL os.path.exists CHECK - IT WAS BLOCKING VALID LOADS
+        try:
+            MAP_CACHE[city] = NuScenesMap(dataroot=NUSCENES_MAP_ROOT, map_name=city)
+        except Exception as e:
+            print(f"CRITICAL ERROR loading map: {e}")
+            print(f"Ensure '{city}.json' is in {NUSCENES_MAP_ROOT}/maps/expansion/ OR {NUSCENES_MAP_ROOT}/maps/")
+            return [], []
     
     nusc_map = MAP_CACHE[city]
     
@@ -42,42 +45,41 @@ def get_local_map_features(city, origin, theta, radius=75):
     x, y = origin[0], origin[1]
     patch_box = (x - radius, y - radius, x + radius, y + radius)
     
-    # DEBUG: Print coordinates to verify they are not (0,0)
-    print(f"   > Querying {city} at Origin: ({x:.1f}, {y:.1f})")
-    print(f"   > Patch Box: {patch_box}")
-
     # 3. Get Records
-    # We query 'lane' (centerlines) and 'drivable_area' (road polygons)
     try:
-        records = nusc_map.get_records_in_patch(patch_box, ['lane', 'road_segment', 'drivable_area'], mode='intersect')
+        # We query 'lane' (centerlines) and 'drivable_area' (road polygons)
+        # Note: Some older maps might not have 'drivable_area', so we handle errors
+        records = nusc_map.get_records_in_patch(patch_box, ['lane', 'drivable_area'], mode='intersect')
     except Exception as e:
-        print(f"   > API Error: {e}")
-        return [], []
+        # Fallback for simpler maps
+        try:
+             records = nusc_map.get_records_in_patch(patch_box, ['lane'], mode='intersect')
+        except:
+             return [], []
     
     local_lanes = []
     local_polygons = []
     
     # 4. Process Lanes (Centerlines)
-    for lane_token in records['lane']:
-        try:
-            pose_record = nusc_map.get_arcline_path(lane_token)
-            points = np.array(pose_record)
-            local_lanes.append(transform_to_local(points, x, y, theta))
-        except: continue
+    if 'lane' in records:
+        for lane_token in records['lane']:
+            try:
+                pose_record = nusc_map.get_arcline_path(lane_token)
+                points = np.array(pose_record)
+                local_lanes.append(transform_to_local(points, x, y, theta))
+            except: continue
             
-    # 5. Process Drivable Area (Road Edges/Polygons) - Fallback if lanes are missing
-    # This helps visualizing intersections even if centerlines are missing
-    for token in records['drivable_area']:
-        try:
-            # Get polygon exterior
-            poly_record = nusc_map.get('drivable_area', token)
-            if 'exterior_node_tokens' in poly_record:
-                nodes = [nusc_map.get('node', t) for t in poly_record['exterior_node_tokens']]
-                points = np.array([[n['x'], n['y']] for n in nodes])
-                local_polygons.append(transform_to_local(points, x, y, theta))
-        except: continue
+    # 5. Process Drivable Area (Road Edges/Polygons)
+    if 'drivable_area' in records:
+        for token in records['drivable_area']:
+            try:
+                poly_record = nusc_map.get('drivable_area', token)
+                if 'exterior_node_tokens' in poly_record:
+                    nodes = [nusc_map.get('node', t) for t in poly_record['exterior_node_tokens']]
+                    points = np.array([[n['x'], n['y']] for n in nodes])
+                    local_polygons.append(transform_to_local(points, x, y, theta))
+            except: continue
 
-    print(f"   > Found {len(local_lanes)} lanes and {len(local_polygons)} road polygons.")
     return local_lanes, local_polygons
 
 def transform_to_local(global_points, origin_x, origin_y, theta):
@@ -103,7 +105,7 @@ def plot_thesis_figure(trajectory, caption_words, attn_weights, save_name, gt_te
     # Plot Trajectory
     traj = trajectory.cpu().numpy()
     
-    # Color logic: Correct Direction = Blue, Wrong = Orange
+    # Color logic
     is_right_turn_geo = traj[-1, 1] < -1.5
     pred_right_text = "right" in pred_text.lower()
     path_color = '#1f77b4' if (is_right_turn_geo == pred_right_text) or "continue" in pred_text else '#ff7f0e'
@@ -120,7 +122,7 @@ def plot_thesis_figure(trajectory, caption_words, attn_weights, save_name, gt_te
     ax[0].axis('equal')
     ax[0].grid(False)
     
-    # Zoom
+    # Auto Zoom
     margin = 20
     ax[0].set_xlim(traj[:,0].min()-margin, traj[:,0].max()+margin)
     ax[0].set_ylim(traj[:,1].min()-margin, traj[:,1].max()+margin)
@@ -138,7 +140,7 @@ def plot_thesis_figure(trajectory, caption_words, attn_weights, save_name, gt_te
     
     plt.tight_layout()
     plt.savefig(save_name, dpi=150)
-    print(f"Saved {save_name}")
+    print(f"Saved {save_name} (Lanes: {len(lanes)})")
     plt.close()
 
 def visualize():
@@ -153,7 +155,7 @@ def visualize():
     datamodule.setup()
     loader = datamodule.val_dataloader()
     
-    print("Searching for Right Turns...")
+    print("Searching for Lane Change / Turn samples...")
     count = 0
     
     for batch in loader:
