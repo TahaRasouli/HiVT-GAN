@@ -22,7 +22,7 @@ NUSCENES_MAP_ROOT = "/mount/arbeitsdaten/analysis/rasoulta/nuscenes/nuscenes_met
 # Cache maps to avoid reloading
 MAP_CACHE = {}
 
-def get_local_lanes(city, origin, theta, radius=50):
+def get_local_lanes(city, origin, theta, radius=60):
     """
     Fetches global lanes and transforms them to the Agent-Centric frame.
     """
@@ -34,19 +34,25 @@ def get_local_lanes(city, origin, theta, radius=50):
     
     # 1. Define query box in Global Coordinates
     x, y = origin[0], origin[1]
-    patch_box = (x, y, radius, radius)
-    patch_angle = 0  # We query axis-aligned first
+    
+    # --- FIX: Correct Bounding Box Format (min_x, min_y, max_x, max_y) ---
+    patch_box = (x - radius, y - radius, x + radius, y + radius)
     
     # 2. Get Lane Records
+    # We broaden the search to include road segments for better context
     layer_names = ['lane', 'road_segment', 'drivable_area']
-    records = nusc_map.get_records_in_patch(patch_box, layer_names, mode='intersect')
+    try:
+        records = nusc_map.get_records_in_patch(patch_box, layer_names, mode='intersect')
+    except Exception as e:
+        print(f"Map Query Error: {e}")
+        return []
     
     local_lanes = []
     
-    # 3. Process Lane Centerlines
+    # 3. Process Lane Centerlines (Using 'lane' layer which has centerlines)
     for lane_token in records['lane']:
-        # Get Global Line
         try:
+            # Get Global Line
             pose_record = nusc_map.get_arcline_path(lane_token)
             global_points = np.array(pose_record) # [N, 2]
             
@@ -67,26 +73,28 @@ def get_local_lanes(city, origin, theta, radius=50):
     return local_lanes
 
 def plot_thesis_figure(trajectory, caption_words, attn_weights, save_name, gt_text, pred_text, local_lanes):
-    """
-    Generates the Thesis-Quality Figure: BEV Map + Attention Heatmap
-    """
     fig, ax = plt.subplots(1, 2, figsize=(24, 9), gridspec_kw={'width_ratios': [1, 1.2]})
     
     # --- PLOT 1: BEV SCENE ---
+    
     # Plot Lanes
+    if not local_lanes:
+        print("WARNING: No lanes found for this sample!")
+    
     for lane in local_lanes:
+        # Plot continuous lines for lanes
         ax[0].plot(lane[:, 0], lane[:, 1], color='#B0B0B0', linewidth=1.5, alpha=0.6, zorder=1)
 
     # Plot Trajectory
     traj = trajectory.cpu().numpy()
     
-    # Color Coding based on Accuracy
+    # Check "Right Turn" match
     is_right_turn_geo = traj[-1, 1] < -1.5
     pred_right_text = "right" in pred_text.lower()
     
-    # If text matches geometry OR if it's just a general straight path
-    match = (is_right_turn_geo == pred_right_text)
-    path_color = '#1f77b4' # Standard Blue
+    # Blue if correct, Orange if incorrect
+    path_color = '#1f77b4' if (is_right_turn_geo == pred_right_text) else '#ff7f0e'
+    if "continue straight" in pred_text: path_color = '#1f77b4' # Neutral for straight
     
     ax[0].plot(traj[:, 0], traj[:, 1], color=path_color, linewidth=5, label="Predicted Path", zorder=5)
     ax[0].scatter(traj[0, 0], traj[0, 1], color='#2ca02c', s=150, edgecolors='black', label="Start", zorder=6)
@@ -103,15 +111,17 @@ def plot_thesis_figure(trajectory, caption_words, attn_weights, save_name, gt_te
     ax[0].axis('equal')
     ax[0].grid(True, linestyle=':', alpha=0.5)
     
-    # Zoom out slightly to show context
-    ax[0].set_xlim(-20, 20)
-    ax[0].set_ylim(-10, 40)
+    # Smart Zoom: Focus on the trajectory but keep some context
+    x_min, x_max = traj[:, 0].min(), traj[:, 0].max()
+    y_min, y_max = traj[:, 1].min(), traj[:, 1].max()
+    margin = 15
+    ax[0].set_xlim(x_min - margin, x_max + margin)
+    ax[0].set_ylim(y_min - margin, y_max + margin)
 
     # --- PLOT 2: ATTENTION HEATMAP ---
     if attn_weights.shape[0] > 0:
         cax = ax[1].imshow(attn_weights.cpu().numpy(), aspect='auto', cmap='plasma', interpolation='nearest')
         
-        # Axis settings
         ax[1].set_xticks(np.arange(0, 30, 5))
         ax[1].set_xticklabels(np.arange(0, 30, 5), fontsize=10)
         ax[1].set_xlabel("Trajectory Time Step ($t_0$ to $t_{30}$)", fontsize=14, labelpad=10)
@@ -120,13 +130,12 @@ def plot_thesis_figure(trajectory, caption_words, attn_weights, save_name, gt_te
         ax[1].set_yticklabels(caption_words, fontsize=13, weight='bold')
         ax[1].set_title("Spatiotemporal Attention Alignment", fontsize=16, pad=15)
         
-        # Colorbar
         cbar = fig.colorbar(cax, ax=ax[1], pad=0.02)
         cbar.set_label("Attention Weight", fontsize=12)
     
     plt.tight_layout()
     plt.savefig(save_name, dpi=300, bbox_inches='tight')
-    print(f"Saved Thesis Figure: {save_name}")
+    print(f"Saved Thesis Figure: {save_name} (Lanes: {len(local_lanes)})")
     plt.close()
 
 def visualize():
@@ -164,13 +173,8 @@ def visualize():
         if "right" not in gt_text and "left" not in gt_text:
             continue
             
-        # 4. Extract Map Metadata BEFORE moving to GPU (if simpler) or move everything
-        # 'city' is usually list of strings in the batch
-        # 'origin' is [B, 2]
-        # 'theta' is [B]
-        
-        # Access the first element of the batch
-        city_name = batch.city[0] # assuming list
+        # 4. Extract Map Metadata
+        city_name = batch.city[0] 
         origin = batch.origin[0].numpy()
         theta = batch.theta[0].item()
         
@@ -205,7 +209,7 @@ def visualize():
                     traj_input[0], 
                     words, 
                     relevant_attn, 
-                    f"thesis_viz_{count}.png",
+                    f"thesis_viz_{count}.jpg",
                     gt_text,
                     pred_text,
                     local_lanes
