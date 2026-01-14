@@ -7,13 +7,12 @@ import sys
 from models.hivt_x import HiVTX
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 
-# --- CONFIGURATION (User Provided) ---
+# --- CONFIGURATION ---
 CKPT_PATH = "/mount/arbeitsdaten/studenten4/rasoulta/HiVT-GAN/lightning_logs/version_54/checkpoints/epoch=29-step=8040.ckpt"
 BACKBONE_PATH = "/mount/studenten/projects/rasoulta/checkpoints/vae-gan-baseline/checkpoints/epoch=45-step=60812.ckpt"
 DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset"
 NUSCENES_MAP_ROOT = "/mount/arbeitsdaten/analysis/rasoulta/nuscenes/nuscenes_meta"
 
-# Import NuScenes API
 try:
     from nuscenes.map_expansion.map_api import NuScenesMap
 except ImportError:
@@ -24,19 +23,10 @@ MAP_CACHE = {}
 
 def transform_agent_to_global(trajectory_local, origin, theta):
     """
-    Transforms the model's agent-centric output (Local) to the Map's coordinate system (Global).
-    
-    Args:
-        trajectory_local: (N, 2) numpy array
-        origin: (2,) numpy array [x, y]
-        theta: scalar (heading in radians)
+    Transforms agent-centric coordinates to global map coordinates.
     """
-    # 1. Rotate
     c, s = np.cos(theta), np.sin(theta)
-    R = np.array([[c, -s], [s, c]]) # Rotation matrix
-    
-    # 2. Translate
-    # (N, 2) @ (2, 2) + (2,)
+    R = np.array([[c, -s], [s, c]])
     trajectory_global = trajectory_local @ R.T + origin
     return trajectory_global
 
@@ -48,11 +38,11 @@ def visualize_sample(model, batch, sample_idx):
     gt_ids = batch.caption_ids[0]
     gt_text = model.tokenizer.decode(gt_ids)
 
-    # 2. Filter: Only plot turns (Optional, remove if you want all samples)
+    # 2. Filter: Only plot turns
     if "right" not in gt_text and "left" not in gt_text:
         return False
 
-    # 3. Load Map (Official API)
+    # 3. Load Map
     if city not in MAP_CACHE:
         try:
             MAP_CACHE[city] = NuScenesMap(dataroot=NUSCENES_MAP_ROOT, map_name=city)
@@ -61,58 +51,49 @@ def visualize_sample(model, batch, sample_idx):
             return False
     nusc_map = MAP_CACHE[city]
 
-    # 4. Create Figure
-    fig, ax = plt.subplots(figsize=(12, 12))
-    
-    # 5. Render Map Patch (Using Official Documentation Method)
-    # We define a box of +/- 60 meters around the ego vehicle
-    radius = 60
-    # box format: (x, y, height, width) center-based 
-    # OR (x_min, y_min, x_max, y_max) depending on exact API version. 
-    # The safest for render_map_patch is often just passing the box or letting it handle the limits.
-    # We will pass the box coordinates manually to be safe:
+    # 4. Define Patch (Global Coordinates)
+    radius = 75
     my_patch = (origin[0] - radius, origin[1] - radius, origin[0] + radius, origin[1] + radius)
     
-    # Layers requested: Lane (polygons), Lane Divider (paint), Road Divider (paint), Drivable Area
+    # 5. Render Map Patch (Using Official API correctly)
+    # The API returns the Figure and Axes. We do NOT pass 'ax' as an argument.
     layers = ['drivable_area', 'lane', 'lane_divider', 'road_divider']
     
-    # RENDER THE MAP
-    nusc_map.render_map_patch(my_patch, layers, alpha=0.5, figsize=(12, 12), ax=ax)
+    try:
+        # Note: figsize determines the resolution/size of the output image
+        fig, ax = nusc_map.render_map_patch(my_patch, layers, figsize=(12, 12))
+    except TypeError:
+        # Fallback if specific version doesn't support figsize in args (rare)
+        fig, ax = nusc_map.render_map_patch(my_patch, layers)
 
     # 6. Run Model Inference
     data = batch.to(model.device)
     with torch.no_grad():
         global_embed, _ = model._get_ego_features(data)
-        traj_input = data.y[0].unsqueeze(0) # (1, 30, 2)
+        traj_input = data.y[0].unsqueeze(0) 
         
-        # Get Logits (Caption)
         logits = model.captioner(global_embed, traj_input, captions=None, return_attn=False)
         pred_ids = logits.argmax(dim=-1)[0]
         pred_text = model.tokenizer.decode(pred_ids)
 
-        # Get Trajectory Prediction (Coordinate regression)
-        # Note: Your HiVT model output for trajectory is usually in `data.y` (GT) 
-        # or predicted via a separate head. Assuming we visualize the GT vs Input here 
-        # or if you have a `motion_decoder`, call it.
-        # Since this is the Captioning checkpoint, we visualize the GT Trajectory 
-        # (which the caption describes) vs the Caption.
-        
-        gt_traj_local = data.y[0].cpu().numpy() # (30, 2)
+        # Get GT Trajectory (Local)
+        gt_traj_local = data.y[0].cpu().numpy()
     
-    # 7. Transform Trajectory to Global Map Coordinates
+    # 7. Transform to Global
     gt_traj_global = transform_agent_to_global(gt_traj_local, origin, theta)
     
-    # 8. Plot Trajectory on top of Map
+    # 8. Plot Trajectory on the API-generated axes
+    # We use 'ax' returned by render_map_patch
     ax.plot(gt_traj_global[:, 0], gt_traj_global[:, 1], color='#1f77b4', linewidth=5, label='Trajectory', zorder=100)
     ax.scatter(gt_traj_global[0, 0], gt_traj_global[0, 1], color='green', s=200, edgecolors='black', label='Start', zorder=101)
     ax.scatter(gt_traj_global[-1, 0], gt_traj_global[-1, 1], color='red', s=200, edgecolors='black', label='End', zorder=101)
 
-    # 9. Final Polish
+    # 9. Polish and Save
     ax.legend(loc='upper right', fontsize=12)
     ax.set_title(f"GT: {gt_text}\nPred: {pred_text}", fontsize=14, pad=20)
     
-    # Zoom in tightly to the car, not the whole patch
-    margin = 30
+    # Tight zoom on the car (optional override of the broad patch)
+    margin = 40
     ax.set_xlim(origin[0] - margin, origin[0] + margin)
     ax.set_ylim(origin[1] - margin, origin[1] + margin)
 
@@ -123,19 +104,19 @@ def visualize_sample(model, batch, sample_idx):
     return True
 
 def main():
-    # 1. Load Model
+    # Load Model
     with open("vocab.json") as f: vocab = json.load(f)
     print("Loading HiVTX Model...")
     model = HiVTX.load_from_checkpoint(CKPT_PATH, cvae_gan_ckpt=BACKBONE_PATH, vocab_size=len(vocab), strict=False)
     model.eval().cuda()
 
-    # 2. Load Data
+    # Load Data
     print("Loading NuScenes Data...")
     datamodule = NuScenesHiVTDataModule(root=DATA_ROOT, split_file="balanced_splits.json", val_batch_size=1, shuffle=True)
     datamodule.setup()
     loader = datamodule.val_dataloader()
 
-    # 3. Loop
+    # Loop
     count = 0
     for i, batch in enumerate(loader):
         if count >= 5: break
