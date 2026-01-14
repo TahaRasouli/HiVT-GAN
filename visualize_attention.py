@@ -7,10 +7,10 @@ from models.hivt_x import HiVTX
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 
 # --- CONFIGURATION ---
-# UPDATE THIS PATH to your new "Lane-Aware" checkpoint
-CKPT_PATH = "/mount/arbeitsdaten65/studenten4/rasoulta/HiVT-GAN/lightning_logs/version_56/checkpoints/epoch=29-step=XXXX.ckpt" 
+CKPT_PATH = "/mount/studenten/projects/rasoulta/checkpoints/x_baseline/checkpoints/epoch=29-step=8040.ckpt" # UPDATE THIS!
 BACKBONE_PATH = "/mount/studenten/projects/rasoulta/checkpoints/vae-gan-baseline/checkpoints/epoch=45-step=60812.ckpt"
 DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset"
+
 
 def plot_attention(trajectory, caption_words, attn_weights, save_name, gt_text, pred_text, lane_vectors=None):
     """
