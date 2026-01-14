@@ -11,50 +11,46 @@ CKPT_PATH = "/mount/studenten/projects/rasoulta/checkpoints/x_baseline/checkpoin
 BACKBONE_PATH = "/mount/studenten/projects/rasoulta/checkpoints/vae-gan-baseline/checkpoints/epoch=45-step=60812.ckpt"
 DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset"
 
-def plot_attention(trajectory, caption_words, attn_weights, save_name, gt_text, pred_text):
-    """
-    Plots Trajectory + Attention Heatmap
-    """
+def plot_attention(trajectory, caption_words, attn_weights, save_name, gt_text, pred_text, lane_vectors=None):
     fig, ax = plt.subplots(1, 2, figsize=(22, 8))
     
-    # --- PLOT 1: Trajectory ---
+    # --- PLOT 1: Trajectory + MAP ---
+    # 1. Plot Map/Lanes (Background)
+    if lane_vectors is not None:
+        # lane_vectors is typically [N, 2]. Plot as small grey dots.
+        lx, ly = lane_vectors[:, 0].cpu().numpy(), lane_vectors[:, 1].cpu().numpy()
+        ax[0].scatter(lx, ly, c='gray', s=1, alpha=0.3, label='Map Lanes')
+
+    # 2. Plot Trajectory
     traj = trajectory.cpu().numpy()
-    
-    # Color logic: Green if correct direction, Red if wrong
-    is_right_turn = traj[-1, 1] < -1.0
+    is_right_turn = traj[-1, 1] < -1.0 # Simple heuristic check
     pred_right = "right" in pred_text.lower()
-    line_color = 'g-' if (is_right_turn == pred_right) else 'r-'
+    
+    # Logic: If text says right but traj goes left, line is ORANGE (Check Map!)
+    line_color = 'b-'
     
     ax[0].plot(traj[:, 0], traj[:, 1], line_color, linewidth=4, label="Predicted Path")
     ax[0].plot(traj[0, 0], traj[0, 1], 'go', markersize=10, label="Start")
     ax[0].plot(traj[-1, 0], traj[-1, 1], 'ro', markersize=10, label="End")
     
-    # Add context text
-    ax[0].text(0, 0, f"GT: {gt_text}\nPred: {pred_text}", fontsize=12, 
-               bbox=dict(facecolor='white', alpha=0.8))
-    
-    ax[0].set_title(f"Trajectory (End Y={traj[-1, 1]:.2f}m)", fontsize=14)
-    ax[0].grid(True)
+    ax[0].set_title(f"Scene BEV\nGT: {gt_text}", fontsize=12)
     ax[0].legend()
     ax[0].axis('equal')
+    ax[0].grid(True, alpha=0.4)
 
-    # --- PLOT 2: Attention Heatmap ---
+    # --- PLOT 2: Attention ---
+    # (Same as before)
     if attn_weights.shape[0] > 0:
         cax = ax[1].imshow(attn_weights.cpu().numpy(), aspect='auto', cmap='viridis')
-        
         ax[1].set_xticks(np.arange(0, 30, 5))
         ax[1].set_xticklabels(np.arange(0, 30, 5))
-        ax[1].set_xlabel("Trajectory Time Step (0=Now, 30=3s Future)", fontsize=12)
-        
+        ax[1].set_xlabel("Time Step", fontsize=12)
         ax[1].set_yticks(np.arange(len(caption_words)))
         ax[1].set_yticklabels(caption_words, fontsize=12)
-        ax[1].set_title("Visual Attention (Decoder looking at Fused Trajectory)", fontsize=14)
+        ax[1].set_title("Attention Heatmap", fontsize=14)
         
-        fig.colorbar(cax, ax=ax[1], label="Attention Weight")
-    
     plt.tight_layout()
     plt.savefig(save_name)
-    print(f"Saved {save_name}")
     plt.close()
 
 def visualize():
