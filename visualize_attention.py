@@ -22,42 +22,59 @@ except ImportError:
 
 MAP_CACHE = {}
 
-def get_map_features(city, origin, theta, radius=60):
+def get_map_features(city, origin, theta, radius=75):
+    """
+    Fetches Drivable Area, Dividers, AND Centerlines.
+    """
     if city not in MAP_CACHE:
         try:
             MAP_CACHE[city] = NuScenesMap(dataroot=NUSCENES_MAP_ROOT, map_name=city)
         except Exception as e:
-            return {}, {}
+            print(f"Map Load Error: {e}")
+            return {}
 
     nusc_map = MAP_CACHE[city]
     x, y = origin[0], origin[1]
     patch_box = (x - radius, y - radius, x + radius, y + radius)
     
-    # FETCH VISUAL LAYERS (Dividers = Paint Lines)
-    layers = ['lane_divider', 'road_divider', 'ped_crossing']
-    records = nusc_map.get_records_in_patch(patch_box, layers, mode='intersect')
+    features = {
+        'drivable_area': [],
+        'dividers': [],
+        'centerlines': []
+    }
     
-    features = {'dividers': [], 'crossings': []}
-    
-    # 1. Process Dividers (White Lines)
-    for layer in ['lane_divider', 'road_divider']:
-        for token in records.get(layer, []):
-            try:
+    # 1. FETCH DRIVABLE AREA (Background Polygons)
+    try:
+        records = nusc_map.get_records_in_patch(patch_box, ['drivable_area'], mode='intersect')
+        for token in records.get('drivable_area', []):
+            poly = nusc_map.get('drivable_area', token)
+            nodes = [nusc_map.get('node', t) for t in poly['exterior_node_tokens']]
+            points = np.array([[n['x'], n['y']] for n in nodes])
+            features['drivable_area'].append(transform_to_local(points, x, y, theta))
+    except: pass
+
+    # 2. FETCH DIVIDERS (Painted Lines - Solid/Dashed)
+    try:
+        layers = ['lane_divider', 'road_divider']
+        records = nusc_map.get_records_in_patch(patch_box, layers, mode='intersect')
+        for layer in layers:
+            for token in records.get(layer, []):
                 line = nusc_map.get(layer, token)
                 nodes = [nusc_map.get('node', t) for t in line['line_token']]
                 points = np.array([[n['x'], n['y']] for n in nodes])
                 features['dividers'].append(transform_to_local(points, x, y, theta))
-            except: continue
+    except: pass
+    
+    # 3. FETCH CENTERLINES (The "Lanes" you want to see)
+    # NuScenes 'lane' layer represents the directed travel path
+    try:
+        records = nusc_map.get_records_in_patch(patch_box, ['lane'], mode='intersect')
+        for token in records.get('lane', []):
+            pose_record = nusc_map.get_arcline_path(token)
+            points = np.array(pose_record)
+            features['centerlines'].append(transform_to_local(points, x, y, theta))
+    except: pass
 
-    # 2. Process Crossings (Context)
-    for token in records.get('ped_crossing', []):
-        try:
-            poly = nusc_map.get('ped_crossing', token)
-            nodes = [nusc_map.get('node', t) for t in poly['exterior_node_tokens']]
-            points = np.array([[n['x'], n['y']] for n in nodes])
-            features['crossings'].append(transform_to_local(points, x, y, theta))
-        except: continue
-        
     return features
 
 def transform_to_local(global_points, origin_x, origin_y, theta):
@@ -67,87 +84,66 @@ def transform_to_local(global_points, origin_x, origin_y, theta):
     return centered @ R.T
 
 def create_interactive_plot(trajectory, attn_weights, save_name, gt_text, pred_text, map_feats, words):
-    # Create Subplots: Left = Map, Right = Heatmap
     fig = make_subplots(
         rows=1, cols=2,
         column_widths=[0.6, 0.4],
-        subplot_titles=(f"Trajectory & Map<br><sup>GT: {gt_text} | Pred: {pred_text}</sup>", "Attention Heatmap"),
+        subplot_titles=("Scene Map (Zoom to see lanes)", "Attention Heatmap"),
         horizontal_spacing=0.05
     )
 
-    # --- 1. DRAW MAP ---
-    # Pedestrian Crossings (Light Blue Polygons)
-    for poly in map_feats['crossings']:
-        # Close the loop for polygon
+    # --- DRAW MAP LAYERS ---
+    
+    # 1. Drivable Area (Light Grey Background)
+    for poly in map_feats['drivable_area']:
         x_poly = np.append(poly[:, 0], poly[0, 0])
         y_poly = np.append(poly[:, 1], poly[0, 1])
         fig.add_trace(go.Scatter(
-            x=x_poly, y=y_poly, fill="toself", fillcolor='rgba(173, 216, 230, 0.3)',
-            line=dict(color='rgba(0,0,0,0)'), showlegend=False, hoverinfo='skip'
+            x=x_poly, y=y_poly, fill="toself", fillcolor='rgba(230, 230, 230, 0.5)',
+            line=dict(width=0), showlegend=False, hoverinfo='skip'
         ), row=1, col=1)
 
-    # Lane Dividers (Grey Dashed Lines)
+    # 2. Lane Dividers (Black Lines)
     for i, line in enumerate(map_feats['dividers']):
         fig.add_trace(go.Scatter(
             x=line[:, 0], y=line[:, 1], mode='lines',
-            line=dict(color='grey', width=1, dash='dash'),
-            showlegend=(i==0), name='Lane Dividers', hoverinfo='skip'
+            line=dict(color='black', width=1),
+            showlegend=(i==0), name='Road Markings', hoverinfo='skip'
         ), row=1, col=1)
 
-    # --- 2. DRAW TRAJECTORY ---
+    # 3. Lane Centerlines (Dashed Purple Lines - Crucial for "Lane Change" context)
+    for i, line in enumerate(map_feats['centerlines']):
+        fig.add_trace(go.Scatter(
+            x=line[:, 0], y=line[:, 1], mode='lines',
+            line=dict(color='rgba(128, 0, 128, 0.6)', width=2, dash='longdashdot'),
+            showlegend=(i==0), name='Lane Centerlines', hoverinfo='skip'
+        ), row=1, col=1)
+
+    # --- DRAW TRAJECTORY ---
     traj = trajectory.cpu().numpy()
     
-    # Start Point
-    fig.add_trace(go.Scatter(
-        x=[traj[0, 0]], y=[traj[0, 1]], mode='markers',
-        marker=dict(color='green', size=12, symbol='circle'),
-        name='Start'
-    ), row=1, col=1)
-    
-    # End Point
-    fig.add_trace(go.Scatter(
-        x=[traj[-1, 0]], y=[traj[-1, 1]], mode='markers',
-        marker=dict(color='red', size=12, symbol='circle'),
-        name='End'
-    ), row=1, col=1)
-
-    # Path
     fig.add_trace(go.Scatter(
         x=traj[:, 0], y=traj[:, 1], mode='lines+markers',
-        line=dict(color='blue', width=4),
-        marker=dict(size=4),
+        line=dict(color='blue', width=4), marker=dict(size=4),
         name='Predicted Path'
     ), row=1, col=1)
+    
+    # Start/End
+    fig.add_trace(go.Scatter(x=[traj[0,0]], y=[traj[0,1]], mode='markers', marker=dict(color='green', size=10), name='Start'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[traj[-1,0]], y=[traj[-1,1]], mode='markers', marker=dict(color='red', size=10), name='End'), row=1, col=1)
 
-    # Fix Aspect Ratio for Map
     fig.update_xaxes(scaleanchor="y", scaleratio=1, row=1, col=1)
 
-    # --- 3. DRAW HEATMAP ---
+    # --- DRAW HEATMAP ---
     if len(words) > 0:
-        heatmap = attn_weights.cpu().numpy().T # Transpose for [Words, Time]
-        
+        heatmap = attn_weights.cpu().numpy().T
         fig.add_trace(go.Heatmap(
-            z=heatmap,
-            x=np.arange(30),
-            y=words,
-            colorscale='Viridis',
-            colorbar=dict(title='Attn'),
+            z=heatmap, x=np.arange(30), y=words, colorscale='Viridis',
         ), row=1, col=2)
+        fig.update_yaxes(autorange="reversed", row=1, col=2)
 
-        fig.update_xaxes(title_text="Time Step", row=1, col=2)
-        fig.update_yaxes(autorange="reversed", row=1, col=2) # Words top-to-bottom
-
-    # --- LAYOUT ---
-    fig.update_layout(
-        height=700, width=1400,
-        title_text="Interactive Thesis Visualization (Zoom/Pan enabled)",
-        template="plotly_white",
-        dragmode='pan' # Default tool is pan
-    )
-    
-    # Save HTML
+    fig.update_layout(height=800, width=1600, title_text=f"GT: {gt_text} <br>Pred: {pred_text}", template="plotly_white")
     fig.write_html(save_name)
-    print(f"Saved Interactive Plot: {save_name}")
+    print(f"Saved: {save_name}")
 
 def visualize():
     with open("vocab.json") as f: vocab = json.load(f)
@@ -166,6 +162,7 @@ def visualize():
         
         gt_ids = batch.caption_ids[0]
         gt_text = model.tokenizer.decode(gt_ids)
+        # Filter: Only look for interesting turns
         if "right" not in gt_text and "left" not in gt_text: continue
             
         city = batch.city[0]
@@ -185,13 +182,8 @@ def visualize():
             words = [model.tokenizer.idx2word[i.item()] for i in pred_ids if i.item() > 1]
             
             if len(words) > 0:
-                print(f"Generating HTML for: {gt_text}")
-                create_interactive_plot(
-                    traj_input[0], 
-                    attn_weights[0, :len(words)], 
-                    f"interactive_viz_{count}.html", 
-                    gt_text, pred_text, map_feats, words
-                )
+                print(f"Plotting: {gt_text}")
+                create_interactive_plot(traj_input[0], attn_weights[0, :len(words)], f"thesis_interactive_{count}.html", gt_text, pred_text, map_feats, words)
                 count += 1
 
 if __name__ == "__main__":
