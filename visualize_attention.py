@@ -4,6 +4,8 @@ import numpy as np
 import json
 import os
 import sys
+from matplotlib.patches import Polygon
+from matplotlib.lines import Line2D
 from models.hivt_x import HiVTX
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 
@@ -16,94 +18,120 @@ NUSCENES_MAP_ROOT = "/mount/arbeitsdaten/analysis/rasoulta/nuscenes/nuscenes_met
 try:
     from nuscenes.map_expansion.map_api import NuScenesMap
 except ImportError:
-    print("Error: nuscenes-devkit not installed. Run 'pip install nuscenes-devkit'")
+    print("Error: nuscenes-devkit not installed.")
     sys.exit(1)
 
 MAP_CACHE = {}
 
-def transform_agent_to_global(trajectory_local, origin, theta):
-    """
-    Transforms agent-centric coordinates to global map coordinates.
-    """
-    c, s = np.cos(theta), np.sin(theta)
-    R = np.array([[c, -s], [s, c]])
-    trajectory_global = trajectory_local @ R.T + origin
-    return trajectory_global
-
-def visualize_sample(model, batch, sample_idx):
-    # 1. Unpack Metadata
-    city = batch.city[0]
-    origin = batch.origin[0].numpy()
-    theta = batch.theta[0].item()
-    gt_ids = batch.caption_ids[0]
-    gt_text = model.tokenizer.decode(gt_ids)
-
-    # 2. Filter: Only plot turns
-    if "right" not in gt_text and "left" not in gt_text:
-        return False
-
-    # 3. Load Map
+def get_map_features(city, origin, theta, radius=75):
+    # Load Map
     if city not in MAP_CACHE:
         try:
             MAP_CACHE[city] = NuScenesMap(dataroot=NUSCENES_MAP_ROOT, map_name=city)
         except Exception as e:
-            print(f"Failed to load map for {city}: {e}")
-            return False
+            print(f"Map Load Error: {e}")
+            return {}
     nusc_map = MAP_CACHE[city]
 
-    # 4. Define Patch (Global Coordinates)
-    radius = 75
-    my_patch = (origin[0] - radius, origin[1] - radius, origin[0] + radius, origin[1] + radius)
+    # Define Patch
+    x, y = origin[0], origin[1]
+    patch_box = (x - radius, y - radius, x + radius, y + radius)
     
-    # 5. Render Map Patch (Using Official API correctly)
-    # The API returns the Figure and Axes. We do NOT pass 'ax' as an argument.
-    layers = ['drivable_area', 'lane', 'lane_divider', 'road_divider']
+    features = {'drivable_area': [], 'dividers': [], 'centerlines': []}
     
+    # 1. FETCH POLYGONS (Drivable Area)
     try:
-        # Note: figsize determines the resolution/size of the output image
-        fig, ax = nusc_map.render_map_patch(my_patch, layers, figsize=(12, 12))
-    except TypeError:
-        # Fallback if specific version doesn't support figsize in args (rare)
-        fig, ax = nusc_map.render_map_patch(my_patch, layers)
+        records = nusc_map.get_records_in_patch(patch_box, ['drivable_area'], mode='intersect')
+        for token in records.get('drivable_area', []):
+            poly = nusc_map.get('drivable_area', token)
+            nodes = [nusc_map.get('node', t) for t in poly['exterior_node_tokens']]
+            points = np.array([[n['x'], n['y']] for n in nodes])
+            features['drivable_area'].append(transform_to_local(points, x, y, theta))
+    except: pass
 
-    # 6. Run Model Inference
-    data = batch.to(model.device)
-    with torch.no_grad():
-        global_embed, _ = model._get_ego_features(data)
-        traj_input = data.y[0].unsqueeze(0) 
-        
-        logits = model.captioner(global_embed, traj_input, captions=None, return_attn=False)
-        pred_ids = logits.argmax(dim=-1)[0]
-        pred_text = model.tokenizer.decode(pred_ids)
-
-        # Get GT Trajectory (Local)
-        gt_traj_local = data.y[0].cpu().numpy()
+    # 2. FETCH DIVIDERS (Paint Lines)
+    try:
+        layers = ['lane_divider', 'road_divider']
+        records = nusc_map.get_records_in_patch(patch_box, layers, mode='intersect')
+        for layer in layers:
+            for token in records.get(layer, []):
+                line = nusc_map.get(layer, token)
+                nodes = [nusc_map.get('node', t) for t in line['line_token']]
+                points = np.array([[n['x'], n['y']] for n in nodes])
+                features['dividers'].append(transform_to_local(points, x, y, theta))
+    except: pass
     
-    # 7. Transform to Global
-    gt_traj_global = transform_agent_to_global(gt_traj_local, origin, theta)
-    
-    # 8. Plot Trajectory on the API-generated axes
-    # We use 'ax' returned by render_map_patch
-    ax.plot(gt_traj_global[:, 0], gt_traj_global[:, 1], color='#1f77b4', linewidth=5, label='Trajectory', zorder=100)
-    ax.scatter(gt_traj_global[0, 0], gt_traj_global[0, 1], color='green', s=200, edgecolors='black', label='Start', zorder=101)
-    ax.scatter(gt_traj_global[-1, 0], gt_traj_global[-1, 1], color='red', s=200, edgecolors='black', label='End', zorder=101)
+    # 3. FETCH CENTERLINES (Actual Lanes)
+    try:
+        records = nusc_map.get_records_in_patch(patch_box, ['lane'], mode='intersect')
+        for token in records.get('lane', []):
+            pose_record = nusc_map.get_arcline_path(token)
+            points = np.array(pose_record)
+            features['centerlines'].append(transform_to_local(points, x, y, theta))
+    except: pass
 
-    # 9. Polish and Save
-    ax.legend(loc='upper right', fontsize=12)
-    ax.set_title(f"GT: {gt_text}\nPred: {pred_text}", fontsize=14, pad=20)
-    
-    # Tight zoom on the car (optional override of the broad patch)
-    margin = 40
-    ax.set_xlim(origin[0] - margin, origin[0] + margin)
-    ax.set_ylim(origin[1] - margin, origin[1] + margin)
+    return features
 
-    save_path = f"official_map_viz_{sample_idx}.png"
-    plt.savefig(save_path, dpi=150)
-    print(f"Saved: {save_path}")
+def transform_to_local(global_points, origin_x, origin_y, theta):
+    # Translate and Rotate Global -> Agent Centric
+    centered = global_points - np.array([origin_x, origin_y])
+    c, s = np.cos(-theta), np.sin(-theta)
+    R = np.array([[c, -s], [s, c]])
+    return centered @ R.T
+
+def plot_final_thesis_viz(trajectory, save_name, gt_text, pred_text, map_feats):
+    # Large Square Figure
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    # A. Plot Asphalt (Background)
+    for poly in map_feats['drivable_area']:
+        p = Polygon(poly, facecolor='#E8E8E8', edgecolor='none', alpha=0.5, zorder=0)
+        ax.add_patch(p)
+
+    # B. Plot Dividers (Black Lines)
+    for line in map_feats['dividers']:
+        ax.plot(line[:, 0], line[:, 1], color='black', linewidth=1.5, alpha=0.6, zorder=1)
+
+    # C. Plot Lane Centerlines (Purple Dashed - The "Lanes")
+    for line in map_feats['centerlines']:
+        ax.plot(line[:, 0], line[:, 1], color='purple', linewidth=2.0, linestyle='--', alpha=0.5, zorder=2)
+
+    # D. Plot Predicted Trajectory (Blue)
+    traj = trajectory.cpu().numpy()
+    ax.plot(traj[:, 0], traj[:, 1], color='#1f77b4', linewidth=6, zorder=10)
+    
+    # Start/End Markers
+    ax.scatter(traj[0, 0], traj[0, 1], color='#2ca02c', s=300, edgecolors='black', linewidth=2, zorder=11)
+    ax.scatter(traj[-1, 0], traj[-1, 1], color='#d62728', s=300, edgecolors='black', linewidth=2, zorder=11)
+
+    # E. Manual Legend (Always visible)
+    legend_elements = [
+        Line2D([0], [0], color='#1f77b4', lw=5, label='Predicted Path'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#2ca02c', markersize=12, markeredgecolor='k', label='Start'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#d62728', markersize=12, markeredgecolor='k', label='End'),
+        Line2D([0], [0], color='purple', lw=2, linestyle='--', label='Lane Centerline'),
+        Line2D([0], [0], color='black', lw=1.5, label='Lane Divider'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=12, framealpha=1.0).set_zorder(102)
+
+    # F. Smart Zoom (Context + 15m)
+    x_min, x_max = traj[:, 0].min(), traj[:, 0].max()
+    y_min, y_max = traj[:, 1].min(), traj[:, 1].max()
+    margin = 15 
+    ax.set_xlim(x_min - margin, x_max + margin)
+    ax.set_ylim(y_min - margin, y_max + margin)
+    ax.set_aspect('equal')
+    
+    # Title
+    ax.set_title(f"GT: {gt_text}\nPred: {pred_text}", fontsize=13, pad=15, weight='bold')
+    ax.grid(False)
+
+    plt.tight_layout()
+    plt.savefig(save_name, dpi=150)
+    print(f"Saved: {save_name}")
     plt.close()
-    return True
 
-def main():
+def visualize():
     # Load Model
     with open("vocab.json") as f: vocab = json.load(f)
     print("Loading HiVTX Model...")
@@ -111,17 +139,41 @@ def main():
     model.eval().cuda()
 
     # Load Data
-    print("Loading NuScenes Data...")
+    print("Loading Data...")
     datamodule = NuScenesHiVTDataModule(root=DATA_ROOT, split_file="balanced_splits.json", val_batch_size=1, shuffle=True)
     datamodule.setup()
     loader = datamodule.val_dataloader()
-
-    # Loop
+    
+    print("Searching for Turn samples...")
     count = 0
-    for i, batch in enumerate(loader):
-        if count >= 5: break
-        if visualize_sample(model, batch, i):
+    for batch in loader:
+        if count >= 3: break
+        
+        gt_ids = batch.caption_ids[0]
+        gt_text = model.tokenizer.decode(gt_ids)
+        # Filter for Turns
+        if "right" not in gt_text and "left" not in gt_text: continue
+            
+        city = batch.city[0]
+        origin = batch.origin[0].numpy()
+        theta = batch.theta[0].item()
+        
+        map_feats = get_map_features(city, origin, theta)
+        
+        data = batch.to(model.device)
+        with torch.no_grad():
+            global_embed, _ = model._get_ego_features(data)
+            traj_input = data.y[0].unsqueeze(0)
+            
+            # --- FIX: Only expecting 1 return value (logits) ---
+            logits = model.captioner(global_embed, traj_input, captions=None, return_attn=False) 
+            
+            pred_ids = logits.argmax(dim=-1)[0]
+            pred_text = model.tokenizer.decode(pred_ids)
+            
+            print(f"Plotting: {gt_text}")
+            plot_final_thesis_viz(traj_input[0], f"thesis_final_{count}.png", gt_text, pred_text, map_feats)
             count += 1
 
 if __name__ == "__main__":
-    main()
+    visualize()
