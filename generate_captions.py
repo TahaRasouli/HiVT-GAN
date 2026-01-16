@@ -1,185 +1,285 @@
+import os
+import sys
+
+# --- 1. CACHE SETUP ---
+user_name = os.environ.get("USER", "rasoulta")
+CACHE_DIR = f"/tmp/{user_name}/fast_cache"
+
+try:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    print(f"[SETUP] Cache forced to Local SSD: {CACHE_DIR}")
+except OSError:
+    CACHE_DIR = "/mount/studenten/projects/rasoulta/cache_internal" 
+    print(f"[SETUP] /tmp unreachable. Using fallback: {CACHE_DIR}")
+
+os.environ["XDG_CACHE_HOME"] = CACHE_DIR
+os.environ["TORCH_HOME"] = os.path.join(CACHE_DIR, "torch")
+os.environ["HF_HOME"] = "/mount/studenten/projects/rasoulta/cache_internal/huggingface"
+
+import argparse
+import json
+import random
 import torch
 import numpy as np
-import os
-from glob import glob
 from tqdm import tqdm
+from PIL import Image
+from nuscenes.nuscenes import NuScenes
 from nuscenes.map_expansion.map_api import NuScenesMap
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
-# --- CONFIGURATION ---
-INPUT_DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset"
-OUTPUT_DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset_clean_balanced" 
-NUSCENES_MAP_ROOT = "/mount/arbeitsdaten/analysis/rasoulta/nuscenes/nuscenes_meta"
+# --- PROMPT TEMPLATE (Grounded Rewriting) ---
+# We inject the {geometric_hint} to stop hallucination.
+PROMPT_TEMPLATE = """
+The vehicle is confirmed to be executing a **{geometric_hint}**.
+Analyze the video to describe HOW this maneuver is performed visually.
 
-# Max samples per category (Balancing)
-MAX_SAMPLES_PER_CLASS = 1500 
+**Focus strictly on:**
+1. **Lane Interaction:** Does the vehicle cross a lane divider (dashed/solid)? Does it stay centered?
+2. **Road Geometry:** Is the road curving, straight, or entering an intersection/junction?
+3. **Dynamics:** Describe the motion relative to the road lines.
+
+**Constraints:**
+- Do NOT mention traffic lights or other cars unless they force the vehicle to stop.
+- Use natural, descriptive language (e.g., "The vehicle drifts right to merge...").
+- Future tense: "The ego vehicle will..."
+
+**Output valid JSON:**
+{{
+  "scene_description": "[Detailed visual description of the road and maneuver]",
+  "maneuver_category": "{geometric_hint}"
+}}
+"""
 
 MAP_CACHE = {}
 
-def get_nusc_map(city):
+def get_nusc_map(dataroot, city):
     if city not in MAP_CACHE:
         try:
-            MAP_CACHE[city] = NuScenesMap(dataroot=NUSCENES_MAP_ROOT, map_name=city)
-        except Exception:
-            # Cache failure (None) so we don't keep trying and spamming logs
+            # Assumes maps are in standard NuScenes location
+            MAP_CACHE[city] = NuScenesMap(dataroot=dataroot, map_name=city)
+        except:
             MAP_CACHE[city] = None
     return MAP_CACHE[city]
 
-def get_attr(data, key):
-    """Helper to safely get attributes from either Dict or PyG Data object."""
-    if isinstance(data, dict):
-        return data.get(key)
-    else:
-        return getattr(data, key, None)
-
-def get_geometric_label(nusc_map, origin, theta, trajectory):
+def get_geometric_hint(nusc_map, origin, trajectory):
     """
-    Trajectory input shape: (30, 2) OR (30, 3)
-    We force slicing [:2] to ensure we only get (x, y).
+    Calculates the 'Physics Truth' to ground the VLM.
+    Trajectory: (30, 2)
     """
-    # --- 1. KINEMATICS ---
-    # Fix: robustly handle 3D trajectories (x, y, z/theta) by slicing
-    # trajectory shape is likely (30, 3). We only want x, y.
+    if trajectory.ndim == 3: trajectory = trajectory[0]
     
-    # End Point
-    x_final = trajectory[-1, 0]
-    y_final = trajectory[-1, 1]
-    displacement = np.linalg.norm(trajectory[-1, :2])
-    
-    # Heading Change (Vector math)
-    # We take slices [:2] to ignore the 3rd dimension if it exists
-    p0 = trajectory[0, :2]
-    p5 = trajectory[5, :2]
-    p_minus6 = trajectory[-6, :2]
-    p_final = trajectory[-1, :2]
+    # 1. Kinematics
+    p0, p_final = trajectory[0, :2], trajectory[-1, :2]
+    displacement = float(np.linalg.norm(p_final))
+    y_final = float(p_final[1]) # Lateral deviation
 
-    v_start = p5 - p0
-    v_end = p_final - p_minus6
-    
+    # Heading Change
+    v_start = trajectory[5, :2] - p0
+    v_end = p_final - trajectory[-6, :2]
     angle_start = np.arctan2(v_start[1], v_start[0])
     angle_end = np.arctan2(v_end[1], v_end[0])
-    
-    # Diff normalized to [-pi, pi]
-    diff = (angle_end - angle_start + np.pi) % (2 * np.pi) - np.pi
-    diff_deg = np.degrees(diff)
+    diff_deg = np.degrees((angle_end - angle_start + np.pi) % (2 * np.pi) - np.pi)
 
-    # --- 2. MAP CONTEXT ---
+    # 2. Map Context
     is_intersection = False
-    if nusc_map is not None:
+    if nusc_map:
         try:
-            x_global, y_global = origin[0], origin[1]
-            patch_box = (x_global - 2, y_global - 2, x_global + 2, y_global + 2)
-            layers = nusc_map.get_records_in_patch(patch_box, ['road_segment'], mode='intersect')
+            patch = (origin[0]-2, origin[1]-2, origin[0]+2, origin[1]+2)
+            layers = nusc_map.get_records_in_patch(patch, ['road_segment'], mode='intersect')
             if 'road_segment' in layers:
-                for token in layers['road_segment']:
-                    # Check if any segment is an intersection
-                    if nusc_map.get('road_segment', token)['is_intersection']:
-                        is_intersection = True
-                        break
-        except Exception:
-            pass # Map query failed, assume standard road
+                for t in layers['road_segment']:
+                    if nusc_map.get('road_segment', t)['is_intersection']:
+                        is_intersection = True; break
+        except: pass
     
-    location_str = "at an intersection" if is_intersection else "on the road"
+    context = "at an intersection" if is_intersection else "on the road"
 
-    # --- 3. CATEGORIZATION ---
-    # Default
-    category = "straight"
-    caption = f"The ego vehicle moves straight {location_str}."
+    # 3. Categorize
+    if displacement < 2.0: return "Stationary Stop"
+    if abs(diff_deg) > 100: return f"U-Turn {context}"
+    if diff_deg > 25: return f"Left Turn {context}"
+    if diff_deg < -25: return f"Right Turn {context}"
+    if y_final > 2.0: return f"Lane Change Left {context}"
+    if y_final < -2.0: return f"Lane Change Right {context}"
+    return f"Straight Drive {context}"
 
-    if displacement < 2.0:
-        category = "stationary"
-        caption = "The ego vehicle is stationary."
-    elif abs(diff_deg) > 100:
-        category = "u_turn"
-        caption = f"The ego vehicle performs a U-turn {location_str}."
-    elif diff_deg > 25:
-        category = "turn_left"
-        caption = f"The ego vehicle turns left {location_str}."
-    elif diff_deg < -25:
-        category = "turn_right"
-        caption = f"The ego vehicle turns right {location_str}."
-    elif y_final > 2.0:
-        category = "lane_change_left"
-        caption = f"The ego vehicle changes lane to the left {location_str}."
-    elif y_final < -2.0:
-        category = "lane_change_right"
-        caption = f"The ego vehicle changes lane to the right {location_str}."
+class CaptionGenerator:
+    def __init__(self, dataroot, version, input_dir, output_dir, model_id="Qwen/Qwen2-VL-7B-Instruct"):
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.nusc_dataroot = dataroot
+        
+        print(f"[INIT] Loading NuScenes {version}...")
+        self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=False)
+        
+        print(f"[INIT] Loading VLM: {model_id}...")
+        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+        self.processor = AutoProcessor.from_pretrained(model_id)
 
-    return caption, category
+    def _collect_future_sequence(self, sample_token):
+        """Collects CURRENT + FUTURE 6 frames."""
+        tokens = [sample_token]
+        cur_token = sample_token
+        for _ in range(6):
+            try:
+                sample = self.nusc.get("sample", cur_token)
+                if not sample["next"]: break # End of scene
+                cur_token = sample["next"]
+                tokens.append(cur_token)
+            except KeyError:
+                break
+        return tokens
 
-def process_dataset():
-    if not os.path.exists(OUTPUT_DATA_ROOT):
-        os.makedirs(OUTPUT_DATA_ROOT)
-    
-    files = glob(os.path.join(INPUT_DATA_ROOT, "**/*.pt"), recursive=True)
-    print(f"Found {len(files)} files to process.")
+    def get_image_paths(self, sequence_tokens):
+        paths = []
+        for token in sequence_tokens:
+            try:
+                sample = self.nusc.get("sample", token)
+                cam_token = sample["data"]["CAM_FRONT"]
+                cam_data = self.nusc.get("sample_data", cam_token)
+                full_path = os.path.join(self.nusc_dataroot, cam_data["filename"])
+                paths.append(full_path)
+            except: continue
+        return paths
 
-    class_counts = {k: 0 for k in ["stationary", "straight", "turn_left", "turn_right", "lane_change_left", "lane_change_right", "u_turn"]}
-    
-    processed_count = 0
-    errors_printed = 0
+    def generate_caption(self, image_paths, geometric_hint):
+        valid_paths = [p for p in image_paths if os.path.exists(p)]
+        if len(valid_paths) < 2: return None
 
-    print("Starting processing...")
-    
-    for file_path in tqdm(files):
+        # Format prompt with the specific hint
+        formatted_prompt = PROMPT_TEMPLATE.format(geometric_hint=geometric_hint)
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "video",
+                    "video": valid_paths,
+                    "max_pixels": 360 * 420, 
+                    "fps": 2.0, 
+                },
+                {"type": "text", "text": formatted_prompt},
+            ],
+        }]
+
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to("cuda")
+
         try:
-            data = torch.load(file_path)
-            
-            # --- SAFE DATA EXTRACTION ---
-            city = get_attr(data, 'city')
-            origin = get_attr(data, 'origin')
-            theta = get_attr(data, 'theta')
-            trajectory = get_attr(data, 'y')
-
-            # Check validity
-            if city is None or origin is None or theta is None or trajectory is None:
-                continue # Skip malformed files
-
-            # Normalize Data Types
-            if hasattr(origin, 'numpy'): origin = origin.numpy()
-            if hasattr(theta, 'item'): theta = theta.item()
-            if hasattr(trajectory, 'cpu'): trajectory = trajectory.cpu().numpy()
-
-            # --- GENERATE LABEL ---
-            nusc_map = get_nusc_map(city)
-            new_caption, category = get_geometric_label(nusc_map, origin, theta, trajectory)
-            
-            # --- BALANCING CHECK ---
-            if class_counts[category] >= MAX_SAMPLES_PER_CLASS:
-                continue
-
-            # Update stats
-            class_counts[category] += 1
-            processed_count += 1
-
-            # --- INJECT & SAVE ---
-            # Handle both PyG Data objects and Dicts
-            if isinstance(data, dict):
-                data['caption_string'] = new_caption
-                data['maneuver_category'] = category
-            else:
-                data.caption_string = new_caption
-                data.maneuver_category = category
-
-            # Calculate save path
-            rel_path = os.path.relpath(file_path, INPUT_DATA_ROOT)
-            save_path = os.path.join(OUTPUT_DATA_ROOT, rel_path)
-            
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            torch.save(data, save_path)
-
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs, 
+                    max_new_tokens=128,
+                    do_sample=False,
+                    num_beams=1,
+                    use_cache=True
+                )
         except Exception as e:
-            if errors_printed < 5:
-                print(f"[ERROR] Failed {os.path.basename(file_path)}: {e}")
-                errors_printed += 1
-            continue
+            print(f"Gen Error: {e}")
+            return None
+        
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_text = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
 
-    print("\n" + "="*40)
-    print("PROCESSING COMPLETE")
-    print("="*40)
-    print(f"Total Files Saved: {processed_count}")
-    print("Class Distribution:")
-    for k, v in class_counts.items():
-        print(f"  {k:<20}: {v}")
+        try:
+            clean_text = output_text.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean_text)
+        except:
+            return {"scene_description": output_text, "maneuver_category": geometric_hint}
+
+    def process_all(self, shard_id=0, num_shards=1):
+        pt_files = []
+        for root, _, files in os.walk(self.input_dir):
+            for file in files:
+                if file.endswith(".pt"):
+                    pt_files.append(os.path.join(root, file))
+        
+        pt_files.sort()
+        my_files = pt_files[shard_id::num_shards]
+        print(f"[GPU {shard_id}] Processing {len(my_files)} files.")
+        random.shuffle(my_files)
+
+        for pt_path in tqdm(my_files, desc=f"GPU {shard_id}"):
+            try:
+                rel_path = os.path.relpath(pt_path, self.input_dir)
+                out_path = os.path.join(self.output_dir, rel_path)
+                
+                if os.path.exists(out_path): continue
+
+                # Load Data
+                data = torch.load(pt_path)
+                
+                # --- EXTRACT GEOMETRIC HINT ---
+                city = data.city if hasattr(data, 'city') else data['city']
+                origin = data.origin if hasattr(data, 'origin') else data['origin']
+                if hasattr(origin, 'numpy'): origin = origin.numpy()
+                
+                # Check for trajectory (y)
+                traj = data.y if hasattr(data, 'y') else data.get('y')
+                if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
+                
+                nusc_map = get_nusc_map(self.nusc_dataroot, city)
+                
+                # "The Truth"
+                hint = get_geometric_hint(nusc_map, origin, traj)
+                
+                # --- VLM GENERATION ---
+                sample_token = os.path.basename(pt_path).replace(".pt", "")
+                seq_tokens = self._collect_future_sequence(sample_token)
+                image_paths = self.get_image_paths(seq_tokens)
+                
+                caption_data = self.generate_caption(image_paths, hint)
+
+                if caption_data:
+                    # Save results
+                    if isinstance(data, dict):
+                        data['caption_dict'] = caption_data
+                        data['scene_caption'] = caption_data.get('scene_description', '')
+                    else:
+                        data.caption_dict = caption_data
+                        data.scene_caption = caption_data.get('scene_description', '')
+                    
+                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                    torch.save(data, out_path)
+
+            except Exception as e:
+                # print(f"Skipped {pt_path}: {e}")
+                pass
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataroot", required=True)
+    parser.add_argument("--input_dir", required=True)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--version", default="v1.0-trainval")
+    parser.add_argument("--shard_id", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
+    args = parser.parse_args()
+
+    gen = CaptionGenerator(
+        dataroot=args.dataroot,
+        version=args.version,
+        input_dir=args.input_dir,
+        output_dir=args.output_dir
+    )
+    gen.process_all(shard_id=args.shard_id, num_shards=args.num_shards)
 
 if __name__ == "__main__":
-    process_dataset()
+    main()
