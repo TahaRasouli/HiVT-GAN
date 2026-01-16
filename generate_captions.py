@@ -28,8 +28,11 @@ from nuscenes.map_expansion.map_api import NuScenesMap
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# --- PROMPT TEMPLATE (Grounded Rewriting) ---
-# We inject the {geometric_hint} to stop hallucination.
+# --- CONFIGURATION ---
+# Total samples desired across ALL shards.
+# The script will divide this by num_shards to balance work.
+GLOBAL_MAX_SAMPLES_PER_CLASS = 1500 
+
 PROMPT_TEMPLATE = """
 The vehicle is confirmed to be executing a **{geometric_hint}**.
 Analyze the video to describe HOW this maneuver is performed visually.
@@ -56,7 +59,6 @@ MAP_CACHE = {}
 def get_nusc_map(dataroot, city):
     if city not in MAP_CACHE:
         try:
-            # Assumes maps are in standard NuScenes location
             MAP_CACHE[city] = NuScenesMap(dataroot=dataroot, map_name=city)
         except:
             MAP_CACHE[city] = None
@@ -64,11 +66,13 @@ def get_nusc_map(dataroot, city):
 
 def get_geometric_hint(nusc_map, origin, trajectory):
     """
-    Calculates the 'Physics Truth' to ground the VLM.
+    Calculates the 'Physics Truth' (Category).
     Trajectory: (30, 2)
     """
+    # Robust Shape Handling
     if trajectory.ndim == 3: trajectory = trajectory[0]
-    
+    if len(trajectory) < 6: return "Stationary Stop" # Too short
+
     # 1. Kinematics
     p0, p_final = trajectory[0, :2], trajectory[-1, :2]
     displacement = float(np.linalg.norm(p_final))
@@ -85,7 +89,9 @@ def get_geometric_hint(nusc_map, origin, trajectory):
     is_intersection = False
     if nusc_map:
         try:
-            patch = (origin[0]-2, origin[1]-2, origin[0]+2, origin[1]+2)
+            # Flatten origin if needed
+            ox, oy = float(origin[0]), float(origin[1])
+            patch = (ox-2, oy-2, ox+2, oy+2)
             layers = nusc_map.get_records_in_patch(patch, ['road_segment'], mode='intersect')
             if 'road_segment' in layers:
                 for t in layers['road_segment']:
@@ -95,7 +101,7 @@ def get_geometric_hint(nusc_map, origin, trajectory):
     
     context = "at an intersection" if is_intersection else "on the road"
 
-    # 3. Categorize
+    # 3. Categorize (The logic we agreed on)
     if displacement < 2.0: return "Stationary Stop"
     if abs(diff_deg) > 100: return f"U-Turn {context}"
     if diff_deg > 25: return f"Left Turn {context}"
@@ -128,7 +134,7 @@ class CaptionGenerator:
         for _ in range(6):
             try:
                 sample = self.nusc.get("sample", cur_token)
-                if not sample["next"]: break # End of scene
+                if not sample["next"]: break
                 cur_token = sample["next"]
                 tokens.append(cur_token)
             except KeyError:
@@ -151,7 +157,6 @@ class CaptionGenerator:
         valid_paths = [p for p in image_paths if os.path.exists(p)]
         if len(valid_paths) < 2: return None
 
-        # Format prompt with the specific hint
         formatted_prompt = PROMPT_TEMPLATE.format(geometric_hint=geometric_hint)
 
         messages = [{
@@ -205,6 +210,11 @@ class CaptionGenerator:
             return {"scene_description": output_text, "maneuver_category": geometric_hint}
 
     def process_all(self, shard_id=0, num_shards=1):
+        # 1. Calculate Target per Shard
+        # If we want 1500 total, and have 2 shards, each shard should stop after 750.
+        target_per_class = GLOBAL_MAX_SAMPLES_PER_CLASS // num_shards
+        print(f"[BALANCING] Max samples per class for this shard: {target_per_class}")
+
         pt_files = []
         for root, _, files in os.walk(self.input_dir):
             for file in files:
@@ -213,8 +223,11 @@ class CaptionGenerator:
         
         pt_files.sort()
         my_files = pt_files[shard_id::num_shards]
-        print(f"[GPU {shard_id}] Processing {len(my_files)} files.")
+        print(f"[GPU {shard_id}] Scanning {len(my_files)} files...")
         random.shuffle(my_files)
+
+        # 2. Tracking Counts
+        class_counts = {}
 
         for pt_path in tqdm(my_files, desc=f"GPU {shard_id}"):
             try:
@@ -226,42 +239,61 @@ class CaptionGenerator:
                 # Load Data
                 data = torch.load(pt_path)
                 
-                # --- EXTRACT GEOMETRIC HINT ---
+                # --- A. GEOMETRIC CHECK (FAST) ---
                 city = data.city if hasattr(data, 'city') else data['city']
                 origin = data.origin if hasattr(data, 'origin') else data['origin']
                 if hasattr(origin, 'numpy'): origin = origin.numpy()
                 
-                # Check for trajectory (y)
                 traj = data.y if hasattr(data, 'y') else data.get('y')
                 if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
                 
                 nusc_map = get_nusc_map(self.nusc_dataroot, city)
                 
-                # "The Truth"
-                hint = get_geometric_hint(nusc_map, origin, traj)
+                # Get the Category (e.g., "Left Turn at intersection")
+                geometric_hint = get_geometric_hint(nusc_map, origin, traj)
                 
-                # --- VLM GENERATION ---
+                # Normalize Category Key (First word usually sufficient for counting, or full string)
+                # We group by the main action (e.g., "Left Turn", "Straight Drive")
+                # This splits "Left Turn at intersection" -> "Left Turn"
+                category_key = " ".join(geometric_hint.split()[:2]) 
+                
+                # --- B. BALANCING FILTER ---
+                current_count = class_counts.get(category_key, 0)
+                
+                if current_count >= target_per_class:
+                    # Skip VLM generation if we have enough of this class
+                    continue
+
+                # --- C. VLM GENERATION (SLOW) ---
                 sample_token = os.path.basename(pt_path).replace(".pt", "")
                 seq_tokens = self._collect_future_sequence(sample_token)
                 image_paths = self.get_image_paths(seq_tokens)
                 
-                caption_data = self.generate_caption(image_paths, hint)
+                # Generate with Hint
+                caption_data = self.generate_caption(image_paths, geometric_hint)
 
                 if caption_data:
                     # Save results
                     if isinstance(data, dict):
                         data['caption_dict'] = caption_data
                         data['scene_caption'] = caption_data.get('scene_description', '')
+                        data['maneuver_category'] = geometric_hint
                     else:
                         data.caption_dict = caption_data
                         data.scene_caption = caption_data.get('scene_description', '')
+                        data.maneuver_category = geometric_hint
                     
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     torch.save(data, out_path)
+                    
+                    # Update Count only after successful save
+                    class_counts[category_key] = current_count + 1
 
             except Exception as e:
                 # print(f"Skipped {pt_path}: {e}")
                 pass
+        
+        print(f"[GPU {shard_id}] Finished. Counts: {class_counts}")
 
 def main():
     parser = argparse.ArgumentParser()
