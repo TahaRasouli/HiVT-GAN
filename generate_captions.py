@@ -28,24 +28,35 @@ from nuscenes.map_expansion.map_api import NuScenesMap
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# --- 2. PROMPT TEMPLATE ---
+# --- 2. PROMPT TEMPLATE (Refined for Contrastive Learning) ---
 PROMPT_TEMPLATE = """
 You are a trajectory forecasting assistant.
 The vehicle in the video is confirmed to be executing a **{geometric_hint}**.
 
-Your task is to generate a JSON output describing this future maneuver based on the visual road geometry.
+Your task is to generate a JSON output describing this future maneuver.
 
 ### GUIDELINES:
 1. **Tense:** You MUST use Future Tense. Start with "The ego vehicle will..."
-2. **Focus:** Describe the geometry (lanes, intersections, dividers). Ignore weather/buildings.
-3. **Format:** Output ONLY valid JSON.
+2. **Focus:** Describe the **Ego Motion** (speed, steering) and **Map Geometry** (lanes, stop-lines, curbs).
+3. **STRICT CONSTRAINTS (Crucial):**
+   - **NO Traffic Lights/Signs:** The map encoder cannot see colors. Do NOT say "waiting for green light." Say "waiting at the intersection stop-line."
+   - **NO Other Vehicles:** Do NOT say "following the car." Say "maintaining a steady pace in the lane."
+4. **Variety:** For "Straight Drive", mention if the road is narrow, wide, or an intersection approach.
 
-### EXAMPLE 1:
-**Input Hint:** Left Turn at intersection
+### EXAMPLES:
+
+**Input Hint:** Stationary Stop
 **Output:**
 {{
-  "scene_description": "The ego vehicle will slow down as it approaches the intersection, then turn left across the perpendicular lanes to enter the target street.",
-  "maneuver_category": "Left Turn at intersection"
+  "scene_description": "The ego vehicle will decelerate smoothly and come to a complete stop at the intersection limit line, maintaining its position in the lane.",
+  "maneuver_category": "Stationary Stop"
+}}
+
+**Input Hint:** Straight Drive
+**Output:**
+{{
+  "scene_description": "The ego vehicle will proceed straight along the multi-lane road, staying centered between the dashed lane dividers.",
+  "maneuver_category": "Straight Drive"
 }}
 
 ### YOUR TASK:
