@@ -51,7 +51,7 @@ You must output a single JSON object with these 3 keys:
 {
   "scene_description": "The ego vehicle will maintain a steady pace, staying centered in the rightmost lane while passing an intersection.",
   "maneuver_category": "Straight Drive",
-  "lane_type": "4-lane urban road"
+  "lane_type": "4-lane road"
 }
 
 ### YOUR TASK:
