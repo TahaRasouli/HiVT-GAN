@@ -49,12 +49,12 @@ def main():
     # Training arguments
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--max_epochs", type=int, default=64)
-    parser.add_argument("--monitor", type=str, default="val_minFDE", choices=["val_minADE", "val_minFDE", "val_minMR", "val_cap_loss"]) # Added val_cap_loss
+    parser.add_argument("--monitor", type=str, default="val_minFDE")
     parser.add_argument("--save_top_k", type=int, default=5)
     
     # --- MODEL FLAGS ---
     parser.add_argument("--train_cvae_gan", action="store_true")
-    parser.add_argument("--train_caption", action="store_true") # <--- NEW FLAG
+    parser.add_argument("--train_contrastive", action="store_true", help="Train HiVT-X Contrastive Model")
     
     parser.add_argument("--grad_clip", type=float, default=None)
     parser.add_argument("--freeze_encoder", action="store_true")
@@ -68,11 +68,9 @@ def main():
         print(f"Fine-tuning detected. Lowering Learning Rate to 1e-4")
         args.lr = 1e-4 
 
-    # =====================================================
-    # 2. DATA MODULE (Moved UP to get vocab_size)
-    # =====================================================
+    # 2. DATA MODULE
     datamodule = NuScenesHiVTDataModule(
-        split_file="balanced_splits.json", # Ensure this file is generated
+        split_file="balanced_splits.json", 
         root=args.root,
         train_batch_size=args.train_batch_size,
         val_batch_size=args.val_batch_size,
@@ -81,32 +79,24 @@ def main():
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
     )
-    # Ensure vocab is built/loaded so we can get the size
     datamodule.prepare_data() 
     vocab_size = len(datamodule.tokenizer.word2idx)
     print(f"--- DataModule Ready. Vocab Size: {vocab_size} ---")
 
-    # =====================================================
     # 3. MODEL INITIALIZATION
-    # =====================================================
     actual_fit_path = args.ckpt_path
     
-    # CASE A: Captioning (HiVT-X)
-    if args.train_caption:
-        print("--- initializing HiVT-X (Captioning) Model ---")
+    # CASE A: Contrastive Learning (HiVT-X)
+    if args.train_contrastive:
+        print("--- initializing HiVT-X (Contrastive) Model ---")
         if not args.ckpt_path:
-            raise ValueError("Caption training requires --ckpt_path to load the CVAE-GAN backbone!")
+            raise ValueError("Contrastive training requires --ckpt_path to load the CVAE-GAN backbone!")
         
-        # Initialize HiVT-X with the backbone path and vocab size
         model = HiVTX(cvae_gan_ckpt=args.ckpt_path, vocab_size=vocab_size, **vars(args))
+        actual_fit_path = None # Start fresh training
         
-        # We start a NEW training session for the captioner, so we don't pass ckpt_path to trainer.fit
-        # (The backbone weights are already loaded inside HiVTX.__init__)
-        actual_fit_path = None
-        
-        # Override monitor for captioning
         if args.monitor == "val_minFDE": 
-            args.monitor = "val_cap_loss"
+            args.monitor = "val_loss"
 
     # CASE B: CVAE-GAN
     elif args.train_cvae_gan:

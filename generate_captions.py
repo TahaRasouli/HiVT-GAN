@@ -28,7 +28,7 @@ from nuscenes.nuscenes import NuScenes
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# --- 2. FIXED PROMPT (Single Braces) ---
+# --- 2. FIXED PROMPT (Single Braces Only) ---
 PROMPT_TEMPLATE = """
 You are a trajectory forecasting assistant. Analyze the video to describe the future motion of the ego vehicle and the road configuration.
 
@@ -44,21 +44,21 @@ You are a trajectory forecasting assistant. Analyze the video to describe the fu
 You must output a single JSON object with these 3 keys:
 - "scene_description": The natural language caption.
 - "maneuver_category": One of [Straight Drive, Turn Left, Turn Right, U-Turn, Lane Change Left, Lane Change Right, Stationary].
-- "lane_type": Describe the lane count/type (e.g., "Single-lane road", "2-lane one-way", "3-lane street", "Multi-lane intersection").
+- "lane_type": Describe the lane count/type (e.g., "Single-lane road", "2-lane one-way", "3-lane highway", "Multi-lane intersection").
 
 ### EXAMPLE:
 **Output:**
 {
   "scene_description": "The ego vehicle will maintain a steady pace, staying centered in the rightmost lane while passing an intersection.",
   "maneuver_category": "Straight Drive",
-  "lane_type": "4-lane road"
+  "lane_type": "4-lane urban road"
 }
 
 ### YOUR TASK:
 **Output:**
 """
 
-# --- 3. BALANCING ---
+# --- 3. BALANCING RATES ---
 KEEP_RATES = {
     "Straight Drive": 0.2,       
     "Stationary Stop": 0.25,     
@@ -70,6 +70,9 @@ KEEP_RATES = {
 }
 
 def get_kinematic_category_robust(trajectory):
+    """
+    Robust Math Check for Filtering.
+    """
     if trajectory.ndim == 3: trajectory = trajectory[0]
     if len(trajectory) < 6: return "Stationary Stop"
 
@@ -77,6 +80,7 @@ def get_kinematic_category_robust(trajectory):
     displacement = float(np.linalg.norm(p_final))
     y_final = float(p_final[1]) 
 
+    # U-TURN FIX: You cannot do a U-Turn in < 4 meters of movement.
     if displacement < 2.0: return "Stationary Stop"
 
     v_start = trajectory[5, :2] - p0
@@ -158,38 +162,34 @@ class CaptionGenerator:
         try:
             with torch.no_grad():
                 generated_ids = self.model.generate(
-                    **inputs, 
-                    max_new_tokens=200, 
-                    do_sample=False, 
-                    num_beams=1
+                    **inputs, max_new_tokens=200, do_sample=False, num_beams=1
                 )
         except Exception as e:
-            print(f"VLM Internal Error: {e}")
+            # print(f"VLM Internal Error: {e}")
             return None
         
         generated_ids_trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         output_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
 
-        # --- IMPROVED PARSER ---
+        # --- ROBUST PARSER ---
         try:
-            # 1. Clean Markdown and Double Braces
+            # 1. Clean Markdown
             cleaned = re.sub(r'```json\s*', '', output_text, flags=re.IGNORECASE)
             cleaned = cleaned.replace('```', '').strip()
-            # FIX: Handle double braces if they still appear
+            
+            # 2. FIX: Replace double braces if they exist (The Fix)
             cleaned = cleaned.replace('{{', '{').replace('}}', '}')
             
-            # 2. Extract JSON
+            # 3. Extract JSON
             start = cleaned.find('{')
             end = cleaned.rfind('}')
             
             if start != -1 and end != -1:
-                json_str = cleaned[start : end+1]
-                return json.loads(json_str)
+                return json.loads(cleaned[start : end+1])
             else:
                 return None
         except Exception:
-            # Fallback: Capture raw text so we don't lose the sample
-            # (We can clean up VLM_RAW_OUTPUT later)
+            # Fallback: Save raw text so we don't lose the sample
             return {
                 "scene_description": output_text.replace('\n', ' ').strip(),
                 "maneuver_category": "VLM_RAW_OUTPUT", 
@@ -219,17 +219,20 @@ class CaptionGenerator:
                 out_path = os.path.join(self.output_dir, rel_path)
                 if os.path.exists(out_path): continue
 
+                # Weights_only=False allows custom objects to load
                 data = torch.load(pt_path, weights_only=False)
                 
                 traj = data.y if hasattr(data, 'y') else data.get('y')
                 if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
 
+                # --- FILTERING ---
                 filter_category = get_kinematic_category_robust(traj)
                 
                 keep_rate = KEEP_RATES.get(filter_category, 1.0)
                 if random.random() > keep_rate:
                     continue 
 
+                # --- VLM GENERATION ---
                 sample_token = os.path.basename(pt_path).replace(".pt", "")
                 seq_tokens = self._collect_future_sequence(sample_token)
                 image_paths = self.get_image_paths(seq_tokens)
@@ -254,7 +257,7 @@ class CaptionGenerator:
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     torch.save(data, out_path)
                     
-                    # Stats
+                    # Update Stats
                     vlm_cat = caption_data.get('maneuver_category', 'Unknown')
                     stats_key = "Unknown"
                     
@@ -293,3 +296,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
