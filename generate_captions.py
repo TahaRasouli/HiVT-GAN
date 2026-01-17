@@ -8,10 +8,10 @@ CACHE_DIR = f"/tmp/{user_name}/fast_cache"
 
 try:
     os.makedirs(CACHE_DIR, exist_ok=True)
-    print(f"[SETUP] Cache forced to Local SSD: {CACHE_DIR}")
+    # print(f"[SETUP] Cache forced to Local SSD: {CACHE_DIR}")
 except OSError:
     CACHE_DIR = "/mount/studenten/projects/rasoulta/cache_internal" 
-    print(f"[SETUP] /tmp unreachable. Using fallback: {CACHE_DIR}")
+    # print(f"[SETUP] /tmp unreachable. Using fallback: {CACHE_DIR}")
 
 os.environ["XDG_CACHE_HOME"] = CACHE_DIR
 os.environ["TORCH_HOME"] = os.path.join(CACHE_DIR, "torch")
@@ -28,50 +28,58 @@ from nuscenes.nuscenes import NuScenes
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# --- 2. FIXED PROMPT (Single Braces Only) ---
+# --- 2. GUIDED PROMPT (We tell it the maneuver) ---
+# This forces the VLM to describe the turn, even if it looks straight initially.
 PROMPT_TEMPLATE = """
-You are a trajectory forecasting assistant. Analyze the video to describe the future motion of the ego vehicle and the road configuration.
+You are a trajectory forecasting assistant.
+The vehicle in the video is confirmed to be executing a **{geometric_hint}**.
+
+Your task is to generate a JSON output describing this future maneuver and the road.
 
 ### GUIDELINES:
-1. **Action:** Describe the maneuver (Straight, Turn, Lane Change, Stop) based STRICTLY on the video.
-2. **Tense:** Use Future Tense. Start with "The ego vehicle will..."
+1. **Consistency:** Your description MUST match the hint: **{geometric_hint}**.
+2. **Tense:** You MUST use Future Tense. Start with "The ego vehicle will..."
 3. **Constraints:**
    - **NO** mention of trees, buildings, weather, or sky.
    - **NO** mention of traffic lights (use "intersection stop-line" instead).
    - **Focus** on lane lines, curbs, and dividers.
 
 ### JSON OUTPUT FORMAT:
-You must output a single JSON object with these 3 keys:
-- "scene_description": The natural language caption.
-- "maneuver_category": One of [Straight Drive, Turn Left, Turn Right, U-Turn, Lane Change Left, Lane Change Right, Stationary].
-- "lane_type": Describe the lane count/type (e.g., "Single-lane road", "2-lane one-way", "3-lane highway", "Multi-lane intersection").
+Output a single JSON object:
+{{
+  "scene_description": "Natural language caption...",
+  "lane_type": "Describe lane count (e.g., 2-lane one-way, 4-lane urban road, etc.)"
+}}
 
 ### EXAMPLE:
+**Input Hint:** Left Turn
 **Output:**
-{
-  "scene_description": "The ego vehicle will maintain a steady pace, staying centered in the rightmost lane while passing an intersection.",
-  "maneuver_category": "Straight Drive",
-  "lane_type": "4-lane urban road"
-}
+{{
+  "scene_description": "The ego vehicle will slow down approaching the intersection, then turn left across the perpendicular lanes to enter the target street.",
+  "lane_type": "Multi-lane intersection"
+}}
 
 ### YOUR TASK:
+**Input Hint:** {geometric_hint}
 **Output:**
 """
 
 # --- 3. BALANCING RATES ---
+# Aggressively filter Straight/Stationary to force balance
 KEEP_RATES = {
-    "Straight Drive": 0.2,       
-    "Stationary Stop": 0.25,     
-    "Left Turn": 1.0,            
-    "Right Turn": 1.0,           
-    "Lane Change Left": 1.0,     
-    "Lane Change Right": 1.0,    
-    "U-Turn": 1.0                
+    "Straight Drive": 0.15,      # Keep only 15% (Drop 85%)
+    "Stationary Stop": 0.20,     # Keep only 20%
+    "Left Turn": 1.0,            # Keep ALL
+    "Right Turn": 1.0,           # Keep ALL
+    "Lane Change Left": 1.0,     # Keep ALL
+    "Lane Change Right": 1.0,    # Keep ALL
+    "U-Turn": 1.0                # Keep ALL
 }
 
 def get_kinematic_category_robust(trajectory):
     """
-    Robust Math Check for Filtering.
+    Robust Math Check.
+    This fixes the 'Straight=U-Turn' bug by checking distance moved.
     """
     if trajectory.ndim == 3: trajectory = trajectory[0]
     if len(trajectory) < 6: return "Stationary Stop"
@@ -80,7 +88,8 @@ def get_kinematic_category_robust(trajectory):
     displacement = float(np.linalg.norm(p_final))
     y_final = float(p_final[1]) 
 
-    # U-TURN FIX: You cannot do a U-Turn in < 4 meters of movement.
+    # 1. Stationary Check (Must move < 2m total)
+    # Fixes jittery cars being called turns
     if displacement < 2.0: return "Stationary Stop"
 
     v_start = trajectory[5, :2] - p0
@@ -89,9 +98,15 @@ def get_kinematic_category_robust(trajectory):
     angle_end = np.arctan2(v_end[1], v_end[0])
     diff_deg = np.degrees((angle_end - angle_start + np.pi) % (2 * np.pi) - np.pi)
 
+    # 2. U-Turn Check (Must turn > 100 deg AND move > 4m)
+    # Fixes stationary/slow cars being called U-turns
     if abs(diff_deg) > 100 and displacement > 4.0: return "U-Turn"
+    
+    # 3. Turn Checks
     if diff_deg > 25: return "Left Turn"
     if diff_deg < -25: return "Right Turn"
+    
+    # 4. Lane Change Checks (Lateral dev > 2m)
     if y_final > 2.0: return "Lane Change Left"
     if y_final < -2.0: return "Lane Change Right"
     
@@ -137,11 +152,12 @@ class CaptionGenerator:
             except: continue
         return paths
 
-    def generate_caption(self, image_paths):
+    def generate_caption(self, image_paths, geometric_hint):
         valid_paths = [p for p in image_paths if os.path.exists(p)]
         if len(valid_paths) < 2: return None
 
-        formatted_prompt = PROMPT_TEMPLATE 
+        # Pass the robust math hint to the prompt
+        formatted_prompt = PROMPT_TEMPLATE.format(geometric_hint=geometric_hint)
 
         messages = [{
             "role": "user",
@@ -164,37 +180,26 @@ class CaptionGenerator:
                 generated_ids = self.model.generate(
                     **inputs, max_new_tokens=200, do_sample=False, num_beams=1
                 )
-        except Exception as e:
-            # print(f"VLM Internal Error: {e}")
+        except Exception:
             return None
         
         generated_ids_trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         output_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
 
-        # --- ROBUST PARSER ---
         try:
-            # 1. Clean Markdown
+            # Robust Cleaning
             cleaned = re.sub(r'```json\s*', '', output_text, flags=re.IGNORECASE)
             cleaned = cleaned.replace('```', '').strip()
-            
-            # 2. FIX: Replace double braces if they exist (The Fix)
             cleaned = cleaned.replace('{{', '{').replace('}}', '}')
             
-            # 3. Extract JSON
             start = cleaned.find('{')
             end = cleaned.rfind('}')
-            
             if start != -1 and end != -1:
                 return json.loads(cleaned[start : end+1])
             else:
                 return None
-        except Exception:
-            # Fallback: Save raw text so we don't lose the sample
-            return {
-                "scene_description": output_text.replace('\n', ' ').strip(),
-                "maneuver_category": "VLM_RAW_OUTPUT", 
-                "lane_type": "Unknown"
-            }
+        except:
+            return None
 
     def process_all(self, shard_id=0, num_shards=1):
         print(f"[BALANCING] Rates: {KEEP_RATES}")
@@ -210,8 +215,8 @@ class CaptionGenerator:
         my_files = pt_files[shard_id::num_shards]
         print(f"[GPU {shard_id}] Scanning {len(my_files)} files...")
 
+        # Count using the MATH Ground Truth (which we force the VLM to use)
         final_stats = {k: 0 for k in KEEP_RATES.keys()}
-        final_stats["VLM_RAW_OUTPUT"] = 0
         
         for pt_path in tqdm(my_files, desc=f"GPU {shard_id}"):
             try:
@@ -219,62 +224,56 @@ class CaptionGenerator:
                 out_path = os.path.join(self.output_dir, rel_path)
                 if os.path.exists(out_path): continue
 
-                # Weights_only=False allows custom objects to load
                 data = torch.load(pt_path, weights_only=False)
-                
                 traj = data.y if hasattr(data, 'y') else data.get('y')
                 if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
 
-                # --- FILTERING ---
-                filter_category = get_kinematic_category_robust(traj)
+                # 1. CALCULATE GROUND TRUTH (MATH)
+                math_category = get_kinematic_category_robust(traj)
                 
-                keep_rate = KEEP_RATES.get(filter_category, 1.0)
+                # 2. FILTER
+                keep_rate = KEEP_RATES.get(math_category, 1.0)
                 if random.random() > keep_rate:
                     continue 
 
-                # --- VLM GENERATION ---
+                # 3. GENERATE (Using Hint)
                 sample_token = os.path.basename(pt_path).replace(".pt", "")
                 seq_tokens = self._collect_future_sequence(sample_token)
                 image_paths = self.get_image_paths(seq_tokens)
                 
                 if not image_paths: continue
 
-                caption_data = self.generate_caption(image_paths)
+                # We pass 'math_category' to the VLM
+                caption_data = self.generate_caption(image_paths, math_category)
 
                 if caption_data:
-                    # Save structure
+                    # 4. SAVE (We force the Math Label into the data)
+                    # This ensures the label 'maneuver_category' is 100% correct geometrically
+                    # while the text description tries its best to describe it.
+                    caption_data['maneuver_category'] = math_category
+                    
                     if isinstance(data, dict):
                         data['caption_dict'] = caption_data
                         data['scene_caption'] = caption_data.get('scene_description', '')
-                        data['maneuver_category'] = caption_data.get('maneuver_category', 'Unknown')
-                        data['lane_type'] = caption_data.get('lane_type', 'Unknown')
+                        data['maneuver_category'] = math_category
                     else:
                         data.caption_dict = caption_data
                         data.scene_caption = caption_data.get('scene_description', '')
-                        data.maneuver_category = caption_data.get('maneuver_category', 'Unknown')
-                        data.lane_type = caption_data.get('lane_type', 'Unknown')
+                        data.maneuver_category = math_category
                     
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     torch.save(data, out_path)
                     
-                    # Update Stats
-                    vlm_cat = caption_data.get('maneuver_category', 'Unknown')
-                    stats_key = "Unknown"
-                    
-                    if vlm_cat == "VLM_RAW_OUTPUT":
-                        stats_key = "VLM_RAW_OUTPUT"
+                    # Log
+                    if math_category in final_stats: 
+                        final_stats[math_category] += 1
                     else:
-                        for k in final_stats.keys():
-                            if k.split()[0] in vlm_cat: 
-                                stats_key = k; break
-                    
-                    if stats_key in final_stats: final_stats[stats_key] += 1
-                    else: final_stats[stats_key] = final_stats.get(stats_key, 0) + 1
+                        final_stats[math_category] = final_stats.get(math_category, 0) + 1
 
             except Exception:
                 pass
         
-        print(f"[GPU {shard_id}] Final Counts: {final_stats}")
+        print(f"[GPU {shard_id}] Final Distribution: {final_stats}")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -296,4 +295,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
