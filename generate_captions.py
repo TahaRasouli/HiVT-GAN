@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 
 # --- 1. CACHE SETUP ---
 user_name = os.environ.get("USER", "rasoulta")
@@ -27,7 +28,7 @@ from nuscenes.nuscenes import NuScenes
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# --- 2. NEW PROMPT (Blind to Math, Lane-Aware, No Trees) ---
+# --- 2. FIXED PROMPT (Single Braces) ---
 PROMPT_TEMPLATE = """
 You are a trajectory forecasting assistant. Analyze the video to describe the future motion of the ego vehicle and the road configuration.
 
@@ -47,11 +48,11 @@ You must output a single JSON object with these 3 keys:
 
 ### EXAMPLE:
 **Output:**
-{{
+{
   "scene_description": "The ego vehicle will maintain a steady pace, staying centered in the rightmost lane while passing an intersection.",
   "maneuver_category": "Straight Drive",
   "lane_type": "4-lane urban road"
-}}
+}
 
 ### YOUR TASK:
 **Output:**
@@ -157,25 +158,43 @@ class CaptionGenerator:
         try:
             with torch.no_grad():
                 generated_ids = self.model.generate(
-                    **inputs, max_new_tokens=150, do_sample=False, num_beams=1
+                    **inputs, 
+                    max_new_tokens=200, 
+                    do_sample=False, 
+                    num_beams=1
                 )
         except Exception as e:
-            print(f"VLM Gen Error: {e}")
+            print(f"VLM Internal Error: {e}")
             return None
         
         generated_ids_trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         output_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
 
+        # --- IMPROVED PARSER ---
         try:
-            cleaned = output_text.strip()
+            # 1. Clean Markdown and Double Braces
+            cleaned = re.sub(r'```json\s*', '', output_text, flags=re.IGNORECASE)
+            cleaned = cleaned.replace('```', '').strip()
+            # FIX: Handle double braces if they still appear
+            cleaned = cleaned.replace('{{', '{').replace('}}', '}')
+            
+            # 2. Extract JSON
             start = cleaned.find('{')
             end = cleaned.rfind('}')
+            
             if start != -1 and end != -1:
-                return json.loads(cleaned[start : end+1])
+                json_str = cleaned[start : end+1]
+                return json.loads(json_str)
             else:
-                return None # Failed to find JSON
-        except:
-            return None
+                return None
+        except Exception:
+            # Fallback: Capture raw text so we don't lose the sample
+            # (We can clean up VLM_RAW_OUTPUT later)
+            return {
+                "scene_description": output_text.replace('\n', ' ').strip(),
+                "maneuver_category": "VLM_RAW_OUTPUT", 
+                "lane_type": "Unknown"
+            }
 
     def process_all(self, shard_id=0, num_shards=1):
         print(f"[BALANCING] Rates: {KEEP_RATES}")
@@ -192,41 +211,35 @@ class CaptionGenerator:
         print(f"[GPU {shard_id}] Scanning {len(my_files)} files...")
 
         final_stats = {k: 0 for k in KEEP_RATES.keys()}
-        errors_printed = 0
+        final_stats["VLM_RAW_OUTPUT"] = 0
         
         for pt_path in tqdm(my_files, desc=f"GPU {shard_id}"):
             try:
-                # Output Check
                 rel_path = os.path.relpath(pt_path, self.input_dir)
                 out_path = os.path.join(self.output_dir, rel_path)
                 if os.path.exists(out_path): continue
 
-                # FIX 1: Allow custom weights (fixes the crash you likely had)
                 data = torch.load(pt_path, weights_only=False)
                 
                 traj = data.y if hasattr(data, 'y') else data.get('y')
                 if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
 
-                # --- FILTERING ---
                 filter_category = get_kinematic_category_robust(traj)
                 
                 keep_rate = KEEP_RATES.get(filter_category, 1.0)
                 if random.random() > keep_rate:
                     continue 
 
-                # --- VLM GENERATION ---
                 sample_token = os.path.basename(pt_path).replace(".pt", "")
                 seq_tokens = self._collect_future_sequence(sample_token)
                 image_paths = self.get_image_paths(seq_tokens)
                 
-                if len(image_paths) == 0:
-                    if errors_printed < 3: print(f"No images for {sample_token}")
-                    continue
+                if not image_paths: continue
 
                 caption_data = self.generate_caption(image_paths)
 
                 if caption_data:
-                    # Save
+                    # Save structure
                     if isinstance(data, dict):
                         data['caption_dict'] = caption_data
                         data['scene_caption'] = caption_data.get('scene_description', '')
@@ -241,28 +254,24 @@ class CaptionGenerator:
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     torch.save(data, out_path)
                     
-                    # Update Stats
+                    # Stats
                     vlm_cat = caption_data.get('maneuver_category', 'Unknown')
                     stats_key = "Unknown"
-                    for k in final_stats.keys():
-                        if k.split()[0] in vlm_cat: 
-                            stats_key = k; break
+                    
+                    if vlm_cat == "VLM_RAW_OUTPUT":
+                        stats_key = "VLM_RAW_OUTPUT"
+                    else:
+                        for k in final_stats.keys():
+                            if k.split()[0] in vlm_cat: 
+                                stats_key = k; break
                     
                     if stats_key in final_stats: final_stats[stats_key] += 1
-                else:
-                    # Log failure to generate caption
-                    if errors_printed < 5:
-                        print(f"[FAIL] VLM returned None for {os.path.basename(pt_path)}")
-                        errors_printed += 1
+                    else: final_stats[stats_key] = final_stats.get(stats_key, 0) + 1
 
-            except Exception as e:
-                # FIX 2: Print errors instead of silent pass
-                if errors_printed < 10:
-                    print(f"[ERROR] Failed {os.path.basename(pt_path)}: {e}")
-                    errors_printed += 1
+            except Exception:
                 pass
         
-        print(f"[GPU {shard_id}] Saved Counts (VLM Classification): {final_stats}")
+        print(f"[GPU {shard_id}] Final Counts: {final_stats}")
 
 def main():
     parser = argparse.ArgumentParser()
