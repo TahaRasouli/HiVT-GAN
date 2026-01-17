@@ -53,15 +53,17 @@ Your task is to generate a JSON output describing this future maneuver based on 
 **Output:**
 """
 
-# --- 3. BALANCING LIMITS (Optimized for Contrastive Learning) ---
-STRICT_LIMITS = {
-    "Straight Drive": 3000,      
-    "Stationary Stop": 1000,     
-    "Left Turn": 5000,           # Keep All
-    "Right Turn": 5000,          # Keep All
-    "Lane Change Left": 5000,    # Keep All
-    "Lane Change Right": 5000,   # Keep All
-    "U-Turn": 5000               # Keep All
+# --- 3. PROBABILISTIC SAMPLING RATES ---
+# 1.0 = Keep All (100%)
+# 0.2 = Keep 20% (Drop 8 out of 10)
+KEEP_RATES = {
+    "Straight Drive": 0.2,       # ~14k -> ~2.8k
+    "Stationary Stop": 0.25,     # ~4k -> ~1k
+    "Left Turn": 1.0,            # Keep All
+    "Right Turn": 1.0,           # Keep All
+    "Lane Change Left": 1.0,     # Keep All
+    "Lane Change Right": 1.0,    # Keep All
+    "U-Turn": 1.0                # Keep All
 }
 
 MAP_CACHE = {}
@@ -76,11 +78,10 @@ def get_nusc_map(dataroot, city):
 
 def get_kinematic_category(trajectory):
     """
-    Fast check: Uses ONLY Math (No Map).
-    Used for quick filtering of Straight/Stationary.
+    Fast Physics Check (No Map).
     """
     if trajectory.ndim == 3: trajectory = trajectory[0]
-    if len(trajectory) < 6: return "Stationary Stop", 0.0, 0.0
+    if len(trajectory) < 6: return "Stationary Stop"
 
     # Metrics
     p0, p_final = trajectory[0, :2], trajectory[-1, :2]
@@ -94,25 +95,16 @@ def get_kinematic_category(trajectory):
     angle_end = np.arctan2(v_end[1], v_end[0])
     diff_deg = np.degrees((angle_end - angle_start + np.pi) % (2 * np.pi) - np.pi)
 
-    # Logic
-    if displacement < 2.0: 
-        return "Stationary Stop", displacement, diff_deg
+    if displacement < 2.0: return "Stationary Stop"
+    if abs(diff_deg) > 100: return "U-Turn"
+    if diff_deg > 25: return "Left Turn"
+    if diff_deg < -25: return "Right Turn"
+    if y_final > 2.0: return "Lane Change Left"
+    if y_final < -2.0: return "Lane Change Right"
     
-    # Check Turns
-    if abs(diff_deg) > 100: return "U-Turn", displacement, diff_deg
-    if diff_deg > 25: return "Left Turn", displacement, diff_deg
-    if diff_deg < -25: return "Right Turn", displacement, diff_deg
-    
-    # Check Lane Changes
-    if y_final > 2.0: return "Lane Change Left", displacement, diff_deg
-    if y_final < -2.0: return "Lane Change Right", displacement, diff_deg
-    
-    return "Straight Drive", displacement, diff_deg
+    return "Straight Drive"
 
 def get_full_hint(nusc_map, origin, base_category):
-    """
-    Detailed check: Adds Map Context (Intersection) only if we keep the sample.
-    """
     context = "on the road"
     if nusc_map:
         try:
@@ -200,7 +192,6 @@ class CaptionGenerator:
         generated_ids_trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         output_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
 
-        # Robust JSON Parser
         try:
             cleaned = output_text.strip()
             start = cleaned.find('{')
@@ -216,7 +207,7 @@ class CaptionGenerator:
             }
 
     def process_all(self, shard_id=0, num_shards=1):
-        print(f"[BALANCING] Limits: {STRICT_LIMITS}")
+        print(f"[BALANCING] Using Sampling Rates: {KEEP_RATES}")
 
         # 1. Collect & Shuffle
         pt_files = []
@@ -226,47 +217,43 @@ class CaptionGenerator:
                     pt_files.append(os.path.join(root, file))
         
         pt_files.sort()
+        # Seed ensures consistent processing
         random.Random(42).shuffle(pt_files) 
         my_files = pt_files[shard_id::num_shards]
         print(f"[GPU {shard_id}] Scanning {len(my_files)} files...")
 
-        class_counts = {k: 0 for k in STRICT_LIMITS.keys()}
+        class_counts = {k: 0 for k in KEEP_RATES.keys()}
         processed_total = 0
 
-        # 2. Optimized Loop
+        # 2. Loop
         for pt_path in tqdm(my_files, desc=f"GPU {shard_id}"):
             try:
-                # Check existence first
+                # Output Check
                 rel_path = os.path.relpath(pt_path, self.input_dir)
                 out_path = os.path.join(self.output_dir, rel_path)
                 if os.path.exists(out_path): continue
 
                 # Load Data
                 data = torch.load(pt_path)
-                
-                # Extract Trajectory
                 traj = data.y if hasattr(data, 'y') else data.get('y')
                 if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
 
-                # --- STEP 1: FAST FILTER (Math Only) ---
-                # Determine if Straight/Stationary purely by physics
-                base_category, _, _ = get_kinematic_category(traj)
+                # --- A. FAST FILTER (Probabilistic) ---
+                base_category = get_kinematic_category(traj)
                 
-                # Check Limits immediately
-                limit = STRICT_LIMITS.get(base_category, 5000)
-                if class_counts.get(base_category, 0) >= limit:
-                    continue # Skip without loading map or VLM
+                # Retrieve rate (Default 1.0 if not found)
+                keep_rate = KEEP_RATES.get(base_category, 1.0)
+                
+                # The "Dice Roll": If random number > rate, we SKIP.
+                if random.random() > keep_rate:
+                    continue 
 
-                # --- STEP 2: FULL PROCESSING (If passed filter) ---
-                # Now we invest resources
+                # --- B. FULL PROCESSING (If kept) ---
                 city = data.city if hasattr(data, 'city') else data['city']
                 origin = data.origin if hasattr(data, 'origin') else data['origin']
                 if hasattr(origin, 'numpy'): origin = origin.numpy()
                 
-                # Get Map Context
                 nusc_map = get_nusc_map(self.nusc_dataroot, city)
-                
-                # Construct Full Hint (e.g. "Left Turn at intersection")
                 full_hint = get_full_hint(nusc_map, origin, base_category)
 
                 # Generate VLM Caption
@@ -281,7 +268,7 @@ class CaptionGenerator:
                     if isinstance(data, dict):
                         data['caption_dict'] = caption_data
                         data['scene_caption'] = caption_data.get('scene_description', '')
-                        data['maneuver_category'] = full_hint # Save the detailed one
+                        data['maneuver_category'] = full_hint 
                     else:
                         data.caption_dict = caption_data
                         data.scene_caption = caption_data.get('scene_description', '')
@@ -290,12 +277,11 @@ class CaptionGenerator:
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     torch.save(data, out_path)
                     
-                    # Update Count (using base category)
                     class_counts[base_category] += 1
                     processed_total += 1
 
                 if processed_total % 20 == 0:
-                    print(f"\n[GPU {shard_id}] Counts: {class_counts}")
+                    print(f"\n[GPU {shard_id}] Saved Counts: {class_counts}")
 
             except Exception:
                 pass
