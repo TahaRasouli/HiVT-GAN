@@ -57,8 +57,7 @@ You must output a single JSON object with these 3 keys:
 **Output:**
 """
 
-# --- 3. BALANCING (Internal Use Only) ---
-# We still use math to filter (keep diverse data), but we DON'T show this to the VLM.
+# --- 3. BALANCING ---
 KEEP_RATES = {
     "Straight Drive": 0.2,       
     "Stationary Stop": 0.25,     
@@ -70,10 +69,6 @@ KEEP_RATES = {
 }
 
 def get_kinematic_category_robust(trajectory):
-    """
-    Robust Math Check for Filtering.
-    Fixes the 'Straight = U-Turn' bug by enforcing displacement checks.
-    """
     if trajectory.ndim == 3: trajectory = trajectory[0]
     if len(trajectory) < 6: return "Stationary Stop"
 
@@ -81,8 +76,6 @@ def get_kinematic_category_robust(trajectory):
     displacement = float(np.linalg.norm(p_final))
     y_final = float(p_final[1]) 
 
-    # U-TURN FIX: You cannot do a U-Turn in < 4 meters of movement.
-    # Previously, noise in stationary cars caused 180-degree heading flips.
     if displacement < 2.0: return "Stationary Stop"
 
     v_start = trajectory[5, :2] - p0
@@ -143,7 +136,6 @@ class CaptionGenerator:
         valid_paths = [p for p in image_paths if os.path.exists(p)]
         if len(valid_paths) < 2: return None
 
-        # No Hint Injection! Pure video analysis.
         formatted_prompt = PROMPT_TEMPLATE 
 
         messages = [{
@@ -167,7 +159,8 @@ class CaptionGenerator:
                 generated_ids = self.model.generate(
                     **inputs, max_new_tokens=150, do_sample=False, num_beams=1
                 )
-        except Exception:
+        except Exception as e:
+            print(f"VLM Gen Error: {e}")
             return None
         
         generated_ids_trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
@@ -180,9 +173,8 @@ class CaptionGenerator:
             if start != -1 and end != -1:
                 return json.loads(cleaned[start : end+1])
             else:
-                raise ValueError("No brackets")
+                return None # Failed to find JSON
         except:
-            # If JSON fails, we return None to be safe (quality control)
             return None
 
     def process_all(self, shard_id=0, num_shards=1):
@@ -200,6 +192,7 @@ class CaptionGenerator:
         print(f"[GPU {shard_id}] Scanning {len(my_files)} files...")
 
         final_stats = {k: 0 for k in KEEP_RATES.keys()}
+        errors_printed = 0
         
         for pt_path in tqdm(my_files, desc=f"GPU {shard_id}"):
             try:
@@ -208,11 +201,13 @@ class CaptionGenerator:
                 out_path = os.path.join(self.output_dir, rel_path)
                 if os.path.exists(out_path): continue
 
-                data = torch.load(pt_path)
+                # FIX 1: Allow custom weights (fixes the crash you likely had)
+                data = torch.load(pt_path, weights_only=False)
+                
                 traj = data.y if hasattr(data, 'y') else data.get('y')
                 if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
 
-                # --- FILTERING (Hidden from VLM) ---
+                # --- FILTERING ---
                 filter_category = get_kinematic_category_robust(traj)
                 
                 keep_rate = KEEP_RATES.get(filter_category, 1.0)
@@ -224,11 +219,14 @@ class CaptionGenerator:
                 seq_tokens = self._collect_future_sequence(sample_token)
                 image_paths = self.get_image_paths(seq_tokens)
                 
-                # No hint passed here
+                if len(image_paths) == 0:
+                    if errors_printed < 3: print(f"No images for {sample_token}")
+                    continue
+
                 caption_data = self.generate_caption(image_paths)
 
                 if caption_data:
-                    # Save the RICH structure
+                    # Save
                     if isinstance(data, dict):
                         data['caption_dict'] = caption_data
                         data['scene_caption'] = caption_data.get('scene_description', '')
@@ -243,17 +241,25 @@ class CaptionGenerator:
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     torch.save(data, out_path)
                     
-                    # Log the VLM's opinion, not the filter's opinion
+                    # Update Stats
                     vlm_cat = caption_data.get('maneuver_category', 'Unknown')
-                    # Clean key for stats
                     stats_key = "Unknown"
                     for k in final_stats.keys():
-                        if k.split()[0] in vlm_cat: # Match "Left" in "Turn Left"
+                        if k.split()[0] in vlm_cat: 
                             stats_key = k; break
                     
                     if stats_key in final_stats: final_stats[stats_key] += 1
+                else:
+                    # Log failure to generate caption
+                    if errors_printed < 5:
+                        print(f"[FAIL] VLM returned None for {os.path.basename(pt_path)}")
+                        errors_printed += 1
 
-            except Exception:
+            except Exception as e:
+                # FIX 2: Print errors instead of silent pass
+                if errors_printed < 10:
+                    print(f"[ERROR] Failed {os.path.basename(pt_path)}: {e}")
+                    errors_printed += 1
                 pass
         
         print(f"[GPU {shard_id}] Saved Counts (VLM Classification): {final_stats}")
