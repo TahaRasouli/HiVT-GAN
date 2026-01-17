@@ -24,48 +24,41 @@ import numpy as np
 from tqdm import tqdm
 from PIL import Image
 from nuscenes.nuscenes import NuScenes
-from nuscenes.map_expansion.map_api import NuScenesMap
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# --- 2. PROMPT TEMPLATE (Refined for Contrastive Learning) ---
+# --- 2. NEW PROMPT (Blind to Math, Lane-Aware, No Trees) ---
 PROMPT_TEMPLATE = """
-You are a trajectory forecasting assistant.
-The vehicle in the video is confirmed to be executing a **{geometric_hint}**.
-
-Your task is to generate a JSON output describing this future maneuver.
+You are a trajectory forecasting assistant. Analyze the video to describe the future motion of the ego vehicle and the road configuration.
 
 ### GUIDELINES:
-1. **Tense:** You MUST use Future Tense. Start with "The ego vehicle will..."
-2. **Focus:** Describe the **Ego Motion** (speed, steering) and **Map Geometry** (lanes, stop-lines, curbs).
-3. **STRICT CONSTRAINTS (Crucial):**
-   - **NO Traffic Lights/Signs:** The map encoder cannot see colors. Do NOT say "waiting for green light." Say "waiting at the intersection stop-line."
-   - **NO Other Vehicles:** Do NOT say "following the car." Say "maintaining a steady pace in the lane."
-4. **Variety:** For "Straight Drive", mention if the road is narrow, wide, or an intersection approach.
+1. **Action:** Describe the maneuver (Straight, Turn, Lane Change, Stop) based STRICTLY on the video.
+2. **Tense:** Use Future Tense. Start with "The ego vehicle will..."
+3. **Constraints:**
+   - **NO** mention of trees, buildings, weather, or sky.
+   - **NO** mention of traffic lights (use "intersection stop-line" instead).
+   - **Focus** on lane lines, curbs, and dividers.
 
-### EXAMPLES:
+### JSON OUTPUT FORMAT:
+You must output a single JSON object with these 3 keys:
+- "scene_description": The natural language caption.
+- "maneuver_category": One of [Straight Drive, Turn Left, Turn Right, U-Turn, Lane Change Left, Lane Change Right, Stationary].
+- "lane_type": Describe the lane count/type (e.g., "Single-lane road", "2-lane one-way", "3-lane highway", "Multi-lane intersection").
 
-**Input Hint:** Stationary Stop
+### EXAMPLE:
 **Output:**
 {{
-  "scene_description": "The ego vehicle will decelerate smoothly and come to a complete stop at the intersection limit line, maintaining its position in the lane.",
-  "maneuver_category": "Stationary Stop"
-}}
-
-**Input Hint:** Straight Drive
-**Output:**
-{{
-  "scene_description": "The ego vehicle will proceed straight along the multi-lane road, staying centered between the dashed lane dividers.",
-  "maneuver_category": "Straight Drive"
+  "scene_description": "The ego vehicle will maintain a steady pace, staying centered in the rightmost lane while passing an intersection.",
+  "maneuver_category": "Straight Drive",
+  "lane_type": "4-lane urban road"
 }}
 
 ### YOUR TASK:
-**Input Hint:** {geometric_hint}
 **Output:**
 """
 
-# --- 3. PROBABILISTIC SAMPLING RATES ---
-# Filter Candidates based on Geometry (0.2 = Keep 20%)
+# --- 3. BALANCING (Internal Use Only) ---
+# We still use math to filter (keep diverse data), but we DON'T show this to the VLM.
 KEEP_RATES = {
     "Straight Drive": 0.2,       
     "Stationary Stop": 0.25,     
@@ -76,18 +69,11 @@ KEEP_RATES = {
     "U-Turn": 1.0                
 }
 
-MAP_CACHE = {}
-
-def get_nusc_map(dataroot, city):
-    if city not in MAP_CACHE:
-        try:
-            MAP_CACHE[city] = NuScenesMap(dataroot=dataroot, map_name=city)
-        except:
-            MAP_CACHE[city] = None
-    return MAP_CACHE[city]
-
-def get_kinematic_category(trajectory):
-    """Fast Physics Check (No Map) for filtering."""
+def get_kinematic_category_robust(trajectory):
+    """
+    Robust Math Check for Filtering.
+    Fixes the 'Straight = U-Turn' bug by enforcing displacement checks.
+    """
     if trajectory.ndim == 3: trajectory = trajectory[0]
     if len(trajectory) < 6: return "Stationary Stop"
 
@@ -95,34 +81,23 @@ def get_kinematic_category(trajectory):
     displacement = float(np.linalg.norm(p_final))
     y_final = float(p_final[1]) 
 
+    # U-TURN FIX: You cannot do a U-Turn in < 4 meters of movement.
+    # Previously, noise in stationary cars caused 180-degree heading flips.
+    if displacement < 2.0: return "Stationary Stop"
+
     v_start = trajectory[5, :2] - p0
     v_end = p_final - trajectory[-6, :2]
     angle_start = np.arctan2(v_start[1], v_start[0])
     angle_end = np.arctan2(v_end[1], v_end[0])
     diff_deg = np.degrees((angle_end - angle_start + np.pi) % (2 * np.pi) - np.pi)
 
-    if displacement < 2.0: return "Stationary Stop"
-    if abs(diff_deg) > 100: return "U-Turn"
+    if abs(diff_deg) > 100 and displacement > 4.0: return "U-Turn"
     if diff_deg > 25: return "Left Turn"
     if diff_deg < -25: return "Right Turn"
     if y_final > 2.0: return "Lane Change Left"
     if y_final < -2.0: return "Lane Change Right"
-    return "Straight Drive"
-
-def get_full_hint(nusc_map, origin, base_category):
-    context = "on the road"
-    if nusc_map:
-        try:
-            ox, oy = float(origin[0]), float(origin[1])
-            patch = (ox-2, oy-2, ox+2, oy+2)
-            layers = nusc_map.get_records_in_patch(patch, ['road_segment'], mode='intersect')
-            if 'road_segment' in layers:
-                for t in layers['road_segment']:
-                    if nusc_map.get('road_segment', t)['is_intersection']:
-                        context = "at an intersection"; break
-        except: pass
     
-    return f"{base_category} {context}"
+    return "Straight Drive"
 
 class CaptionGenerator:
     def __init__(self, dataroot, version, input_dir, output_dir, model_id="Qwen/Qwen2-VL-7B-Instruct"):
@@ -164,11 +139,12 @@ class CaptionGenerator:
             except: continue
         return paths
 
-    def generate_caption(self, image_paths, geometric_hint):
+    def generate_caption(self, image_paths):
         valid_paths = [p for p in image_paths if os.path.exists(p)]
         if len(valid_paths) < 2: return None
 
-        formatted_prompt = PROMPT_TEMPLATE.format(geometric_hint=geometric_hint)
+        # No Hint Injection! Pure video analysis.
+        formatted_prompt = PROMPT_TEMPLATE 
 
         messages = [{
             "role": "user",
@@ -189,7 +165,7 @@ class CaptionGenerator:
         try:
             with torch.no_grad():
                 generated_ids = self.model.generate(
-                    **inputs, max_new_tokens=128, do_sample=False, num_beams=1
+                    **inputs, max_new_tokens=150, do_sample=False, num_beams=1
                 )
         except Exception:
             return None
@@ -206,15 +182,12 @@ class CaptionGenerator:
             else:
                 raise ValueError("No brackets")
         except:
-            return {
-                "scene_description": f"The ego vehicle will execute a {geometric_hint}.",
-                "maneuver_category": geometric_hint
-            }
+            # If JSON fails, we return None to be safe (quality control)
+            return None
 
     def process_all(self, shard_id=0, num_shards=1):
-        print(f"[BALANCING] Using Sampling Rates: {KEEP_RATES}")
-
-        # 1. Collect & Shuffle
+        print(f"[BALANCING] Rates: {KEEP_RATES}")
+        
         pt_files = []
         for root, _, files in os.walk(self.input_dir):
             for file in files:
@@ -226,10 +199,8 @@ class CaptionGenerator:
         my_files = pt_files[shard_id::num_shards]
         print(f"[GPU {shard_id}] Scanning {len(my_files)} files...")
 
-        # Initialize tracking (Keys match KEEP_RATES for consistency)
         final_stats = {k: 0 for k in KEEP_RATES.keys()}
         
-        # 2. Loop
         for pt_path in tqdm(my_files, desc=f"GPU {shard_id}"):
             try:
                 # Output Check
@@ -237,73 +208,55 @@ class CaptionGenerator:
                 out_path = os.path.join(self.output_dir, rel_path)
                 if os.path.exists(out_path): continue
 
-                # Load Data
                 data = torch.load(pt_path)
                 traj = data.y if hasattr(data, 'y') else data.get('y')
                 if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
 
-                # --- A. FAST FILTER (Probabilistic) ---
-                # We use geometric hint for FILTERING only
-                base_category = get_kinematic_category(traj)
+                # --- FILTERING (Hidden from VLM) ---
+                filter_category = get_kinematic_category_robust(traj)
                 
-                keep_rate = KEEP_RATES.get(base_category, 1.0)
+                keep_rate = KEEP_RATES.get(filter_category, 1.0)
                 if random.random() > keep_rate:
                     continue 
 
-                # --- B. FULL PROCESSING ---
-                city = data.city if hasattr(data, 'city') else data['city']
-                origin = data.origin if hasattr(data, 'origin') else data['origin']
-                if hasattr(origin, 'numpy'): origin = origin.numpy()
-                
-                nusc_map = get_nusc_map(self.nusc_dataroot, city)
-                full_hint = get_full_hint(nusc_map, origin, base_category)
-
-                # Generate VLM Caption
+                # --- VLM GENERATION ---
                 sample_token = os.path.basename(pt_path).replace(".pt", "")
                 seq_tokens = self._collect_future_sequence(sample_token)
                 image_paths = self.get_image_paths(seq_tokens)
                 
-                caption_data = self.generate_caption(image_paths, full_hint)
+                # No hint passed here
+                caption_data = self.generate_caption(image_paths)
 
                 if caption_data:
-                    # Save
+                    # Save the RICH structure
                     if isinstance(data, dict):
                         data['caption_dict'] = caption_data
                         data['scene_caption'] = caption_data.get('scene_description', '')
-                        data['maneuver_category'] = caption_data.get('maneuver_category', full_hint)
+                        data['maneuver_category'] = caption_data.get('maneuver_category', 'Unknown')
+                        data['lane_type'] = caption_data.get('lane_type', 'Unknown')
                     else:
                         data.caption_dict = caption_data
                         data.scene_caption = caption_data.get('scene_description', '')
-                        data.maneuver_category = caption_data.get('maneuver_category', full_hint)
+                        data.maneuver_category = caption_data.get('maneuver_category', 'Unknown')
+                        data.lane_type = caption_data.get('lane_type', 'Unknown')
                     
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     torch.save(data, out_path)
                     
-                    # --- C. UPDATE STATS FROM VLM OUTPUT ---
-                    # The VLM output (maneuver_category) is the "Truth" for the counter.
-                    # We normalize it back to base categories for the summary report.
-                    vlm_cat = caption_data.get('maneuver_category', base_category)
+                    # Log the VLM's opinion, not the filter's opinion
+                    vlm_cat = caption_data.get('maneuver_category', 'Unknown')
+                    # Clean key for stats
+                    stats_key = "Unknown"
+                    for k in final_stats.keys():
+                        if k.split()[0] in vlm_cat: # Match "Left" in "Turn Left"
+                            stats_key = k; break
                     
-                    count_key = "Unknown"
-                    if "Straight" in vlm_cat: count_key = "Straight Drive"
-                    elif "Stationary" in vlm_cat: count_key = "Stationary Stop"
-                    elif "Left Turn" in vlm_cat: count_key = "Left Turn"
-                    elif "Right Turn" in vlm_cat: count_key = "Right Turn"
-                    elif "Lane Change Left" in vlm_cat: count_key = "Lane Change Left"
-                    elif "Lane Change Right" in vlm_cat: count_key = "Lane Change Right"
-                    elif "U-Turn" in vlm_cat: count_key = "U-Turn"
-                    
-                    if count_key in final_stats:
-                        final_stats[count_key] += 1
-                    else:
-                        # Handle unexpected keys gracefully in dict
-                        final_stats[count_key] = final_stats.get(count_key, 0) + 1
+                    if stats_key in final_stats: final_stats[stats_key] += 1
 
             except Exception:
                 pass
         
-        # --- D. FINAL PRINT ONLY ---
-        print(f"[GPU {shard_id}] Saved Counts: {final_stats}")
+        print(f"[GPU {shard_id}] Saved Counts (VLM Classification): {final_stats}")
 
 def main():
     parser = argparse.ArgumentParser()
