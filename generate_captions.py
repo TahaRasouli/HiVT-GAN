@@ -28,31 +28,41 @@ from nuscenes.map_expansion.map_api import NuScenesMap
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# --- CONFIGURATION ---
-# Total samples desired across ALL shards.
-# The script will divide this by num_shards to balance work.
-GLOBAL_MAX_SAMPLES_PER_CLASS = 1500 
-
+# --- 2. PROMPT TEMPLATE ---
 PROMPT_TEMPLATE = """
-The vehicle is confirmed to be executing a **{geometric_hint}**.
-Analyze the video to describe HOW this maneuver is performed visually.
+You are a trajectory forecasting assistant.
+The vehicle in the video is confirmed to be executing a **{geometric_hint}**.
 
-**Focus strictly on:**
-1. **Lane Interaction:** Does the vehicle cross a lane divider (dashed/solid)? Does it stay centered?
-2. **Road Geometry:** Is the road curving, straight, or entering an intersection/junction?
-3. **Dynamics:** Describe the motion relative to the road lines.
+Your task is to generate a JSON output describing this future maneuver based on the visual road geometry.
 
-**Constraints:**
-- Do NOT mention traffic lights or other cars unless they force the vehicle to stop.
-- Use natural, descriptive language (e.g., "The vehicle drifts right to merge...").
-- Future tense: "The ego vehicle will..."
+### GUIDELINES:
+1. **Tense:** You MUST use Future Tense. Start with "The ego vehicle will..."
+2. **Focus:** Describe the geometry (lanes, intersections, dividers). Ignore weather/buildings.
+3. **Format:** Output ONLY valid JSON.
 
-**Output valid JSON:**
+### EXAMPLE 1:
+**Input Hint:** Left Turn at intersection
+**Output:**
 {{
-  "scene_description": "[Detailed visual description of the road and maneuver]",
-  "maneuver_category": "{geometric_hint}"
+  "scene_description": "The ego vehicle will slow down as it approaches the intersection, then turn left across the perpendicular lanes to enter the target street.",
+  "maneuver_category": "Left Turn at intersection"
 }}
+
+### YOUR TASK:
+**Input Hint:** {geometric_hint}
+**Output:**
 """
+
+# --- 3. BALANCING LIMITS (Optimized for Contrastive Learning) ---
+STRICT_LIMITS = {
+    "Straight Drive": 3000,      
+    "Stationary Stop": 1000,     
+    "Left Turn": 5000,           # Keep All
+    "Right Turn": 5000,          # Keep All
+    "Lane Change Left": 5000,    # Keep All
+    "Lane Change Right": 5000,   # Keep All
+    "U-Turn": 5000               # Keep All
+}
 
 MAP_CACHE = {}
 
@@ -64,51 +74,58 @@ def get_nusc_map(dataroot, city):
             MAP_CACHE[city] = None
     return MAP_CACHE[city]
 
-def get_geometric_hint(nusc_map, origin, trajectory):
+def get_kinematic_category(trajectory):
     """
-    Calculates the 'Physics Truth' (Category).
-    Trajectory: (30, 2)
+    Fast check: Uses ONLY Math (No Map).
+    Used for quick filtering of Straight/Stationary.
     """
-    # Robust Shape Handling
     if trajectory.ndim == 3: trajectory = trajectory[0]
-    if len(trajectory) < 6: return "Stationary Stop" # Too short
+    if len(trajectory) < 6: return "Stationary Stop", 0.0, 0.0
 
-    # 1. Kinematics
+    # Metrics
     p0, p_final = trajectory[0, :2], trajectory[-1, :2]
     displacement = float(np.linalg.norm(p_final))
-    y_final = float(p_final[1]) # Lateral deviation
+    y_final = float(p_final[1]) 
 
-    # Heading Change
+    # Heading
     v_start = trajectory[5, :2] - p0
     v_end = p_final - trajectory[-6, :2]
     angle_start = np.arctan2(v_start[1], v_start[0])
     angle_end = np.arctan2(v_end[1], v_end[0])
     diff_deg = np.degrees((angle_end - angle_start + np.pi) % (2 * np.pi) - np.pi)
 
-    # 2. Map Context
-    is_intersection = False
+    # Logic
+    if displacement < 2.0: 
+        return "Stationary Stop", displacement, diff_deg
+    
+    # Check Turns
+    if abs(diff_deg) > 100: return "U-Turn", displacement, diff_deg
+    if diff_deg > 25: return "Left Turn", displacement, diff_deg
+    if diff_deg < -25: return "Right Turn", displacement, diff_deg
+    
+    # Check Lane Changes
+    if y_final > 2.0: return "Lane Change Left", displacement, diff_deg
+    if y_final < -2.0: return "Lane Change Right", displacement, diff_deg
+    
+    return "Straight Drive", displacement, diff_deg
+
+def get_full_hint(nusc_map, origin, base_category):
+    """
+    Detailed check: Adds Map Context (Intersection) only if we keep the sample.
+    """
+    context = "on the road"
     if nusc_map:
         try:
-            # Flatten origin if needed
             ox, oy = float(origin[0]), float(origin[1])
             patch = (ox-2, oy-2, ox+2, oy+2)
             layers = nusc_map.get_records_in_patch(patch, ['road_segment'], mode='intersect')
             if 'road_segment' in layers:
                 for t in layers['road_segment']:
                     if nusc_map.get('road_segment', t)['is_intersection']:
-                        is_intersection = True; break
+                        context = "at an intersection"; break
         except: pass
     
-    context = "at an intersection" if is_intersection else "on the road"
-
-    # 3. Categorize (The logic we agreed on)
-    if displacement < 2.0: return "Stationary Stop"
-    if abs(diff_deg) > 100: return f"U-Turn {context}"
-    if diff_deg > 25: return f"Left Turn {context}"
-    if diff_deg < -25: return f"Right Turn {context}"
-    if y_final > 2.0: return f"Lane Change Left {context}"
-    if y_final < -2.0: return f"Lane Change Right {context}"
-    return f"Straight Drive {context}"
+    return f"{base_category} {context}"
 
 class CaptionGenerator:
     def __init__(self, dataroot, version, input_dir, output_dir, model_id="Qwen/Qwen2-VL-7B-Instruct"):
@@ -128,7 +145,6 @@ class CaptionGenerator:
         self.processor = AutoProcessor.from_pretrained(model_id)
 
     def _collect_future_sequence(self, sample_token):
-        """Collects CURRENT + FUTURE 6 frames."""
         tokens = [sample_token]
         cur_token = sample_token
         for _ in range(6):
@@ -137,8 +153,7 @@ class CaptionGenerator:
                 if not sample["next"]: break
                 cur_token = sample["next"]
                 tokens.append(cur_token)
-            except KeyError:
-                break
+            except KeyError: break
         return tokens
 
     def get_image_paths(self, sequence_tokens):
@@ -148,8 +163,7 @@ class CaptionGenerator:
                 sample = self.nusc.get("sample", token)
                 cam_token = sample["data"]["CAM_FRONT"]
                 cam_data = self.nusc.get("sample_data", cam_token)
-                full_path = os.path.join(self.nusc_dataroot, cam_data["filename"])
-                paths.append(full_path)
+                paths.append(os.path.join(self.nusc_dataroot, cam_data["filename"]))
             except: continue
         return paths
 
@@ -162,12 +176,7 @@ class CaptionGenerator:
         messages = [{
             "role": "user",
             "content": [
-                {
-                    "type": "video",
-                    "video": valid_paths,
-                    "max_pixels": 360 * 420, 
-                    "fps": 2.0, 
-                },
+                {"type": "video", "video": valid_paths, "max_pixels": 360 * 420, "fps": 2.0},
                 {"type": "text", "text": formatted_prompt},
             ],
         }]
@@ -176,45 +185,40 @@ class CaptionGenerator:
         image_inputs, video_inputs = process_vision_info(messages)
         
         inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
+            text=[text], images=image_inputs, videos=video_inputs,
+            padding=True, return_tensors="pt",
         ).to("cuda")
 
         try:
             with torch.no_grad():
                 generated_ids = self.model.generate(
-                    **inputs, 
-                    max_new_tokens=128,
-                    do_sample=False,
-                    num_beams=1,
-                    use_cache=True
+                    **inputs, max_new_tokens=128, do_sample=False, num_beams=1
                 )
-        except Exception as e:
-            print(f"Gen Error: {e}")
+        except Exception:
             return None
         
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        output_text = self.processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0]
+        generated_ids_trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
+        output_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
 
+        # Robust JSON Parser
         try:
-            clean_text = output_text.replace("```json", "").replace("```", "").strip()
-            return json.loads(clean_text)
+            cleaned = output_text.strip()
+            start = cleaned.find('{')
+            end = cleaned.rfind('}')
+            if start != -1 and end != -1:
+                return json.loads(cleaned[start : end+1])
+            else:
+                raise ValueError("No brackets")
         except:
-            return {"scene_description": output_text, "maneuver_category": geometric_hint}
+            return {
+                "scene_description": f"The ego vehicle will execute a {geometric_hint}.",
+                "maneuver_category": geometric_hint
+            }
 
     def process_all(self, shard_id=0, num_shards=1):
-        # 1. Calculate Target per Shard
-        # If we want 1500 total, and have 2 shards, each shard should stop after 750.
-        target_per_class = GLOBAL_MAX_SAMPLES_PER_CLASS // num_shards
-        print(f"[BALANCING] Max samples per class for this shard: {target_per_class}")
+        print(f"[BALANCING] Limits: {STRICT_LIMITS}")
 
+        # 1. Collect & Shuffle
         pt_files = []
         for root, _, files in os.walk(self.input_dir):
             for file in files:
@@ -222,78 +226,81 @@ class CaptionGenerator:
                     pt_files.append(os.path.join(root, file))
         
         pt_files.sort()
+        random.Random(42).shuffle(pt_files) 
         my_files = pt_files[shard_id::num_shards]
         print(f"[GPU {shard_id}] Scanning {len(my_files)} files...")
-        random.shuffle(my_files)
 
-        # 2. Tracking Counts
-        class_counts = {}
+        class_counts = {k: 0 for k in STRICT_LIMITS.keys()}
+        processed_total = 0
 
+        # 2. Optimized Loop
         for pt_path in tqdm(my_files, desc=f"GPU {shard_id}"):
             try:
+                # Check existence first
                 rel_path = os.path.relpath(pt_path, self.input_dir)
                 out_path = os.path.join(self.output_dir, rel_path)
-                
                 if os.path.exists(out_path): continue
 
                 # Load Data
                 data = torch.load(pt_path)
                 
-                # --- A. GEOMETRIC CHECK (FAST) ---
+                # Extract Trajectory
+                traj = data.y if hasattr(data, 'y') else data.get('y')
+                if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
+
+                # --- STEP 1: FAST FILTER (Math Only) ---
+                # Determine if Straight/Stationary purely by physics
+                base_category, _, _ = get_kinematic_category(traj)
+                
+                # Check Limits immediately
+                limit = STRICT_LIMITS.get(base_category, 5000)
+                if class_counts.get(base_category, 0) >= limit:
+                    continue # Skip without loading map or VLM
+
+                # --- STEP 2: FULL PROCESSING (If passed filter) ---
+                # Now we invest resources
                 city = data.city if hasattr(data, 'city') else data['city']
                 origin = data.origin if hasattr(data, 'origin') else data['origin']
                 if hasattr(origin, 'numpy'): origin = origin.numpy()
                 
-                traj = data.y if hasattr(data, 'y') else data.get('y')
-                if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
-                
+                # Get Map Context
                 nusc_map = get_nusc_map(self.nusc_dataroot, city)
                 
-                # Get the Category (e.g., "Left Turn at intersection")
-                geometric_hint = get_geometric_hint(nusc_map, origin, traj)
-                
-                # Normalize Category Key (First word usually sufficient for counting, or full string)
-                # We group by the main action (e.g., "Left Turn", "Straight Drive")
-                # This splits "Left Turn at intersection" -> "Left Turn"
-                category_key = " ".join(geometric_hint.split()[:2]) 
-                
-                # --- B. BALANCING FILTER ---
-                current_count = class_counts.get(category_key, 0)
-                
-                if current_count >= target_per_class:
-                    # Skip VLM generation if we have enough of this class
-                    continue
+                # Construct Full Hint (e.g. "Left Turn at intersection")
+                full_hint = get_full_hint(nusc_map, origin, base_category)
 
-                # --- C. VLM GENERATION (SLOW) ---
+                # Generate VLM Caption
                 sample_token = os.path.basename(pt_path).replace(".pt", "")
                 seq_tokens = self._collect_future_sequence(sample_token)
                 image_paths = self.get_image_paths(seq_tokens)
                 
-                # Generate with Hint
-                caption_data = self.generate_caption(image_paths, geometric_hint)
+                caption_data = self.generate_caption(image_paths, full_hint)
 
                 if caption_data:
-                    # Save results
+                    # Save
                     if isinstance(data, dict):
                         data['caption_dict'] = caption_data
                         data['scene_caption'] = caption_data.get('scene_description', '')
-                        data['maneuver_category'] = geometric_hint
+                        data['maneuver_category'] = full_hint # Save the detailed one
                     else:
                         data.caption_dict = caption_data
                         data.scene_caption = caption_data.get('scene_description', '')
-                        data.maneuver_category = geometric_hint
+                        data.maneuver_category = full_hint
                     
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     torch.save(data, out_path)
                     
-                    # Update Count only after successful save
-                    class_counts[category_key] = current_count + 1
+                    # Update Count (using base category)
+                    class_counts[base_category] += 1
+                    processed_total += 1
 
-            except Exception as e:
-                # print(f"Skipped {pt_path}: {e}")
+                if processed_total % 20 == 0:
+                    print(f"\n[GPU {shard_id}] Counts: {class_counts}")
+
+            except Exception:
                 pass
         
-        print(f"[GPU {shard_id}] Finished. Counts: {class_counts}")
+        print(f"[GPU {shard_id}] Finished. Final Distribution: {class_counts}")
 
 def main():
     parser = argparse.ArgumentParser()
