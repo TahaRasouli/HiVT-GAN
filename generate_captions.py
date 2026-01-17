@@ -44,7 +44,7 @@ You are a trajectory forecasting assistant. Analyze the video to describe the fu
 You must output a single JSON object with these 3 keys:
 - "scene_description": The natural language caption.
 - "maneuver_category": One of [Straight Drive, Turn Left, Turn Right, U-Turn, Lane Change Left, Lane Change Right, Stationary].
-- "lane_type": Describe the lane count/type (e.g., "Single-lane road", "2-lane one-way", "3-lane highway", "Multi-lane intersection").
+- "lane_type": Describe the lane count/type (e.g., "Single-lane road", "2-lane one-way", "3-lane street", "Multi-lane intersection").
 
 ### EXAMPLE:
 **Output:**
