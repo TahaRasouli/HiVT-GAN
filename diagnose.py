@@ -1,6 +1,6 @@
 import os
 import sys
-import re # Added for robust cleanup
+import re
 
 # --- 1. CACHE SETUP ---
 user_name = os.environ.get("USER", "rasoulta")
@@ -28,7 +28,7 @@ from nuscenes.nuscenes import NuScenes
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# --- 2. PROMPT (Unchanged) ---
+# --- 2. FIXED PROMPT (Single Braces Only) ---
 PROMPT_TEMPLATE = """
 You are a trajectory forecasting assistant. Analyze the video to describe the future motion of the ego vehicle and the road configuration.
 
@@ -48,17 +48,17 @@ You must output a single JSON object with these 3 keys:
 
 ### EXAMPLE:
 **Output:**
-{{
+{
   "scene_description": "The ego vehicle will maintain a steady pace, staying centered in the rightmost lane while passing an intersection.",
   "maneuver_category": "Straight Drive",
   "lane_type": "4-lane urban road"
-}}
+}
 
 ### YOUR TASK:
 **Output:**
 """
 
-# --- 3. BALANCING ---
+# --- 3. BALANCING RATES ---
 KEEP_RATES = {
     "Straight Drive": 0.2,       
     "Stationary Stop": 0.25,     
@@ -70,6 +70,9 @@ KEEP_RATES = {
 }
 
 def get_kinematic_category_robust(trajectory):
+    """
+    Robust Math Check for Filtering.
+    """
     if trajectory.ndim == 3: trajectory = trajectory[0]
     if len(trajectory) < 6: return "Stationary Stop"
 
@@ -77,6 +80,7 @@ def get_kinematic_category_robust(trajectory):
     displacement = float(np.linalg.norm(p_final))
     y_final = float(p_final[1]) 
 
+    # U-TURN FIX: You cannot do a U-Turn in < 4 meters of movement.
     if displacement < 2.0: return "Stationary Stop"
 
     v_start = trajectory[5, :2] - p0
@@ -157,52 +161,38 @@ class CaptionGenerator:
 
         try:
             with torch.no_grad():
-                # Explicitly disable sampling parameters to fix warnings
                 generated_ids = self.model.generate(
-                    **inputs, 
-                    max_new_tokens=200, 
-                    do_sample=False, 
-                    num_beams=1,
-                    temperature=None, 
-                    top_p=None, 
-                    top_k=None
+                    **inputs, max_new_tokens=200, do_sample=False, num_beams=1
                 )
         except Exception as e:
-            print(f"VLM Internal Error: {e}")
+            # print(f"VLM Internal Error: {e}")
             return None
         
         generated_ids_trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         output_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
 
-        # --- DIAGNOSTIC PARSER ---
+        # --- ROBUST PARSER ---
         try:
-            # 1. Strip Markdown Code Blocks
+            # 1. Clean Markdown
             cleaned = re.sub(r'```json\s*', '', output_text, flags=re.IGNORECASE)
             cleaned = cleaned.replace('```', '').strip()
             
-            # 2. Locate Brackets
+            # 2. FIX: Replace double braces if they exist (The Fix)
+            cleaned = cleaned.replace('{{', '{').replace('}}', '}')
+            
+            # 3. Extract JSON
             start = cleaned.find('{')
             end = cleaned.rfind('}')
             
             if start != -1 and end != -1:
-                json_str = cleaned[start : end+1]
-                return json.loads(json_str)
+                return json.loads(cleaned[start : end+1])
             else:
-                # DEBUG: Print what failed
-                print(f"\n[DEBUG] JSON Parse Failed. Raw Output:\n{output_text}\n{'-'*30}")
-                
-                # FALLBACK: Save raw text anyway so we don't lose the sample
-                # We can clean it later with regex.
-                return {
-                    "scene_description": output_text.replace('\n', ' ').strip(),
-                    "maneuver_category": "VLM_RAW_OUTPUT", 
-                    "lane_type": "Unknown"
-                }
-        except Exception as e:
-            print(f"\n[DEBUG] JSON Exception: {e}. Raw Output:\n{output_text}\n{'-'*30}")
+                return None
+        except Exception:
+            # Fallback: Save raw text so we don't lose the sample
             return {
                 "scene_description": output_text.replace('\n', ' ').strip(),
-                "maneuver_category": "VLM_ERROR", 
+                "maneuver_category": "VLM_RAW_OUTPUT", 
                 "lane_type": "Unknown"
             }
 
@@ -229,18 +219,20 @@ class CaptionGenerator:
                 out_path = os.path.join(self.output_dir, rel_path)
                 if os.path.exists(out_path): continue
 
-                # FIX: weights_only=False
+                # Weights_only=False allows custom objects to load
                 data = torch.load(pt_path, weights_only=False)
                 
                 traj = data.y if hasattr(data, 'y') else data.get('y')
                 if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
 
+                # --- FILTERING ---
                 filter_category = get_kinematic_category_robust(traj)
                 
                 keep_rate = KEEP_RATES.get(filter_category, 1.0)
                 if random.random() > keep_rate:
                     continue 
 
+                # --- VLM GENERATION ---
                 sample_token = os.path.basename(pt_path).replace(".pt", "")
                 seq_tokens = self._collect_future_sequence(sample_token)
                 image_paths = self.get_image_paths(seq_tokens)
@@ -265,7 +257,7 @@ class CaptionGenerator:
                     os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     torch.save(data, out_path)
                     
-                    # Stats
+                    # Update Stats
                     vlm_cat = caption_data.get('maneuver_category', 'Unknown')
                     stats_key = "Unknown"
                     
@@ -279,8 +271,7 @@ class CaptionGenerator:
                     if stats_key in final_stats: final_stats[stats_key] += 1
                     else: final_stats[stats_key] = final_stats.get(stats_key, 0) + 1
 
-            except Exception as e:
-                # print(f"Error: {e}")
+            except Exception:
                 pass
         
         print(f"[GPU {shard_id}] Final Counts: {final_stats}")
