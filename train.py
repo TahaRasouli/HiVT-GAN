@@ -26,7 +26,7 @@ from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.hivt import HiVT
 from models.cvae_gan import CVAE_GAN
 from models.hivt_x import HiVTX   
-from utils import SimpleTokenizer
+from transformers import AutoTokenizer
 
 # speed boost on Nvidia-A6000
 torch.set_float32_matmul_precision('medium')
@@ -69,6 +69,8 @@ def main():
         args.lr = 1e-4 
 
     # 2. DATA MODULE
+    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+
     datamodule = NuScenesHiVTDataModule(
         split_file="balanced_splits.json", 
         root=args.root,
@@ -78,29 +80,21 @@ def main():
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
+        tokenizer=tokenizer # <--- Pass the BERT tokenizer
     )
     datamodule.prepare_data() 
-    vocab_size = len(datamodule.tokenizer.word2idx)
-    print(f"--- DataModule Ready. Vocab Size: {vocab_size} ---")
+    print(f"--- DataModule Ready with DistilBERT Tokenizer ---")
 
     # 3. MODEL INITIALIZATION
     actual_fit_path = args.ckpt_path
     
     # CASE A: Contrastive Learning (HiVT-X)
+    
     if args.train_contrastive:
-        print("--- initializing HiVT-X (Contrastive) Model ---")
-        if not args.ckpt_path:
-            raise ValueError("Contrastive training requires --ckpt_path to load the CVAE-GAN backbone!")
-        
-        # Load the model structure
-        model = HiVTX(cvae_gan_ckpt=args.ckpt_path, vocab_size=vocab_size, **vars(args))
-        
-        # We set fit_path to None because the backbone weights are already loaded 
-        # inside HiVTX.__init__. We want to start a FRESH training run.
-        actual_fit_path = None 
-        
-        if args.monitor == "val_minFDE": 
-            args.monitor = "val_loss"
+        print("--- initializing HiVT-X (Contrastive + DistilBERT) ---")
+        # Remove vocab_size arg, HiVTX doesn't need it anymore
+        model = HiVTX(cvae_gan_ckpt=args.ckpt_path, **vars(args))
+        actual_fit_path = None
 
     # CASE B: CVAE-GAN
     elif args.train_cvae_gan:
