@@ -162,6 +162,7 @@ def main():
         callbacks=[checkpoint_callback],
         log_every_n_steps=50,
         num_sanity_val_steps=0,
+        gradient_clip_val=1.0,
     )
 
     trainer.fit(model, datamodule, ckpt_path=actual_fit_path)

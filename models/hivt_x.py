@@ -178,19 +178,26 @@ class HiVTX(pl.LightningModule):
         self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
-        """
-        Differential Learning Rates:
-        - Backbone (HiVT): 1e-5 (Very slow, to preserve pre-trained knowledge)
-        - Heads (Text/Proj): 1e-4 (Fast, to learn quickly)
-        """
         # 1. Separate Parameters
         backbone_params = list(self.backbone.parameters())
         head_params = [p for n, p in self.named_parameters() if "backbone" not in n]
         
-        # 2. Create Groups
+        # 2. Aggressive Learning Rates
         optimizer = torch.optim.AdamW([
-            {'params': backbone_params, 'lr': 1e-5}, # Low LR for pre-trained part
-            {'params': head_params, 'lr': 1e-4}      # High LR for new parts
-        ], weight_decay=1e-5)
+            {'params': backbone_params, 'lr': 1e-4}, # Boosted from 1e-5
+            {'params': head_params, 'lr': 1e-3}      # Boosted from 1e-4
+        ], weight_decay=1e-4) # Slightly higher decay to prevent overfitting
         
-        return optimizer
+        # 3. Add a Scheduler (Optional but recommended)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "frequency": 1
+            }
+        }
