@@ -14,23 +14,21 @@ class HiVTX(pl.LightningModule):
         # 1. ARCHITECTURE
         # ------------------------------------------------------------------
         
-        # A. Backbone (Frozen HiVT Trajectory Encoder)
+        # A. Backbone (Frozen HiVT + Mamba Trajectory Encoder)
+        # This automatically loads Mamba if the checkpoint was trained with it.
         self.backbone = CVAE_GAN.load_from_checkpoint(cvae_gan_ckpt)
         self.backbone.freeze() 
         self.backbone.eval()
         
         # B. Text Encoder (Simple GRU based)
-        # We embed tokens to 256-dim, then run a GRU to get a sequence summary
         self.text_embedding = nn.Embedding(vocab_size, 256)
         self.text_encoder = nn.GRU(256, 256, batch_first=True)
         
         # C. Projection Heads (Map both modalities to shared 128-dim space)
-        # This allows us to calculate dot-product similarity
         self.proj_traj = nn.Linear(128, embed_dim) # From HiVT's 128-dim global embed
         self.proj_text = nn.Linear(256, embed_dim) # From Text Encoder's 256-dim hidden state
         
         # D. Auxiliary Classifier (Lane Type Prediction)
-        # Forces the encoder to pay attention to map features (lanes)
         self.lane_classifier = nn.Linear(128, 5) 
         
         # ------------------------------------------------------------------
@@ -83,7 +81,6 @@ class HiVTX(pl.LightningModule):
         contrastive_loss = (loss_i + loss_t) / 2
         
         # 4. Auxiliary Loss (Lane Type Classification)
-        # Only calculate if the label is valid (not -1)
         lane_logits = self.lane_classifier(traj_feat)
         valid_mask = data.lane_type_id.squeeze() != -1
         
@@ -120,10 +117,9 @@ class HiVTX(pl.LightningModule):
         self.log("val_loss", loss, prog_bar=True, batch_size=data.num_graphs)
         
         # 3. Store for Epoch End
-        # We need to accumulate ALL validation data to check if the model
-        # can retrieve the correct text from the entire validation set, not just the batch.
+        # Move to CPU to prevent GPU OOM during large validations
         self.validation_step_outputs.append({
-            "z_traj": z_traj.cpu(), # Move to CPU to save GPU memory
+            "z_traj": z_traj.cpu(), 
             "z_text": z_text.cpu()
         })
         return loss
@@ -140,14 +136,13 @@ class HiVTX(pl.LightningModule):
         all_text = torch.cat([x["z_text"] for x in self.validation_step_outputs])
         
         # 2. Compute Global Similarity Matrix
-        # [N_val, N_val] - This can be large! 
-        # For N=5000, this is a 25M element matrix (100MB), which is fine.
+        # [N_val, N_val] matrix
         similarity = all_traj @ all_text.T 
         
         num_samples = similarity.size(0)
         
         # 3. Get Top-K Indices for every sample
-        # For every trajectory (row), which text indices (columns) have the highest dot product?
+        # For every trajectory (row), find the indices of the text (cols) with highest dot product
         topk_indices = torch.topk(similarity, k=10, dim=1).indices 
         
         # The correct index for the i-th trajectory is the i-th text
@@ -169,7 +164,8 @@ class HiVTX(pl.LightningModule):
         self.log("val_R10", r10, prog_bar=False)
         
         if self.global_rank == 0:
-            print(f"\nEpoch {self.current_epoch:03d} | Loss: {self.trainer.callback_metrics.get('val_loss',0):.4f} | R@1: {r1:.4f} | R@5: {r5:.4f}")
+            val_loss = self.trainer.callback_metrics.get('val_loss', 0)
+            print(f"\nEpoch {self.current_epoch:03d} | Loss: {val_loss:.4f} | R@1: {r1:.4f} | R@5: {r5:.4f}")
             
         # 6. Cleanup
         self.validation_step_outputs.clear()

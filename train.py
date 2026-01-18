@@ -17,7 +17,7 @@ from argparse import ArgumentParser
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
-from torchmetrics.text import BLEUScore
+# Removed unused BLEUScore import
 import torch.multiprocessing as mp
 import torch
 import torch.nn as nn
@@ -25,7 +25,7 @@ import torch.nn as nn
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.hivt import HiVT
 from models.cvae_gan import CVAE_GAN
-from models.hivt_x import HiVTX  
+from models.hivt_x import HiVTX   
 from utils import SimpleTokenizer
 
 # speed boost on Nvidia-A6000
@@ -92,8 +92,12 @@ def main():
         if not args.ckpt_path:
             raise ValueError("Contrastive training requires --ckpt_path to load the CVAE-GAN backbone!")
         
+        # Load the model structure
         model = HiVTX(cvae_gan_ckpt=args.ckpt_path, vocab_size=vocab_size, **vars(args))
-        actual_fit_path = None # Start fresh training
+        
+        # We set fit_path to None because the backbone weights are already loaded 
+        # inside HiVTX.__init__. We want to start a FRESH training run.
+        actual_fit_path = None 
         
         if args.monitor == "val_minFDE": 
             args.monitor = "val_loss"
@@ -112,7 +116,8 @@ def main():
     # =====================================================
     # 4. WARM START / TRANSFER LOGIC (For Cases B & C)
     # =====================================================
-    if args.ckpt_path and not args.train_caption:
+    # FIX: Changed 'args.train_caption' to 'args.train_contrastive'
+    if args.ckpt_path and not args.train_contrastive:
         print(f"--- Loading Weights from: {args.ckpt_path} ---")
         
         if args.freeze_encoder:
@@ -121,7 +126,7 @@ def main():
             model.load_state_dict(ckpt['state_dict'], strict=False)
             actual_fit_path = None 
         else:
-            # Smart Transfer Logic (Keep your existing logic here)
+            # Smart Transfer Logic
             ckpt = torch.load(args.ckpt_path, map_location="cpu")
             state_dict = ckpt['state_dict']
             is_gan_checkpoint = any("critic" in k for k in state_dict.keys())
