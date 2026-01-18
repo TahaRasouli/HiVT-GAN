@@ -17,9 +17,12 @@ class HiVTX(pl.LightningModule):
         # A. Backbone (Frozen HiVT + Mamba Trajectory Encoder)
         # This automatically loads Mamba if the checkpoint was trained with it.
         self.backbone = CVAE_GAN.load_from_checkpoint(cvae_gan_ckpt)
-        self.backbone.freeze() 
-        self.backbone.eval()
-        
+        # self.backbone.freeze() 
+        # self.backbone.eval()
+        self.backbone.train() 
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+                
         # B. Text Encoder (Simple GRU based)
         self.text_embedding = nn.Embedding(vocab_size, 256)
         self.text_encoder = nn.GRU(256, 256, batch_first=True)
@@ -171,4 +174,15 @@ class HiVTX(pl.LightningModule):
         self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=1e-4, weight_decay=1e-5)
+        # Separate parameter groups
+        backbone_params = list(self.backbone.parameters())
+        
+        # All other params (Text Encoder, Projections, Classifier)
+        head_params = [p for n, p in self.named_parameters() if "backbone" not in n]
+        
+        optimizer = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': 1e-5}, # Slow updates for HiVT
+            {'params': head_params, 'lr': 1e-4}      # Fast updates for new layers
+        ], weight_decay=1e-5)
+        
+        return optimizer
