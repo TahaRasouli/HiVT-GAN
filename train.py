@@ -80,7 +80,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
-        tokenizer=tokenizer # <--- Pass the BERT tokenizer
+        tokenizer=tokenizer
     )
     datamodule.prepare_data() 
     print(f"--- DataModule Ready with DistilBERT Tokenizer ---")
