@@ -14,25 +14,29 @@ class HiVTX(pl.LightningModule):
         # 1. ARCHITECTURE
         # ------------------------------------------------------------------
         
-        # A. Backbone (Frozen HiVT + Mamba Trajectory Encoder)
-        # This automatically loads Mamba if the checkpoint was trained with it.
+        # A. Backbone (UNFROZEN)
         self.backbone = CVAE_GAN.load_from_checkpoint(cvae_gan_ckpt)
-        # self.backbone.freeze() 
-        # self.backbone.eval()
+        
+        # --- CRITICAL CHANGE: UNFREEZE ---
         self.backbone.train() 
         for param in self.backbone.parameters():
             param.requires_grad = True
-                
-        # B. Text Encoder (Simple GRU based)
+        # ---------------------------------
+
+        # B. Text Encoder
         self.text_embedding = nn.Embedding(vocab_size, 256)
         self.text_encoder = nn.GRU(256, 256, batch_first=True)
         
-        # C. Projection Heads (Map both modalities to shared 128-dim space)
-        self.proj_traj = nn.Linear(128, embed_dim) # From HiVT's 128-dim global embed
-        self.proj_text = nn.Linear(256, embed_dim) # From Text Encoder's 256-dim hidden state
-        
-        # D. Auxiliary Classifier (Lane Type Prediction)
+        # C. Heads
+        self.proj_traj = nn.Linear(128, embed_dim) 
+        self.proj_text = nn.Linear(256, embed_dim) 
         self.lane_classifier = nn.Linear(128, 5) 
+        
+        # D. Training Components
+        self.temp = nn.Parameter(torch.tensor(0.07)) 
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.tokenizer = SimpleTokenizer(vocab_file="vocab.json") 
+        self.validation_step_outputs = []
         
         # ------------------------------------------------------------------
         # 2. TRAINING COMPONENTS
@@ -174,15 +178,19 @@ class HiVTX(pl.LightningModule):
         self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
-        # Separate parameter groups
+        """
+        Differential Learning Rates:
+        - Backbone (HiVT): 1e-5 (Very slow, to preserve pre-trained knowledge)
+        - Heads (Text/Proj): 1e-4 (Fast, to learn quickly)
+        """
+        # 1. Separate Parameters
         backbone_params = list(self.backbone.parameters())
-        
-        # All other params (Text Encoder, Projections, Classifier)
         head_params = [p for n, p in self.named_parameters() if "backbone" not in n]
         
+        # 2. Create Groups
         optimizer = torch.optim.AdamW([
-            {'params': backbone_params, 'lr': 1e-5}, # Slow updates for HiVT
-            {'params': head_params, 'lr': 1e-4}      # Fast updates for new layers
+            {'params': backbone_params, 'lr': 1e-5}, # Low LR for pre-trained part
+            {'params': head_params, 'lr': 1e-4}      # High LR for new parts
         ], weight_decay=1e-5)
         
         return optimizer
