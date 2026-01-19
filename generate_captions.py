@@ -11,6 +11,8 @@ from PIL import Image
 from nuscenes.nuscenes import NuScenes
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
+import traceback
+
 
 # ==========================================
 # 1. CONFIGURATION & CACHE
@@ -340,7 +342,10 @@ class CaptionGenerator:
                 final_stats[vlm_maneuver] = final_stats.get(vlm_maneuver, 0) + 1
 
             except Exception as e:
-                pass
+                except Exception as e:
+                print(f"\n[CRITICAL ERROR] Failed on {pt_path}: {e}")
+                traceback.print_exc()
+                break # Stop after the first error so we can fix it
         
         print(f"[GPU {shard_id}] Final Distribution: {final_stats}")
 
