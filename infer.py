@@ -2,17 +2,18 @@ import torch
 import numpy as np
 import json
 import os
-import random
+from transformers import AutoTokenizer
 from models.hivt_x import HiVTX
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
+import torch.nn.functional as F
 
 # --- CONFIGURATION ---
-CKPT_PATH = "/mount/arbeitsdaten/studenten4/rasoulta/HiVT-GAN/lightning_logs/version_54/checkpoints/epoch=29-step=8040.ckpt"
+CKPT_PATH = "/mount/arbeitsdaten/studenten4/rasoulta/HiVT-GAN/lightning_logs/version_62/checkpoints/epoch=17-step=1296.ckpt"
 BACKBONE_PATH = "/mount/studenten/projects/rasoulta/checkpoints/vae-gan-baseline/checkpoints/epoch=45-step=60812.ckpt"
 DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset"
 OUTPUT_FILE = "inference_results.json"
 
-# Targets: How many samples we want for each category
+# Targets: How many samples we want to find for each category
 TARGET_COUNTS = {
     "lane_change": 10,
     "turn": 10,
@@ -20,109 +21,117 @@ TARGET_COUNTS = {
     "intersection": 10
 }
 
-def get_category(text):
-    """
-    Classifies the text into one of the target categories.
-    Returns None if it doesn't fit or is 'straight'.
-    """
+# --- 1. DEFINE CANDIDATE CAPTIONS (The "Vocabulary" for Retrieval) ---
+# Since the model selects the best match, we define standard descriptions.
+CANDIDATE_TEXTS = [
+    "The vehicle drives straight.",
+    "The vehicle turns left.",
+    "The vehicle turns right.",
+    "The vehicle changes lane to the left.",
+    "The vehicle changes lane to the right.",
+    "The vehicle performs a U-turn.",
+    "The vehicle stops.",
+    "The vehicle moves slowly at an intersection."
+]
+
+def get_category_from_gt(text):
+    """Filters Ground Truth to find specific examples."""
     text = text.lower()
-    
-    # 1. Exclude Straight / Stationary logic handled in main loop
-    if "straight" in text:
-        return None
-        
-    # 2. Check for U-Turn (Specific type of turn)
-    if "u-turn" in text:
-        return "u_turn"
-        
-    # 3. Check for Lane Change
-    if "change lane" in text or "lane change" in text:
-        return "lane_change"
-        
-    # 4. Check for Turns (Left/Right) - Excludes U-turn because we checked it above
-    if "turn" in text or "left" in text or "right" in text:
-        return "turn"
-        
-    # 5. Check for Intersection / Juncture
-    if "intersection" in text or "junction" in text or "juncture" in text:
-        return "intersection"
-        
+    if "u-turn" in text: return "u_turn"
+    if "lane change" in text or "change lane" in text: return "lane_change"
+    if "turn" in text: return "turn" # Covers left/right
+    if "intersection" in text: return "intersection"
     return None
 
 def run_inference():
     print("Loading Model...")
-    with open("vocab.json") as f: vocab = json.load(f)
-    model = HiVTX.load_from_checkpoint(CKPT_PATH, cvae_gan_ckpt=BACKBONE_PATH, vocab_size=len(vocab), strict=False)
+    # Load Contrastive Model
+    model = HiVTX.load_from_checkpoint(CKPT_PATH, cvae_gan_ckpt=BACKBONE_PATH)
     model.eval().cuda()
 
     print("Loading Data...")
-    datamodule = NuScenesHiVTDataModule(root=DATA_ROOT, split_file="balanced_splits.json", val_batch_size=1, shuffle=True)
+    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+    
+    # We use batch_size=1 to process samples one by one
+    datamodule = NuScenesHiVTDataModule(
+        root=DATA_ROOT, 
+        split_file="balanced_splits.json", 
+        val_batch_size=1, 
+        shuffle=True, # Randomize to find variety
+        tokenizer=tokenizer
+    )
     datamodule.setup()
     loader = datamodule.val_dataloader()
 
-    # Trackers
+    # --- 2. PRE-COMPUTE TEXT EMBEDDINGS (The "Dictionary") ---
+    print("Encoding Candidate Texts...")
+    with torch.no_grad():
+        inputs = tokenizer(CANDIDATE_TEXTS, return_tensors="pt", padding=True, truncation=True).to(model.device)
+        # Encode all candidates once
+        text_feats = model._encode_text(inputs.input_ids, inputs.attention_mask)
+        z_candidates = F.normalize(model.proj_text(text_feats), dim=1)
+
     collected_samples = []
     current_counts = {k: 0 for k in TARGET_COUNTS.keys()}
     
-    print(f"Starting Search. Targets: {TARGET_COUNTS}")
+    print(f"Starting Search...")
 
     for batch_idx, batch in enumerate(loader):
-        # Stop if all targets met
         if all(current_counts[k] >= TARGET_COUNTS[k] for k in TARGET_COUNTS):
             print("\nAll targets met!")
             break
 
-        gt_ids = batch.caption_ids[0]
-        gt_text = model.tokenizer.decode(gt_ids)
+        # 1. Get Ground Truth Text (for filtering)
+        # Note: batch.input_ids is tokenized, we can't easily read it back to raw text perfectly.
+        # But we stored raw attributes in the dataset if available, or we decode roughly.
+        gt_text = tokenizer.decode(batch.input_ids[0], skip_special_tokens=True)
+
+        # 2. Determine Category (Is this a sample we want?)
+        category = get_category_from_gt(gt_text)
         
-        # 1. Check Stationary (Motion < 2m)
-        traj_input = batch.y[0]
-        displacement = torch.norm(traj_input[-1] - traj_input[0]).item()
-        if displacement < 2.0:
+        # Skip straight drives or categories we filled up
+        if category is None or current_counts.get(category, 0) >= TARGET_COUNTS[category]:
             continue
-
-        # 2. Determine Category
-        category = get_category(gt_text)
-        if category is None:
-            continue
-            
-        # 3. Check if we need more of this category
-        if current_counts.get(category, 0) >= TARGET_COUNTS[category]:
-            continue
-
-        # 4. Run Inference
-        data = batch.to(model.device)
+        
+        # 3. RUN INFERENCE (Retrieval)
+        batch = batch.to(model.device)
         with torch.no_grad():
-            global_embed, _ = model._get_ego_features(data)
-            traj_input_batch = data.y[0].unsqueeze(0)
+            # Embed Trajectory
+            traj_feat = model._get_ego_features(batch)
+            z_traj = F.normalize(model.proj_traj(traj_feat), dim=1)
             
-            logits = model.captioner(global_embed, traj_input_batch, captions=None, return_attn=False)
-            pred_ids = logits.argmax(dim=-1)[0]
-            pred_text = model.tokenizer.decode(pred_ids)
+            # Compare Trajectory vs All Candidates
+            # Dot product: [1, 128] @ [8, 128].T -> [1, 8] scores
+            scores = (z_traj @ z_candidates.T).squeeze()
+            
+            # Pick best match
+            best_idx = scores.argmax().item()
+            pred_text = CANDIDATE_TEXTS[best_idx]
+            confidence = scores[best_idx].item()
 
-        # 5. Save Data (Same structure + added 'category' for clarity)
+        # 4. Save
+        # Extract raw trajectory for visualization
+        traj_input = batch.y[0].cpu().numpy().tolist()
+        
         sample_data = {
             "sample_idx": batch_idx,
-            "city": batch.city[0],
-            "category_tag": category, # Added helper tag (does not break structure, just adds info)
+            "category": category,
             "ground_truth_text": gt_text,
             "predicted_text": pred_text,
+            "confidence": round(confidence, 4),
             "origin": batch.origin[0].cpu().numpy().tolist(),
-            "theta": batch.theta[0].item(),
-            "trajectory": traj_input.cpu().numpy().tolist()
+            "trajectory": traj_input
         }
         
         collected_samples.append(sample_data)
         current_counts[category] += 1
         
-        print(f"[{category.upper()}] Found {current_counts[category]}/{TARGET_COUNTS[category]}: {gt_text}")
+        print(f"[{category.upper()}] GT: '{gt_text[:30]}...' -> PRED: '{pred_text}' ({confidence:.2f})")
 
-    # 6. Save JSON
     with open(OUTPUT_FILE, 'w') as f:
         json.dump(collected_samples, f, indent=4)
     
-    print(f"\nSaved {len(collected_samples)} samples to {OUTPUT_FILE}")
-    print("Final Counts:", current_counts)
+    print(f"\nSaved results to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     run_inference()
