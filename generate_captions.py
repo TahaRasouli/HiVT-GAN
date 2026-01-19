@@ -89,38 +89,36 @@ LANE_STATUS_TEMPLATES = {
 }
 
 # ==========================================
-# 3. VLM PROMPT
+# 3. VLM PROMPT (Strict JSON)
 # ==========================================
-# Note: We use string concatenation for the markdown backticks to prevent
-# breaking the python script display in editors/chat interfaces.
 JSON_MARKER = "```json"
 END_MARKER = "```"
 
 FULL_PROMPT = f"""
-Analyze the driving video and output a single JSON object describing the EGO VEHICLE's behavior and the scene.
+Analyze the driving video and output a single JSON object describing the EGO VEHICLE's behavior.
 
-### 1. MANEUVER
-Choose EXACTLY ONE from: ["Straight Drive", "Left Turn", "Right Turn", "U-Turn", "Lane Change Left", "Lane Change Right", "Stationary Stop"].
-- **U-Turn**: A 180-degree turn reversing direction.
-- **Lane Change**: A lateral shift between marked lanes.
-- **Straight Drive**: Proceeding forward with no turn or lane change.
+### 1. MANEUVER (Choose EXACTLY ONE)
+Options: ["Straight Drive", "Left Turn", "Right Turn", "U-Turn", "Lane Change Left", "Lane Change Right", "Stationary Stop"]
 
-### 2. LANE STATUS
-Choose EXACTLY ONE from: ["maintain", "change_left", "change_right"].
-- **maintain**: Staying in the same lane (even while turning).
-- **change_left**: Crossing the line to the left.
+* **U-Turn**: A complete 180-degree reversal of direction.
+    * *WARNING*: Do NOT classify a sharp 90-degree turn as a U-Turn.
+* **Left/Right Turn**: A standard 90-degree turn at an intersection or curve.
+* **Lane Change**: A lateral shift between lanes (even shallow ones).
+* **Straight Drive**: Moving forward with minimal lateral deviation.
+
+### 2. LANE STATUS (Choose EXACTLY ONE)
+Options: ["maintain", "change_left", "change_right"]
 
 ### 3. SCENE DESCRIPTION
-Describe ONLY the environmental context.
-- **Include**: Weather (Sunny/Rainy/Night), Road Surface (Dry/Wet), Scene Type (Urban/Highway/Intersection).
-- **Negative Constraint**: Do NOT mention the ego vehicle, speed, or other traffic.
+Describe ONLY the environmental context (Weather, Road Surface, Scene Type).
+* *Negative Constraint*: Do NOT mention the ego vehicle or traffic.
 
 ### EXAMPLE OUTPUT:
 {JSON_MARKER}
 {{
   "maneuver": "Left Turn",
   "lane_status": "maintain",
-  "scene_description": "It is a sunny day on a dry asphalt intersection with clear lane markings and urban buildings in the background."
+  "scene_description": "It is a cloudy day on a wet asphalt road in a residential area."
 }}
 {END_MARKER}
 
@@ -132,16 +130,14 @@ Output the JSON object for this video.
 # 4. PRE-FILTERING (Sample Rates)
 # ==========================================
 KEEP_RATES = {
-    "Straight Drive": 0.15,      # Keep 15%
-    "Stationary Stop": 0.20,     # Keep 20%
-    "Potential Turn": 1.0,       # Keep 100% of anything interesting
+    "Straight Drive": 0.15,      
+    "Stationary Stop": 0.20,     
+    "Potential Turn": 1.0,       # Keep 100% of candidates
 }
 
 def get_rough_category(trajectory):
     """
     Loose Math Filter.
-    Returns 'Potential Turn' if there is ANY chance of a turn,
-    so we don't accidentally filter out hard samples.
     """
     if trajectory.ndim == 3: trajectory = trajectory[0]
     if len(trajectory) < 6: return "Stationary Stop"
@@ -150,18 +146,20 @@ def get_rough_category(trajectory):
     displacement = float(np.linalg.norm(p_final))
     y_final = float(p_final[1])
 
-    # Hard Physics Check: If moving < 1.0m, it is definitely stationary
+    # 1. Stationary Check (Physics doesn't lie)
     if displacement < 1.0: return "Stationary Stop"
 
-    # Angle Check
+    # 2. Angle Calculation
     v_start = trajectory[5, :2] - p0
     v_end = p_final - trajectory[-6, :2]
     angle_start = np.arctan2(v_start[1], v_start[0])
     angle_end = np.arctan2(v_end[1], v_end[0])
     diff_deg = np.degrees((angle_end - angle_start + np.pi) % (2 * np.pi) - np.pi)
 
-    # Sensitive Trigger: >15 deg turn OR >1.5m lateral move -> Let VLM decide
-    if abs(diff_deg) > 15 or abs(y_final) > 1.5:
+    # 3. SENSITIVE FILTER (Calibrated from Diagnostics)
+    # Lateral > 0.5m catches the 3.0% of data that are Lane Changes
+    # Angle > 10.0 degrees catches shallow curves and turns
+    if abs(diff_deg) > 10.0 or abs(y_final) > 0.5:
         return "Potential Turn"
     
     return "Straight Drive"
