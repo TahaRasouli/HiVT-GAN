@@ -342,7 +342,6 @@ class CaptionGenerator:
                 final_stats[vlm_maneuver] = final_stats.get(vlm_maneuver, 0) + 1
 
             except Exception as e:
-                except Exception as e:
                 print(f"\n[CRITICAL ERROR] Failed on {pt_path}: {e}")
                 traceback.print_exc()
                 break # Stop after the first error so we can fix it
