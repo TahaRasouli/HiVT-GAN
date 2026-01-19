@@ -52,12 +52,12 @@ def run_inference():
     print("Loading Data...")
     tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
     
-    # We use batch_size=1 to process samples one by one
     datamodule = NuScenesHiVTDataModule(
         root=DATA_ROOT, 
         split_file="balanced_splits.json", 
+        train_batch_size=1,  # <--- ADD THIS DUMMY VALUE
         val_batch_size=1, 
-        shuffle=True, # Randomize to find variety
+        shuffle=True, 
         tokenizer=tokenizer
     )
     datamodule.setup()
