@@ -68,8 +68,12 @@ class HiVTX(pl.LightningModule):
         z_traj = F.normalize(self.proj_traj(traj_feat), dim=1)
         z_text = F.normalize(self.proj_text(text_feat), dim=1)
         
+        # --- STABILITY FIX: CLAMP TEMPERATURE ---
+        # Ensure temp never goes below 0.01
+        temp = torch.clamp(self.temp, min=0.01)
+
         # 4. Contrastive Loss
-        logits = (z_traj @ z_text.T) / self.temp
+        logits = (z_traj @ z_text.T) / temp
         labels = torch.arange(logits.shape[0], device=self.device)
         loss = (self.ce_loss(logits, labels) + self.ce_loss(logits.T, labels)) / 2
         

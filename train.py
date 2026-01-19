@@ -151,12 +151,12 @@ def main():
         accelerator="gpu",
         devices=args.devices,
         strategy=strategy,
-        precision="16-mixed",
+        precision="32-true", 
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback],
         log_every_n_steps=50,
+        gradient_clip_val=1.0, # Keep this!
         num_sanity_val_steps=0,
-        gradient_clip_val=1.0,
     )
 
     trainer.fit(model, datamodule, ckpt_path=actual_fit_path)
