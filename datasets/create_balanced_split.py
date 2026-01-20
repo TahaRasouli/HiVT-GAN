@@ -5,7 +5,7 @@ from glob import glob
 
 # --- CONFIGURATION ---
 # The directory where you just generated the captioned .pt files
-DATA_DIR = "/mount/studenten/projects/rasoulta/dataset/captioned" 
+DATA_DIR = "/mount/studenten/projects/rasoulta/dataset/tmple-captioned" 
 OUTPUT_JSON = "balanced_splits.json"
 VAL_SPLIT_RATIO = 0.2  # 20% for validation
 
