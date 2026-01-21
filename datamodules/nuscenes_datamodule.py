@@ -48,10 +48,24 @@ class NuScenesHiVTDataModule(pl.LightningDataModule):
         )
 
     def train_dataloader(self):
+        print("Calculating sampler weights...")
+        dataset = self.train_dataset
+
+        class_weights = {
+            0: 1.0 / 0.72,   # Straight (Low weight)
+            1: 1.0 / 0.043,  # Left (High weight)
+            2: 1.0 / 0.056,  # Right
+            3: 1.0 / 0.002,  # U-Turn (Very High)
+            4: 1.0 / 0.022,  # Lane L
+            5: 1.0 / 0.015,  # Lane R
+            6: 1.0 / 0.143,  # Stop
+            -1: 0
+        }
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.train_batch_size,
-            shuffle=self.shuffle,
+            shuffle=self.shuffle, 
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
