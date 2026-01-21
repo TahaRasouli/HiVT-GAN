@@ -1,146 +1,138 @@
 import torch
-import numpy as np
-import json
-import os
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+import argparse
 from models.hivt_x import HiVTX
-from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
+from transformers import AutoTokenizer
 
-# ==========================================
+# ============================
 # CONFIGURATION
-# ==========================================
-# Update these paths to match your exact file locations
-CKPT_PATH = "/mount/arbeitsdaten/studenten4/rasoulta/HiVT-GAN/lightning_logs/version_62/checkpoints/epoch=17-step=1296.ckpt"
-BACKBONE_PATH = "/mount/studenten/projects/rasoulta/checkpoints/vae-gan-baseline/checkpoints/epoch=45-step=60812.ckpt"
-DATA_ROOT = "/mount/studenten/projects/rasoulta/dataset"
-OUTPUT_FILE = "inference_results.json"
-
-# Targets: How many samples we want to find for each category
-TARGET_COUNTS = {
-    "lane_change": 10,
-    "turn": 10,
-    "u_turn": 10,
-    "intersection": 10
-}
-
-# The "Menu" of descriptions the model can choose from
-CANDIDATE_TEXTS = [
+# ============================
+# The "Menu" of descriptions the model can choose from.
+# You can add as many as you want!
+CANDIDATE_CAPTIONS = [
     "The vehicle drives straight.",
-    "The vehicle turns left.",
-    "The vehicle turns right.",
-    "The vehicle changes lane to the left.",
-    "The vehicle changes lane to the right.",
+    "The vehicle executes a left turn.",
+    "The vehicle executes a right turn.",
     "The vehicle performs a U-turn.",
-    "The vehicle stops.",
-    "The vehicle moves slowly at an intersection."
+    "The vehicle changes lanes to the left.",
+    "The vehicle changes lanes to the right.",
+    "The vehicle remains stationary.",
+    "The vehicle is waiting at the intersection."
 ]
 
-# ==========================================
-# UTILITIES
-# ==========================================
-def get_category_from_gt(text):
-    """Filters Ground Truth to find specific examples."""
-    text = text.lower()
-    if "u-turn" in text: return "u_turn"
-    if "lane change" in text or "change lane" in text: return "lane_change"
-    if "turn" in text: return "turn" 
-    if "intersection" in text: return "intersection"
-    return None
+# Map class indices (0-6) to text for the Aux Head
+AUX_CLASS_MAP = {
+    0: "Straight Drive",
+    1: "Left Turn",
+    2: "Right Turn",
+    3: "U-Turn",
+    4: "Lane Change Left",
+    5: "Lane Change Right",
+    6: "Stationary Stop"
+}
 
-def run_inference():
-    print(f"--- Starting Inference ---")
+def load_model(ckpt_path):
+    print(f"Loading model from {ckpt_path}...")
+    # strict=False ensures we can load even if there are minor mismatches
+    model = HiVTX.load_from_checkpoint(ckpt_path, strict=False)
+    model.eval()
+    model.cuda()
+    return model
+
+def prepare_text_embeddings(model, tokenizer, texts):
+    """
+    Pre-computes the embeddings for all candidate captions.
+    """
+    print("Encoding candidate texts...")
+    encoded_input = tokenizer(texts, return_tensors='pt', padding=True, truncation=True).to(model.device)
     
-    # 1. Load Model
-    print(f"Loading Model from: {CKPT_PATH}")
-    # We must pass the backbone path as it was required in __init__
-    model = HiVTX.load_from_checkpoint(CKPT_PATH, cvae_gan_ckpt=BACKBONE_PATH, strict=False)
-    model.eval().cuda()
-
-    # 2. Load Data
-    print("Setting up DataModule...")
-    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-    
-    datamodule = NuScenesHiVTDataModule(
-        root=DATA_ROOT, 
-        split_file="balanced_splits.json", 
-        train_batch_size=1, # Dummy value to satisfy __init__
-        val_batch_size=1,   # Process 1 at a time for analysis
-        shuffle=True,       # Randomize to find variety
-        tokenizer=tokenizer
-    )
-    datamodule.setup()
-    loader = datamodule.val_dataloader()
-
-    # 3. Pre-compute Text Embeddings (The "Anchors")
-    print("Encoding Candidate Texts...")
     with torch.no_grad():
-        inputs = tokenizer(CANDIDATE_TEXTS, return_tensors="pt", padding=True, truncation=True).to(model.device)
-        text_feats = model._encode_text(inputs.input_ids, inputs.attention_mask)
-        z_candidates = F.normalize(model.proj_text(text_feats), dim=1)
+        # 1. BERT Encoding
+        bert_output = model.bert(**encoded_input)
+        text_features = bert_output.last_hidden_state[:, 0, :] # CLS token
+        
+        # 2. Projection to Joint Space
+        z_text = model.proj_text(text_features)
+        z_text = F.normalize(z_text, dim=1)
+        
+    return z_text
 
-    # 4. Search Loop
-    collected_samples = []
-    current_counts = {k: 0 for k in TARGET_COUNTS.keys()}
+def run_inference(model, z_text_candidates, sample_path):
+    # 1. Load Data
+    try:
+        data = torch.load(sample_path)
+    except:
+        # Fallback for weights_only=False requirement
+        data = torch.load(sample_path, weights_only=False)
+        
+    # 2. Fix Batch Attributes (Simulate a batch of size 1)
+    if not hasattr(data, 'ptr'):
+        # PyG usually handles this, but manual loading needs help
+        data.ptr = torch.tensor([0, data.num_nodes], dtype=torch.long)
+    if not hasattr(data, 'batch'):
+        data.batch = torch.zeros(data.num_nodes, dtype=torch.long)
+        
+    data = data.to(model.device)
     
-    print(f"Searching for samples... Targets: {TARGET_COUNTS}")
-
-    for batch_idx, batch in enumerate(loader):
-        # Stop if we found enough of everything
-        if all(current_counts[k] >= TARGET_COUNTS[k] for k in TARGET_COUNTS):
-            print("\nAll targets met!")
-            break
-
-        # Get Raw Ground Truth Text (roughly decoded)
-        gt_text = tokenizer.decode(batch.input_ids[0], skip_special_tokens=True)
-
-        # Categorize this sample based on GT
-        category = get_category_from_gt(gt_text)
-        
-        # Skip if it's 'straight' (None) or if we already have enough of this category
-        if category is None or current_counts.get(category, 0) >= TARGET_COUNTS[category]:
-            continue
-        
-        # --- MODEL PREDICTION ---
-        batch = batch.to(model.device)
-        with torch.no_grad():
-            # Get Trajectory Embedding
-            traj_feat = model._get_ego_features(batch)
-            z_traj = F.normalize(model.proj_traj(traj_feat), dim=1)
-            
-            # Compare vs Candidates (Dot Product)
-            scores = (z_traj @ z_candidates.T).squeeze()
-            
-            # Pick Winner
-            best_idx = scores.argmax().item()
-            pred_text = CANDIDATE_TEXTS[best_idx]
-            confidence = scores[best_idx].item()
-
-        # 5. Save Data (Ensure 'city' and 'theta' are included!)
-        traj_input = batch.y[0].cpu().numpy().tolist()
-        
-        sample_data = {
-            "sample_idx": batch_idx,
-            "city": batch.city[0],           # <--- CRITICAL FOR VISUALIZATION
-            "theta": batch.theta[0].item(),  # <--- CRITICAL FOR ROTATION
-            "origin": batch.origin[0].cpu().numpy().tolist(),
-            "category": category,
-            "ground_truth_text": gt_text,
-            "predicted_text": pred_text,
-            "confidence": round(confidence, 4),
-            "trajectory": traj_input
-        }
-        
-        collected_samples.append(sample_data)
-        current_counts[category] += 1
-        
-        print(f"[{category.upper()}] Conf: {confidence:.2f} | GT: {gt_text[:40]}... -> PRED: {pred_text}")
-
-    # 6. Dump to JSON
-    with open(OUTPUT_FILE, 'w') as f:
-        json.dump(collected_samples, f, indent=4)
+    # 3. Ground Truth Info (Just for checking)
+    gt_category = getattr(data, 'maneuver_category', "Unknown")
     
-    print(f"\nSaved {len(collected_samples)} samples to {OUTPUT_FILE}")
+    # 4. Model Forward Pass
+    with torch.no_grad():
+        # A. Trajectory Embedding
+        traj_feat = model._get_ego_features(data) # [1, 128]
+        z_traj = model.proj_traj(traj_feat)
+        z_traj = F.normalize(z_traj, dim=1)
+        
+        # B. Aux Head Classification
+        aux_logits = model.maneuver_classifier(traj_feat)
+        aux_probs = F.softmax(aux_logits, dim=1) # [1, 7]
+
+    # 5. Calculate Similarity (Contrastive Score)
+    # Cosine similarity is just the dot product of normalized vectors
+    similarity_scores = (z_traj @ z_text_candidates.T).squeeze() # [Num_Candidates]
+    
+    # ============================
+    # PRINT RESULTS
+    # ============================
+    print(f"\n{'-'*40}")
+    print(f"Analyzing: {sample_path.split('/')[-1]}")
+    print(f"Ground Truth: {gt_category}")
+    print(f"{'-'*40}")
+
+    print("\n[Method 1] Contrastive Retrieval (Text Matching):")
+    # Sort by score
+    sorted_indices = torch.argsort(similarity_scores, descending=True)
+    
+    for i in sorted_indices:
+        score = similarity_scores[i].item()
+        text = CANDIDATE_CAPTIONS[i]
+        # Highlight the winner
+        prefix = ">>" if score == similarity_scores[sorted_indices[0]] else "  "
+        print(f"{prefix} [{score:.4f}] {text}")
+
+    print("\n[Method 2] Aux Classifier Head:")
+    top_aux_id = torch.argmax(aux_probs).item()
+    top_aux_conf = aux_probs[0, top_aux_id].item()
+    print(f">> Predicted: {AUX_CLASS_MAP.get(top_aux_id, 'Unknown')} ({top_aux_conf*100:.1f}%)")
+    
+    print("\nRaw Probabilities:")
+    for cls_id, cls_name in AUX_CLASS_MAP.items():
+        if cls_id < aux_probs.shape[1]:
+            print(f"   {cls_name:<18}: {aux_probs[0, cls_id].item():.4f}")
 
 if __name__ == "__main__":
-    run_inference()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt_path", type=str, required=True, help="Path to trained .ckpt")
+    parser.add_argument("--sample_path", type=str, required=True, help="Path to a .pt file")
+    args = parser.parse_args()
+
+    # Init
+    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+    model = load_model(args.ckpt_path)
+    
+    # Pre-compute text candidates once
+    z_candidates = prepare_text_embeddings(model, tokenizer, CANDIDATE_CAPTIONS)
+    
+    # Run
+    run_inference(model, z_candidates, args.sample_path)
