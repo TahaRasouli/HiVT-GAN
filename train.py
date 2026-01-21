@@ -89,12 +89,15 @@ def main():
     actual_fit_path = args.ckpt_path
     
     # CASE A: Contrastive Learning (HiVT-X)
-    
     if args.train_contrastive:
         print("--- initializing HiVT-X (Contrastive + DistilBERT) ---")
-        # Remove vocab_size arg, HiVTX doesn't need it anymore
         model = HiVTX(cvae_gan_ckpt=args.ckpt_path, **vars(args))
         actual_fit_path = None
+        
+        # --- FIX: Change Monitor for Contrastive Training ---
+        # Contrastive models don't calculate minFDE. They calculate Loss/Recall.
+        args.monitor = "val_Sem_Acc" 
+        print(f"(!) Switched monitor to '{args.monitor}' for Contrastive Training.")
 
     # CASE B: CVAE-GAN
     elif args.train_cvae_gan:
