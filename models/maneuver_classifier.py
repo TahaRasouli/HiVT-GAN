@@ -132,21 +132,51 @@ class ManeuverClassifier(pl.LightningModule):
 
         # -------- Case B: graph-batched node embeddings --------
         # [num_graphs, N, D]  (N nodes-per-graph, padded or fixed)
-        elif global_embed.dim() == 3 and global_embed.size(0) == num_graphs:
-            # ego_index must be within N
-            N = int(global_embed.size(1))
-            ego_idx = batch.ego_index.to(global_embed.device).long()
-            if int(ego_idx.max().detach().cpu()) >= N or int(ego_idx.min().detach().cpu()) < 0:
+        elif global_embed.dim() == 3 and global_embed.size(0) == 1:
+            assert hasattr(batch, "ptr"), "Batch missing ptr"
+
+            ptr = batch.ptr.long()
+            ego_idx = batch.ego_index.to(global_embed.device).long()  # <-- define first
+            nodes_per_graph = (ptr[1:] - ptr[:-1]).to(ego_idx.device)
+
+            # DEBUG (safe now)
+            if self.global_step == 0:
+                print("ego_idx shape:", ego_idx.shape)
+                print("ego_idx min/max:", int(ego_idx.min().cpu()), int(ego_idx.max().cpu()))
+                print("nodes_per_graph min/max:",
+                    int(nodes_per_graph.min().cpu()),
+                    int(nodes_per_graph.max().cpu()))
+                print("ptr[-1] total_nodes:", int(ptr[-1].cpu()))
+
+            total_nodes = global_embed.size(1)
+
+            # Case 1: ego_index is LOCAL
+            if torch.all((ego_idx >= 0) & (ego_idx < nodes_per_graph)):
+                ego_global = ptr[:-1].to(ego_idx.device) + ego_idx
+
+            # Case 2: ego_index is already GLOBAL
+            elif torch.all((ego_idx >= 0) & (ego_idx < total_nodes)):
+                ego_global = ego_idx
+
+            else:
                 raise RuntimeError(
-                    f"ego_index out of range for per-graph node dim. "
-                    f"min={int(ego_idx.min().cpu())}, max={int(ego_idx.max().cpu())}, N={N}, "
-                    f"global_embed.shape={tuple(global_embed.shape)}"
+                    f"Invalid ego_index values. "
+                    f"ego_idx min={int(ego_idx.min())}, max={int(ego_idx.max())}, "
+                    f"nodes_per_graph max={int(nodes_per_graph.max())}, "
+                    f"total_nodes={total_nodes}"
                 )
 
-            ego_embeds = global_embed[
-                torch.arange(num_graphs, device=global_embed.device),
-                ego_idx,
-            ]  # [num_graphs, D]
+            # Final safety check
+            if ego_global.min() < 0 or ego_global.max() >= total_nodes:
+                raise RuntimeError(
+                    f"Computed ego_global out of bounds: "
+                    f"min={int(ego_global.min())}, "
+                    f"max={int(ego_global.max())}, "
+                    f"total_nodes={total_nodes}"
+                )
+
+            ego_embeds = global_embed[0, ego_global, :]
+
 
         # -------- Case C: single-batch node embeddings --------
         # [1, total_nodes, D] or [total_nodes, D]
