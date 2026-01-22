@@ -44,14 +44,30 @@ class CaptionFinetuner(pl.LightningModule):
         self.validation_step_outputs = []
 
     def forward(self, data):
-        # 1. Get Embeddings (Frozen Backbone)
+        # 1. Get Embeddings
         local_embed = self.model.local_encoder(data)
         global_embed = self.model.global_interactor(data, local_embed)
         
-        # 2. POOLING: [Num Nodes, Dim] -> [Batch Size, Dim]
-        graph_embed = global_max_pool(global_embed, data.batch)
-        
-        # 3. CLASSIFICATION: [Batch Size, Dim] -> [Batch Size, 7]
+        # --- DEBUG PRINT (Optional: Remove after fixing) ---
+        # print(f"Global Embed Shape: {global_embed.shape}")
+        # print(f"Batch Vector Shape: {data.batch.shape}")
+        # ---------------------------------------------------
+
+        # 2. SELECT EGO AGENT (Fix for Batch Size 1 Error)
+        # Instead of pooling, we grab the 0-th node of every graph in the batch.
+        # data.ptr contains the start index of each graph in the batch.
+        # data.ptr[:-1] gives us the indices [0, num_nodes_1, num_nodes_1+num_nodes_2, ...]
+        if hasattr(data, 'ptr'):
+            ego_indices = data.ptr[:-1]
+            graph_embed = global_embed[ego_indices]
+        else:
+            # Fallback for some PyG versions or if ptr is missing (unlikely)
+            # This replicates "Select index 0 where batch changes"
+            # But relying on ptr is safer for HiVT
+            graph_embed = global_max_pool(global_embed, data.batch)
+
+        # 3. CLASSIFICATION
+        # Now graph_embed is GUARANTEED to be [Batch_Size, Hidden_Dim]
         logits = self.classifier(graph_embed) 
         
         return logits
