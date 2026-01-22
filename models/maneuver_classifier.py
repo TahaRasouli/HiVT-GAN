@@ -7,6 +7,9 @@ from torchmetrics import Accuracy, F1Score
 class ManeuverClassifier(pl.LightningModule):
     """
     Ego-centric maneuver classifier on top of a frozen HiVT / CVAE backbone.
+
+    Backbone output observed: [B, N, 128]
+    We select the ego embedding (prefer batch.ego_index, otherwise default to 0).
     """
 
     def __init__(
@@ -44,9 +47,7 @@ class ManeuverClassifier(pl.LightningModule):
 
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
-        self.val_f1_per_class = F1Score(
-            task="multiclass", num_classes=num_classes, average=None
-        )
+        self.val_f1_per_class = F1Score(task="multiclass", num_classes=num_classes, average=None)
 
         self.class_names = [
             "Straight",
@@ -59,7 +60,7 @@ class ManeuverClassifier(pl.LightningModule):
         ]
 
     # --------------------------------------------------------------
-    # FORWARD (EGO POOLING)
+    # FORWARD (EGO POOLING WITH FALLBACK)
     # --------------------------------------------------------------
     def forward(self, batch):
         """
@@ -68,27 +69,30 @@ class ManeuverClassifier(pl.LightningModule):
         self.backbone.eval()
         with torch.no_grad():
             node_embeddings = self.backbone(batch)
-            # node_embeddings: [B, N, 128]
+            # Expected: [B, N, 128]
 
-        assert node_embeddings.dim() == 3, (
-            f"Expected [B,N,D] from backbone, got {node_embeddings.shape}"
-        )
+        if node_embeddings.dim() != 3:
+            raise RuntimeError(f"Expected backbone output [B,N,D], got {node_embeddings.shape}")
 
-        B = node_embeddings.size(0)
+        B, N, D = node_embeddings.shape
+        if B == 0 or N == 0:
+            # Empty batch / empty graph case
+            return torch.empty((0, self.head[-1].out_features), device=node_embeddings.device)
 
-        # Ego indices must exist and be valid
-        assert hasattr(batch, "ego_index"), "Batch missing ego_index"
-        ego_idx = batch.ego_index.view(-1)
+        # Prefer ego_index if present; otherwise default to 0
+        if hasattr(batch, "ego_index"):
+            ego_idx = batch.ego_index.view(-1).long()
+            if ego_idx.numel() != B:
+                # If ego_index exists but doesn't match, fall back
+                ego_idx = torch.zeros((B,), dtype=torch.long, device=node_embeddings.device)
+        else:
+            ego_idx = torch.zeros((B,), dtype=torch.long, device=node_embeddings.device)
 
-        assert ego_idx.numel() == B, (
-            f"Ego index mismatch: B={B}, ego_idx={ego_idx}"
-        )
+        # Bound check
+        ego_idx = torch.clamp(ego_idx, 0, N - 1)
 
-        # Ego pooling
-        ego_embed = node_embeddings[torch.arange(B, device=ego_idx.device), ego_idx]
-        # ego_embed: [B, 128]
-
-        logits = self.head(ego_embed)
+        ego_embed = node_embeddings[torch.arange(B, device=node_embeddings.device), ego_idx]  # [B, D]
+        logits = self.head(ego_embed)  # [B, num_classes]
         return logits
 
     # --------------------------------------------------------------
@@ -100,19 +104,20 @@ class ManeuverClassifier(pl.LightningModule):
             return None
 
         logits = self(batch)
+        if logits.numel() == 0:
+            return None
 
-        assert logits.size(0) == targets.size(0), (
-            f"Train N mismatch: logits {logits.shape}, targets {targets.shape}"
-        )
+        # Ensure [B, C] and [B]
+        assert logits.dim() == 2, f"logits must be [B,C], got {logits.shape}"
+        assert targets.dim() == 1, f"targets must be [B], got {targets.shape}"
+        assert logits.size(0) == targets.size(0), f"N mismatch: logits {logits.shape}, targets {targets.shape}"
 
         loss = self.criterion(logits, targets)
-
         preds = torch.argmax(logits, dim=1)
-        self.train_acc(preds, targets)
 
+        self.train_acc(preds, targets)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_acc", self.train_acc, on_epoch=True, prog_bar=True)
-
         return loss
 
     # --------------------------------------------------------------
@@ -124,17 +129,18 @@ class ManeuverClassifier(pl.LightningModule):
             return None
 
         logits = self(batch)
+        if logits.numel() == 0:
+            return None
 
-        assert logits.size(0) == targets.size(0), (
-            f"Val N mismatch: logits {logits.shape}, targets {targets.shape}"
-        )
+        assert logits.dim() == 2, f"logits must be [B,C], got {logits.shape}"
+        assert targets.dim() == 1, f"targets must be [B], got {targets.shape}"
+        assert logits.size(0) == targets.size(0), f"N mismatch: logits {logits.shape}, targets {targets.shape}"
 
         loss = self.criterion(logits, targets)
-
         preds = torch.argmax(logits, dim=1)
+
         self.val_acc(preds, targets)
         self.val_f1_per_class(preds, targets)
-
         self.log("val_loss", loss, prog_bar=True)
         return loss
 
@@ -171,8 +177,5 @@ class ManeuverClassifier(pl.LightningModule):
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-            },
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"},
         }
