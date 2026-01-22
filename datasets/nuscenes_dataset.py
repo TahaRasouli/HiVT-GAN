@@ -15,17 +15,24 @@ LANE_TYPE_MAP = {
     "Single-lane": 0, "2-lane": 1, "3-lane": 2, "4-lane": 3, "Multi-lane": 4, "Unknown": -1
 }
 
-# --- CRITICAL FIX: Custom Data Class for Correct Batching ---
+
 class HiVTTemporalData(TemporalData):
     def __inc__(self, key, value, *args, **kwargs):
         if key == 'lane_actor_index':
-            # Bipartite graph handling:
-            # Row 0 (Lanes) -> Increment by number of lanes
-            # Row 1 (Actors) -> Increment by number of nodes
-            # FIX: Must return shape [2, 1] to broadcast over [2, NumEdges]
+            # Bipartite graph: 
+            # Row 0 (Lanes) -> Inc by num_lanes
+            # Row 1 (Actors) -> Inc by num_nodes
+            # Returns shape [2, 1] for broadcasting
             return torch.tensor([[self['lane_vectors'].size(0)], [self.num_nodes]])
+        elif key == 'edge_index':
+            # Agent-Agent graph:
+            # Both rows are Actors -> Inc by num_nodes
+            return self.num_nodes
+        elif 'edge_index' in key:
+            # Catch-all for temporal edges like 'edge_index_0', 'edge_index_1' etc.
+            return self.num_nodes
         else:
-            # Default behavior for edge_index, etc.
+            # Default for everything else
             return super().__inc__(key, value, *args, **kwargs)
 
 class NuScenesHiVTDataset(Dataset):
