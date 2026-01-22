@@ -29,7 +29,7 @@ def main():
     print("Setting up DataModule...")
     # Your dataset expects split_file to be inside root or passed explicitly. 
     # Assuming 'balanced_splits.json' is in the root folder based on your previous logs.
-    split_path = os.path.join(args.root, "balanced_splits.json")
+    split_path = "./balanced_splits.json"
     
     datamodule = NuScenesHiVTDataModule(
         root=args.root,
