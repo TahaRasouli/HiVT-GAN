@@ -5,7 +5,7 @@ from typing import Optional
 from torch_geometric.data import Dataset, Batch
 from utils import TemporalData
 
-# --- UPDATED MAPPING (Must match your patch script) ---
+# --- UPDATED MAPPING ---
 MANEUVER_MAP = {
     "Straight Drive": 0,
     "Left Turn": 1,
@@ -17,7 +17,6 @@ MANEUVER_MAP = {
     "Unknown": -1
 }
 
-# (Optional: If you use lane type aux loss)
 LANE_TYPE_MAP = {
     "Single-lane": 0, "2-lane": 1, "3-lane": 2, "4-lane": 3, "Multi-lane": 4, "Unknown": -1
 }
@@ -66,6 +65,23 @@ class NuScenesHiVTDataset(Dataset):
 
         data = self._sanitize(data)
         
+        # --- [FIX] INJECT MISSING ROTATE_MAT ---
+        # The model expects 'rotate_mat'. If missing, we create an Identity matrix.
+        if not hasattr(data, 'rotate_mat') and 'rotate_mat' not in data:
+            # Determine number of nodes (agents) to shape the matrix correctly
+            if hasattr(data, 'x'):
+                num_nodes = data.x.size(0)
+            elif hasattr(data, 'num_nodes'):
+                num_nodes = data.num_nodes
+            else:
+                num_nodes = 1 # Fallback
+            
+            # Create Identity Matrix: [num_nodes, 2, 2]
+            # This assumes the data is already in the correct coordinate frame 
+            # or that no rotation is needed.
+            identity_rot = torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_nodes, 1, 1)
+            data.rotate_mat = identity_rot
+
         # --- 1. ROBUST CAPTION EXTRACTION ---
         cap_dict = {}
         if isinstance(data, dict):
@@ -78,15 +94,12 @@ class NuScenesHiVTDataset(Dataset):
         lane_text = cap_dict.get('lane_status', "")
         scene_desc = cap_dict.get('scene_description', "")
         
-        # Fallback for category logic (string -> int)
-        # Note: Your patch script saves 'maneuver_category' inside data object too
+        # Fallback for category logic
         cat_str = getattr(data, 'maneuver_category', "Unknown")
-        if isinstance(cat_str, list): cat_str = cat_str[0] # Handle weird list wrapping
+        if isinstance(cat_str, list): cat_str = cat_str[0]
         
         # --- 2. CONSTRUCT FULL TEXT ---
-        # "The ego vehicle executes a left turn. It enters the intersection. Night time driving."
         full_text = f"{man_text} {lane_text} {scene_desc}".strip()
-        
         if len(full_text) < 5: full_text = "Traffic scene."
 
         # --- 3. BERT TOKENIZATION ---
@@ -98,19 +111,14 @@ class NuScenesHiVTDataset(Dataset):
                 truncation=True, 
                 max_length=64 
             )
-            
-            # Squeeze batch dim [1, 64] -> [64] so PyG collates correctly
             data.input_ids = enc['input_ids'].squeeze(0)
             data.attention_mask = enc['attention_mask'].squeeze(0)
 
         # --- 4. MAP LABELS FOR AUX LOSS ---
         m_id = MANEUVER_MAP.get(cat_str, -1)
         data.maneuver_id = torch.tensor([m_id], dtype=torch.long)
-        
-        # Pass the raw category string too, just in case
         data.maneuver_category = cat_str
 
-        # Handle legacy lane type if needed
         l_type = cap_dict.get('lane_type', "Unknown")
         l_id = -1
         for key, val in LANE_TYPE_MAP.items():
@@ -120,7 +128,6 @@ class NuScenesHiVTDataset(Dataset):
         return data
 
     def _sanitize(self, data):
-        # (Paste your existing sanitize function here, it is correct)
         if hasattr(data, "lane_actor_index"):
              lai = data.lane_actor_index
              if not torch.is_tensor(lai) or lai.numel() == 0:
