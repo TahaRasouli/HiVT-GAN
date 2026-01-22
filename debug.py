@@ -1,25 +1,37 @@
 import torch
 import os
+from tqdm import tqdm
 
-# Point this to your data path
+# Update this path
 ROOT = "/mount/studenten/projects/rasoulta/dataset/tmpl-captioned"
 
-# Get a file
 files = [f for f in os.listdir(ROOT) if f.endswith('.pt')]
-file_path = os.path.join(ROOT, files[0])
+unique_labels = set()
 
-print(f"Loading: {file_path}")
-data = torch.load(file_path)
+print(f"Scanning {len(files)} files for unique labels...")
 
-print("\n--- Keys in Data Object ---")
-print(data.keys)
+for f in tqdm(files):
+    try:
+        data = torch.load(os.path.join(ROOT, f))
+        
+        # Check where the label lives based on your debug output
+        label = None
+        
+        # Priority 1: Top-level 'maneuver_category' (e.g., 'Straight Drive')
+        if hasattr(data, 'maneuver_category'):
+            label = data.maneuver_category
+            
+        # Priority 2: Inside caption_dict['category']
+        elif hasattr(data, 'caption_dict') and 'category' in data.caption_dict:
+            label = data.caption_dict['category']
+            
+        if label:
+            unique_labels.add(label)
+            
+    except Exception as e:
+        continue
 
-if hasattr(data, 'caption_dict'):
-    print("\n--- Content of caption_dict ---")
-    print(data.caption_dict)
-
-if hasattr(data, 'maneuver_id'):
-    print(f"\n--- Top Level maneuver_id ---")
-    print(data.maneuver_id)
-else:
-    print("\nXXX maneuver_id is NOT a top level attribute XXX")
+print("\n--- FOUND CLASSES ---")
+print("Copy these exact strings into your mapping:")
+for label in sorted(list(unique_labels)):
+    print(f"'{label}'")
