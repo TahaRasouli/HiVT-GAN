@@ -4,10 +4,11 @@ import torch
 from torch_geometric.data import Dataset, Batch
 from utils import TemporalData
 
+
 class NuScenesHiVTDataset(Dataset):
     """
-    HiVT-compatible nuScenes dataset.
-    Robustly handles flat directory structures and sanitizes map data.
+    HiVT-compatible nuScenes dataset with explicit ego indexing.
+    Robust against CUDA index crashes.
     """
 
     def __init__(
@@ -16,20 +17,20 @@ class NuScenesHiVTDataset(Dataset):
         split: str = "train",
         transform=None,
         max_samples: Optional[int] = None,
-        val_ratio: float = 0.1
+        val_ratio: float = 0.1,
     ):
         self.split = split
         self.root = root
         self.transform = transform
         self._directory = f"{split}_processed"
-        
+
         # 1. Structure Detection
         standard_path = os.path.join(self.root, self._directory)
         if os.path.isdir(standard_path):
             self._processed_dir = standard_path
             self.is_flat = False
         elif os.path.isdir(self.root):
-            print(f"[Dataset] Warning: '{self._directory}' not found. scanning root '{self.root}' directly.")
+            print(f"[Dataset] Warning: '{self._directory}' not found. Scanning root '{self.root}' directly.")
             self._processed_dir = self.root
             self.is_flat = True
         else:
@@ -37,13 +38,13 @@ class NuScenesHiVTDataset(Dataset):
 
         # 2. File Listing
         all_files = sorted(f for f in os.listdir(self._processed_dir) if f.endswith(".pt"))
-        
+
         # 3. Split Logic
         if self.is_flat:
             num_total = len(all_files)
             num_val = int(num_total * val_ratio)
             num_train = num_total - num_val
-            
+
             if split == "train":
                 self._processed_file_names = all_files[:num_train]
                 print(f"[Dataset] Auto-Split: Assigned {len(self._processed_file_names)} files to TRAIN.")
@@ -68,95 +69,107 @@ class NuScenesHiVTDataset(Dataset):
     def processed_file_names(self) -> List[str]:
         return self._processed_file_names
 
-    def _sanitize(self, data):
+    # ------------------------------------------------------------------
+    # SANITIZATION LOGIC
+    # ------------------------------------------------------------------
+    def _sanitize(self, data: TemporalData) -> TemporalData:
         """
-        Critical function to ensure data matches Model expectations.
+        Enforces strict invariants required by HiVT and GPU-safe indexing.
         """
-        # --- 1. Geometry Sanitization ---
-        # Ensure lane_actor_index is [2, N]
+
+        # --------------------------------------------------------------
+        # 1. GRAPH INDEX SANITIZATION
+        # --------------------------------------------------------------
         if hasattr(data, "lane_actor_index"):
             lai = data.lane_actor_index
-            if not torch.is_tensor(lai): data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
-            elif lai.numel() == 0: data.lane_actor_index = lai.reshape(2, 0)
-            elif lai.dim() == 1 and lai.size(0) == 2: data.lane_actor_index = lai.reshape(2, 1)
+            if not torch.is_tensor(lai):
+                data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
+            elif lai.numel() == 0:
+                data.lane_actor_index = lai.reshape(2, 0)
+            elif lai.dim() == 1 and lai.size(0) == 2:
+                data.lane_actor_index = lai.reshape(2, 1)
             elif lai.dim() != 2 or lai.size(0) != 2:
-                if lai.size(1) == 2 and lai.size(0) != 2: data.lane_actor_index = lai.t()
-                else: data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
+                data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
 
-        # Fix empty vector shapes
+        if hasattr(data, "edge_index"):
+            ei = data.edge_index
+            if not torch.is_tensor(ei) or ei.numel() == 0:
+                data.edge_index = torch.empty((2, 0), dtype=torch.long)
+            elif ei.dim() == 1 and ei.size(0) == 2:
+                data.edge_index = ei.reshape(2, 1)
+            elif ei.dim() != 2 or ei.size(0) != 2:
+                data.edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        # --------------------------------------------------------------
+        # 2. VECTOR SHAPE FIXES
+        # --------------------------------------------------------------
         for key in ["lane_actor_vectors", "lane_vectors"]:
             if hasattr(data, key):
                 vec = getattr(data, key)
                 if not torch.is_tensor(vec) or vec.numel() == 0 or vec.dim() != 2:
                     setattr(data, key, torch.empty((0, 2), dtype=torch.float))
 
-        if hasattr(data, "edge_index"):
-            ei = data.edge_index
-            if ei.numel() == 0: data.edge_index = ei.reshape(2, 0)
-            elif ei.dim() == 1 and ei.size(0) == 2: data.edge_index = ei.reshape(2, 1)
-            elif ei.dim() != 2 or ei.size(0) != 2: data.edge_index = torch.empty((2, 0), dtype=torch.long)
-
-        # --- 2. MAP FEATURE CLAMPING (Fixes CUDA Crash) ---
-        # HiVT Embeddings have specific sizes. Data outside this range crashes the GPU.
-        
-        # turn_directions: Embedding size 3 -> indices must be 0, 1, 2
+        # --------------------------------------------------------------
+        # 3. MAP FEATURE CLAMPING (EMBEDDING SAFETY)
+        # --------------------------------------------------------------
         if hasattr(data, "turn_directions"):
-            # Clamp anything > 2 to 0 (Straight) or 2 (Right) to be safe
-            data.turn_directions = torch.clamp(data.turn_directions, min=0, max=2).long()
-            
-        # traffic_controls: Embedding size 2 -> indices must be 0, 1
-        if hasattr(data, "traffic_controls"):
-            data.traffic_controls = torch.clamp(data.traffic_controls, min=0, max=1).long()
-            
-        # is_intersections: Embedding size 2 -> indices must be 0, 1
-        if hasattr(data, "is_intersections"):
-            data.is_intersections = torch.clamp(data.is_intersections, min=0, max=1).long()
+            data.turn_directions = torch.clamp(data.turn_directions, 0, 2).long()
 
-        # --- 3. LABEL EXTRACTION (Fixes Zero Counts) ---
+        if hasattr(data, "traffic_controls"):
+            data.traffic_controls = torch.clamp(data.traffic_controls, 0, 1).long()
+
+        if hasattr(data, "is_intersections"):
+            data.is_intersections = torch.clamp(data.is_intersections, 0, 1).long()
+
+        # --------------------------------------------------------------
+        # 4. MANEUVER LABEL EXTRACTION
+        # --------------------------------------------------------------
         str_to_int = {
-            'Straight Drive': 0, 'Go Straight': 0,
-            'Left Turn': 1, 'Turn Left': 1,
-            'Right Turn': 2, 'Turn Right': 2,
-            'U-Turn': 3, 'U Turn': 3,
-            'Lane Change Left': 4, 'Left Lane Change': 4,
-            'Lane Change Right': 5, 'Right Lane Change': 5,
-            'Stationary': 6, 'Stop': 6, 'Stationary Stop': 6
+            "Straight Drive": 0, "Go Straight": 0,
+            "Left Turn": 1, "Turn Left": 1,
+            "Right Turn": 2, "Turn Right": 2,
+            "U-Turn": 3, "U Turn": 3,
+            "Lane Change Left": 4, "Left Lane Change": 4,
+            "Lane Change Right": 5, "Right Lane Change": 5,
+            "Stationary": 6, "Stop": 6, "Stationary Stop": 6,
         }
 
         label_str = None
-        # Check all possible hiding spots
-        if hasattr(data, 'maneuver_category'):
+        if hasattr(data, "maneuver_category"):
             label_str = data.maneuver_category
-        elif hasattr(data, 'caption_dict'):
-            if 'category' in data.caption_dict:
-                label_str = data.caption_dict['category']
-            elif 'maneuver_category' in data.caption_dict:
-                label_str = data.caption_dict['maneuver_category']
+        elif hasattr(data, "caption_dict"):
+            label_str = data.caption_dict.get("category") or data.caption_dict.get("maneuver_category")
 
-        # Map to int
-        maneuver_id = 0 # Default to Straight
-        if label_str and label_str in str_to_int:
-            maneuver_id = str_to_int[label_str]
-        
-        # Force Assignment
+        maneuver_id = str_to_int.get(label_str, 0)
         data.maneuver_id = torch.tensor([maneuver_id], dtype=torch.long)
-        
+
+        # --------------------------------------------------------------
+        # 5. EXPLICIT EGO INDEX (OPTION A)
+        # --------------------------------------------------------------
+        if not hasattr(data, "ego_index"):
+            # ASSUMPTION: ego node is index 0 (must match preprocessing)
+            data.ego_index = torch.tensor([0], dtype=torch.long)
+        else:
+            data.ego_index = data.ego_index.reshape(1).long()
+
+        # Safety invariant
+        assert data.ego_index.item() < data.num_nodes, (
+            f"Ego index {data.ego_index.item()} >= num_nodes {data.num_nodes}"
+        )
+
         return data
 
+    # ------------------------------------------------------------------
+    # DATASET INTERFACE
+    # ------------------------------------------------------------------
     def len(self) -> int:
         return len(self._processed_file_names)
 
     def get(self, idx: int) -> TemporalData:
         path = os.path.join(self.processed_dir, self._processed_file_names[idx])
-        try:
-            data = torch.load(path)
-            data = self._sanitize(data)
-            return data
-        except Exception as e:
-            # Fallback for corrupted files to prevent full crash
-            print(f"Error loading {path}: {e}")
-            # return a dummy empty object or skip (handled by caller usually)
-            raise e
+        data = torch.load(path)
+        data = self._sanitize(data)
+        return data
 
     @staticmethod
     def collate_fn(batch: List[TemporalData]) -> Batch:
