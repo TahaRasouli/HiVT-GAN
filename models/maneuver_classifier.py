@@ -1,65 +1,109 @@
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from torchmetrics import Accuracy, F1Score, ConfusionMatrix
-from utils import VariationalCaptionGenerator
+from torchmetrics import Accuracy, F1Score
+
 
 class ManeuverClassifier(pl.LightningModule):
-    def __init__(self, frozen_backbone, num_classes=7, learning_rate=1e-3, class_weights=None):
+    """
+    Graph-level maneuver classifier on top of a frozen HiVT / CVAE backbone.
+    """
+
+    def __init__(
+        self,
+        frozen_backbone,
+        num_classes: int = 7,
+        learning_rate: float = 1e-3,
+        class_weights: torch.Tensor | None = None,
+    ):
         super().__init__()
-        self.save_hyperparameters(ignore=['frozen_backbone'])
-        
-        # 1. The Backbone (Frozen)
+        self.save_hyperparameters(ignore=["frozen_backbone"])
+
+        # ----------------------------------------------------------
+        # 1. BACKBONE (FROZEN)
+        # ----------------------------------------------------------
         self.backbone = frozen_backbone
         self.backbone.eval()
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-            
-        # 2. The Head (Trainable)
-        # Input: 128 (HiVT embedding) -> Output: 7 (Maneuver Classes)
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        # ----------------------------------------------------------
+        # 2. CLASSIFICATION HEAD
+        # ----------------------------------------------------------
         self.head = nn.Sequential(
             nn.Linear(128, 128),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(128, num_classes)
+            nn.Linear(128, num_classes),
         )
-        
-        # 3. Loss & Metrics
-        # Weights are passed from the training script to handle imbalance
-        self.class_weights = class_weights
-        self.criterion = nn.CrossEntropyLoss(weight=self.class_weights)
-        
-        # Metrics
+
+        # ----------------------------------------------------------
+        # 3. LOSS + METRICS
+        # ----------------------------------------------------------
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
-        
-        # We track F1 score per-class to see if we are failing at U-Turns specifically
-        self.val_f1_per_class = F1Score(task="multiclass", num_classes=num_classes, average=None)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
-        
-        # Class Names for pretty printing
+        self.val_f1_per_class = F1Score(
+            task="multiclass", num_classes=num_classes, average=None
+        )
+
         self.class_names = [
-            "Straight", "Left Turn", "Right Turn", "U-Turn", 
-            "LC Left", "LC Right", "Stationary"
+            "Straight",
+            "Left Turn",
+            "Right Turn",
+            "U-Turn",
+            "LC Left",
+            "LC Right",
+            "Stationary",
         ]
 
+    # --------------------------------------------------------------
+    # FORWARD
+    # --------------------------------------------------------------
     def forward(self, batch):
+        """
+        Returns logits of shape [B, num_classes].
+        """
         self.backbone.eval()
         with torch.no_grad():
-            # HiVT backbone returns [batch_size, 128]
             global_embed = self.backbone(batch)
 
-        # global_embed is already ego-centric and graph-level
+        # Normalize backbone output shape
+        # Acceptable:
+        #   [B, D]
+        #   [B, 1, D] -> squeeze
+        if global_embed.dim() == 3 and global_embed.size(1) == 1:
+            global_embed = global_embed.squeeze(1)
+
+        # Final safety
+        assert global_embed.dim() == 2, (
+            f"Backbone output must be [B,D], got {global_embed.shape}"
+        )
+
         logits = self.head(global_embed)
         return logits
 
-
+    # --------------------------------------------------------------
+    # TRAINING STEP
+    # --------------------------------------------------------------
     def training_step(self, batch, batch_idx):
         targets = batch.maneuver_id.view(-1).long()
 
+        # Skip empty batches (Lightning + PyG edge case)
         if targets.numel() == 0:
             return None
 
         logits = self(batch)
+
+        # Shape hygiene
+        logits = logits.view(logits.size(0), -1)
+        targets = targets.view(-1)
+
+        assert logits.size(0) == targets.size(0), (
+            f"Train N mismatch: logits {logits.shape}, targets {targets.shape}"
+        )
+
         loss = self.criterion(logits, targets)
 
         preds = torch.argmax(logits, dim=1)
@@ -70,63 +114,70 @@ class ManeuverClassifier(pl.LightningModule):
 
         return loss
 
-
+    # --------------------------------------------------------------
+    # VALIDATION STEP
+    # --------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
-        # Extract targets FIRST
         targets = batch.maneuver_id.view(-1).long()
 
-        # HARD GUARD: skip empty validation batches
+        # Skip empty batches
         if targets.numel() == 0:
             return None
 
         logits = self(batch)
 
-        loss = self.criterion(logits, targets)
-        preds = torch.argmax(logits, dim=1)
+        # Shape hygiene
+        logits = logits.view(logits.size(0), -1)
+        targets = targets.view(-1)
 
+        assert logits.size(0) == targets.size(0), (
+            f"Val N mismatch: logits {logits.shape}, targets {targets.shape}"
+        )
+
+        loss = self.criterion(logits, targets)
+
+        preds = torch.argmax(logits, dim=1)
         self.val_acc(preds, targets)
         self.val_f1_per_class(preds, targets)
 
         self.log("val_loss", loss, prog_bar=True)
         return loss
 
-
+    # --------------------------------------------------------------
+    # VALIDATION EPOCH END
+    # --------------------------------------------------------------
     def on_validation_epoch_end(self):
-        """
-        Prints a results table to the terminal at the end of every epoch.
-        """
-        # Get the computed metrics from the accumulator
         f1_scores = self.val_f1_per_class.compute()
         acc = self.val_acc.compute()
-        
-        # Print to console
-        print(f"\n{'='*40}")
+
+        print("\n" + "=" * 40)
         print(f"Epoch {self.current_epoch} Results")
-        print(f"{'-'*40}")
+        print("-" * 40)
         print(f"Overall Accuracy: {acc:.4f}")
-        print(f"{'-'*40}")
+        print("-" * 40)
         print(f"{'Class':<15} | {'F1 Score':<10}")
-        print(f"{'-'*40}")
-        
+        print("-" * 40)
+
         for i, name in enumerate(self.class_names):
-            score = f1_scores[i].item()
-            print(f"{name:<15} | {score:.4f}")
-            
-        print(f"{'='*40}\n")
-        
-        # Reset for next epoch
+            print(f"{name:<15} | {f1_scores[i].item():.4f}")
+
+        print("=" * 40 + "\n")
+
         self.val_f1_per_class.reset()
         self.val_acc.reset()
 
+    # --------------------------------------------------------------
+    # OPTIMIZER
+    # --------------------------------------------------------------
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.head.parameters(), lr=self.hparams.learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5
+            optimizer, mode="min", factor=0.5, patience=5
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss"
-            }
+                "monitor": "val_loss",
+            },
         }
