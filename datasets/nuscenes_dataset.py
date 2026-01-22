@@ -116,10 +116,9 @@ class NuScenesHiVTDataset(Dataset):
 
     def _sanitize(self, data):
         """
-        Full-Spectrum Sanitization to prevent GPU Index Crashes.
+        Full-Spectrum Sanitization for Nodes AND Lanes.
         """
         # --- A. CONSISTENT NODE COUNT ---
-        # Find minimum valid length for node-level tensors
         node_counts = []
         if hasattr(data, 'x') and torch.is_tensor(data.x): node_counts.append(data.x.size(0))
         if hasattr(data, 'positions') and torch.is_tensor(data.positions): node_counts.append(data.positions.size(0))
@@ -131,7 +130,6 @@ class NuScenesHiVTDataset(Dataset):
             valid_num_nodes = data.num_nodes if hasattr(data, 'num_nodes') else 0
 
         # Crop Node Tensors
-        # NOTE: 'av_index' is NOT in this list because it's a scalar index, not a feature list
         node_keys = ['x', 'positions', 'padding_mask', 'bos_mask', 'rotate_angles', 'y']
         for key in node_keys:
             if hasattr(data, key):
@@ -140,24 +138,36 @@ class NuScenesHiVTDataset(Dataset):
                     setattr(data, key, tensor[:valid_num_nodes])
         data.num_nodes = valid_num_nodes
 
-        # --- B. FIX AV_INDEX (Crucial for HiVT Origin) ---
-        # If av_index points to a node we just cropped (or never existed), point it to 0.
+        # --- B. FIX AV_INDEX ---
         if hasattr(data, 'av_index') and torch.is_tensor(data.av_index):
             if data.av_index.numel() == 1:
                 if data.av_index.item() >= valid_num_nodes:
                     data.av_index.fill_(0)
             else:
-                # If av_index is somehow a list, filter it
                 data.av_index = data.av_index[data.av_index < valid_num_nodes]
                 if data.av_index.numel() == 0:
                     data.av_index = torch.tensor([0], device=data.x.device)
 
-        # --- C. CONSISTENT LANE COUNT ---
-        if hasattr(data, 'lane_vectors') and torch.is_tensor(data.lane_vectors):
-            real_num_lanes = data.lane_vectors.size(0)
+        # --- C. CONSISTENT LANE COUNT (New Fix) ---
+        # Find minimum valid length for lane tensors
+        lane_counts = []
+        if hasattr(data, 'lane_vectors') and torch.is_tensor(data.lane_vectors): lane_counts.append(data.lane_vectors.size(0))
+        if hasattr(data, 'is_intersections') and torch.is_tensor(data.is_intersections): lane_counts.append(data.is_intersections.size(0))
+        if hasattr(data, 'turn_directions') and torch.is_tensor(data.turn_directions): lane_counts.append(data.turn_directions.size(0))
+        if hasattr(data, 'traffic_controls') and torch.is_tensor(data.traffic_controls): lane_counts.append(data.traffic_controls.size(0))
+
+        if len(lane_counts) > 0:
+            real_num_lanes = min(lane_counts)
         else:
             real_num_lanes = 0
-            data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
+            
+        # Crop Lane Tensors
+        lane_keys = ['lane_vectors', 'is_intersections', 'turn_directions', 'traffic_controls']
+        for key in lane_keys:
+            if hasattr(data, key):
+                tensor = getattr(data, key)
+                if torch.is_tensor(tensor) and tensor.size(0) > real_num_lanes:
+                    setattr(data, key, tensor[:real_num_lanes])
 
         # --- D. FILTER EDGES ---
         # 1. Lane-Actor Index
@@ -169,6 +179,7 @@ class NuScenesHiVTDataset(Dataset):
             else:
                 if lai.dim() == 1: lai = lai.reshape(2, 1)
                 
+                # Check against REAL limits
                 mask_lanes = (lai[0] < real_num_lanes) & (lai[0] >= 0)
                 mask_actors = (lai[1] < valid_num_nodes) & (lai[1] >= 0)
                 valid_mask = mask_lanes & mask_actors
@@ -181,7 +192,7 @@ class NuScenesHiVTDataset(Dataset):
                     else:
                         data.lane_actor_vectors = torch.empty((data.lane_actor_index.shape[1], 2), dtype=torch.float)
 
-        # 2. Edge Index (Agent-Agent)
+        # 2. Edge Index
         if hasattr(data, "edge_index"):
             ei = data.edge_index
             if not torch.is_tensor(ei) or ei.numel() == 0:
