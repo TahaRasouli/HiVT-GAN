@@ -3,7 +3,7 @@ import json
 import torch
 import torch.nn.functional as F
 from typing import Optional
-from torch_geometric.data import Dataset, Batch, Data
+from torch_geometric.data import Dataset, Batch
 from utils import TemporalData
 
 # --- MAPPING ---
@@ -66,14 +66,24 @@ class NuScenesHiVTDataset(Dataset):
         if data.num_nodes == 0:
             return self.get((idx + 1) % len(self))
 
-        # 3. Temporal Padding (Ensure history >= 20 steps)
+        # 3. Temporal Padding
         data = self._pad_temporal(data)
 
-        # 4. Inject Rotate Mat if missing
-        if not hasattr(data, 'rotate_mat') or data.rotate_mat is None:
-            num_nodes = data.num_nodes 
-            identity_rot = torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_nodes, 1, 1)
-            data.rotate_mat = identity_rot
+        # 4. REGENERATE ROTATE MAT (The Fix)
+        # We perform this AFTER sanitization/padding to guarantee size match
+        num_nodes = data.num_nodes
+        if hasattr(data, 'rotate_angles') and data.rotate_angles is not None:
+            # Generate from angles: [N, 2, 2]
+            # Use the LAST time step (current time) for rotation
+            theta = data.rotate_angles[:, -1] 
+            cos, sin = theta.cos(), theta.sin()
+            # Rotation matrix: [[cos, -sin], [sin, cos]]
+            row1 = torch.stack([cos, -sin], dim=1)
+            row2 = torch.stack([sin, cos], dim=1)
+            data.rotate_mat = torch.stack([row1, row2], dim=1)
+        else:
+            # Fallback to Identity
+            data.rotate_mat = torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_nodes, 1, 1)
 
         # 5. Extract Text/Labels
         cap_dict = getattr(data, 'caption_dict', {}) if not isinstance(data, dict) else data.get('caption_dict', {})
@@ -130,6 +140,10 @@ class NuScenesHiVTDataset(Dataset):
                 if torch.is_tensor(tensor) and tensor.size(0) > valid_num_nodes:
                     setattr(data, key, tensor[:valid_num_nodes])
         data.num_nodes = valid_num_nodes
+        
+        # **FORCE DELETE rotate_mat** to ensure it's regenerated correctly later
+        if hasattr(data, 'rotate_mat'): del data.rotate_mat
+        
         if valid_num_nodes == 0: return data
 
         # B. AV Index
@@ -173,7 +187,7 @@ class NuScenesHiVTDataset(Dataset):
                 data.edge_index = torch.empty((2, 0), dtype=torch.long)
             else:
                 if ei.dim() == 1: ei = ei.reshape(2, 1)
-                valid_mask = (ei[0] < valid_num_nodes) & (ei[1] < valid_num_nodes) & (ei[0] >= 0) & (ei[1] >= 0)
+                valid_mask = (ei[0] < valid_num_nodes) & (ei[1] < valid_num_nodes)
                 data.edge_index = ei[:, valid_mask]
 
         # E. Clamp Categorical
@@ -188,10 +202,9 @@ class NuScenesHiVTDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch_list):
-        # 1. Base Batching (Stacks tensors)
         batch = Batch.from_data_list(batch_list)
         
-        # 2. MANUAL RE-BATCHING of Indices (Guarantees Correctness)
+        # MANUAL RE-BATCHING of Indices
         lane_actor_indices = []
         lane_actor_vectors = []
         edge_indices = []
@@ -200,28 +213,23 @@ class NuScenesHiVTDataset(Dataset):
         node_offset = 0
         
         for data in batch_list:
-            # Re-calc Lane-Actor Index
             if hasattr(data, 'lane_actor_index') and data.lane_actor_index.numel() > 0:
                 lai = data.lane_actor_index.clone()
-                lai[0] += lane_offset # Row 0: Lanes
-                lai[1] += node_offset # Row 1: Actors
+                lai[0] += lane_offset
+                lai[1] += node_offset
                 lane_actor_indices.append(lai)
-                
                 if hasattr(data, 'lane_actor_vectors'):
                     lane_actor_vectors.append(data.lane_actor_vectors)
             
-            # Re-calc Edge Index
             if hasattr(data, 'edge_index') and data.edge_index.numel() > 0:
                 ei = data.edge_index.clone()
-                ei += node_offset # Both rows: Actors
+                ei += node_offset
                 edge_indices.append(ei)
 
-            # Update Offsets
             if hasattr(data, 'lane_vectors') and data.lane_vectors is not None:
                 lane_offset += data.lane_vectors.size(0)
             node_offset += data.num_nodes
             
-        # Overwrite Batch Attributes
         if len(lane_actor_indices) > 0:
             batch.lane_actor_index = torch.cat(lane_actor_indices, dim=1)
             if len(lane_actor_vectors) > 0:
