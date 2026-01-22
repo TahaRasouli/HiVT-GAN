@@ -12,6 +12,9 @@ from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.cvae import CVAE
 from models.maneuver_classifier import ManeuverClassifier
 from datasets.nuscenes_dataset import NuScenesHiVTDataset
+import faulthandler, sys
+faulthandler.enable(file=sys.stderr)
+faulthandler.dump_traceback_later(60, repeat=True)
 
 # Optimization
 torch.set_float32_matmul_precision('medium')
@@ -129,15 +132,13 @@ def main():
 
 
     trainer = pl.Trainer(
-        accelerator="gpu" if use_gpu else "cpu",
-        devices=args.devices if use_gpu else 1,
-        strategy=strategy if use_gpu else "auto",
-        precision="16-mixed" if use_gpu else 32,
-        max_epochs=args.max_epochs,
-        callbacks=[checkpoint_callback],
-        log_every_n_steps=50,
-        enable_progress_bar=False,
-        enable_model_summary=True,
+    accelerator="gpu",
+    devices=1,
+    strategy="single_device",   # important
+    precision="16-mixed",
+    num_sanity_val_steps=0,
+    limit_val_batches=0, 
+    check_val_every_n_epoch=1,
     )
 
     print("[Info] Starting Linear Probe Training...")
