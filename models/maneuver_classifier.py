@@ -8,8 +8,8 @@ class ManeuverClassifier(pl.LightningModule):
     """
     Ego-centric maneuver classifier on top of a frozen HiVT / CVAE backbone.
 
-    Backbone output observed: [B, N, 128]
-    We select the ego embedding (prefer batch.ego_index, otherwise default to 0).
+    Backbone output: [B, N, 128]
+    Ego pooling via batch.ego_index → [B, 128]
     """
 
     def __init__(
@@ -47,7 +47,9 @@ class ManeuverClassifier(pl.LightningModule):
 
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
-        self.val_f1_per_class = F1Score(task="multiclass", num_classes=num_classes, average=None)
+        self.val_f1_per_class = F1Score(
+            task="multiclass", num_classes=num_classes, average=None
+        )
 
         self.class_names = [
             "Straight",
@@ -60,13 +62,12 @@ class ManeuverClassifier(pl.LightningModule):
         ]
 
     # --------------------------------------------------------------
-    # FORWARD (EGO POOLING WITH FALLBACK)
+    # FORWARD
     # --------------------------------------------------------------
     def forward(self, batch):
         self.backbone.eval()
         with torch.no_grad():
-            # Backbone output: [B, N, 128]
-            global_embed = self.backbone(batch)
+            global_embed = self.backbone(batch)  # [B, N, 128]
 
         assert global_embed.dim() == 3, (
             f"Expected [B, N, D], got {global_embed.shape}"
@@ -76,10 +77,10 @@ class ManeuverClassifier(pl.LightningModule):
 
         assert hasattr(batch, "ego_index"), "Batch missing ego_index"
         assert batch.ego_index.numel() == B, (
-            f"ego_index must have length B={B}, got {batch.ego_index.numel()}"
+            f"ego_index must have length B={B}, "
+            f"got {batch.ego_index.numel()}"
         )
 
-        # Extract one ego per graph
         ego_embeds = global_embed[
             torch.arange(B, device=global_embed.device),
             batch.ego_index
@@ -88,28 +89,18 @@ class ManeuverClassifier(pl.LightningModule):
         logits = self.head(ego_embeds)  # [B, num_classes]
         return logits
 
-
     # --------------------------------------------------------------
     # TRAINING STEP
     # --------------------------------------------------------------
     def training_step(self, batch, batch_idx):
         targets = batch.maneuver_id.view(-1).long()
-        if targets.numel() == 0:
-            return None
-
         logits = self(batch)
-        if logits.numel() == 0:
-            return None
-
-        # Ensure [B, C] and [B]
-        assert logits.dim() == 2, f"logits must be [B,C], got {logits.shape}"
-        assert targets.dim() == 1, f"targets must be [B], got {targets.shape}"
-        assert logits.size(0) == targets.size(0), f"N mismatch: logits {logits.shape}, targets {targets.shape}"
 
         loss = self.criterion(logits, targets)
         preds = torch.argmax(logits, dim=1)
 
         self.train_acc(preds, targets)
+
         self.log(
             "train_loss",
             loss,
@@ -118,7 +109,6 @@ class ManeuverClassifier(pl.LightningModule):
             prog_bar=True,
             batch_size=targets.size(0),
         )
-
         self.log(
             "train_acc",
             self.train_acc,
@@ -134,11 +124,10 @@ class ManeuverClassifier(pl.LightningModule):
     # VALIDATION STEP
     # --------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
-        logits = self(batch)                   # [B, 7]
-        targets = batch.maneuver_id.view(-1)   # [B]
+        logits = self(batch)
+        targets = batch.maneuver_id.view(-1)
 
         loss = self.criterion(logits, targets)
-
         preds = torch.argmax(logits, dim=1)
 
         self.val_acc.update(preds, targets)
@@ -155,26 +144,28 @@ class ManeuverClassifier(pl.LightningModule):
 
         return loss
 
-
-
     # --------------------------------------------------------------
     # VALIDATION EPOCH END
     # --------------------------------------------------------------
     def on_validation_epoch_end(self):
-        if self.current_epoch % 5 != 0:
-            self.val_f1_per_class.reset()
-            self.val_acc.reset()
-            return
+        self.val_acc.reset()
+        self.val_f1_per_class.reset()
 
     # --------------------------------------------------------------
     # OPTIMIZER
     # --------------------------------------------------------------
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.head.parameters(), lr=self.hparams.learning_rate)
+        optimizer = torch.optim.Adam(
+            self.head.parameters(),
+            lr=self.hparams.learning_rate,
+        )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=5
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"},
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+            },
         }

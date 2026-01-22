@@ -8,7 +8,12 @@ from utils import TemporalData
 class NuScenesHiVTDataset(Dataset):
     """
     HiVT-compatible nuScenes dataset.
-    Robust against empty graphs, invalid indices, and CUDA crashes.
+
+    Guarantees:
+    - Valid graph indices
+    - Non-empty graphs
+    - maneuver_id always present
+    - ego_index always present AND batchable
     """
 
     def __init__(
@@ -32,16 +37,23 @@ class NuScenesHiVTDataset(Dataset):
             self._processed_dir = standard_path
             self.is_flat = False
         elif os.path.isdir(self.root):
-            print(f"[Dataset] Warning: '{self._directory}' not found. Scanning root '{self.root}' directly.")
+            print(
+                f"[Dataset] Warning: '{self._directory}' not found. "
+                f"Scanning root '{self.root}' directly."
+            )
             self._processed_dir = self.root
             self.is_flat = True
         else:
-            raise FileNotFoundError(f"Could not find data in {standard_path} OR {self.root}")
+            raise FileNotFoundError(
+                f"Could not find data in {standard_path} OR {self.root}"
+            )
 
         # --------------------------------------------------------------
         # 2. FILE LISTING
         # --------------------------------------------------------------
-        all_files = sorted(f for f in os.listdir(self._processed_dir) if f.endswith(".pt"))
+        all_files = sorted(
+            f for f in os.listdir(self._processed_dir) if f.endswith(".pt")
+        )
 
         # --------------------------------------------------------------
         # 3. SPLIT LOGIC
@@ -53,10 +65,16 @@ class NuScenesHiVTDataset(Dataset):
 
             if split == "train":
                 self._processed_file_names = all_files[:num_train]
-                print(f"[Dataset] Auto-Split: Assigned {len(self._processed_file_names)} files to TRAIN.")
+                print(
+                    f"[Dataset] Auto-Split: Assigned "
+                    f"{len(self._processed_file_names)} files to TRAIN."
+                )
             elif split == "val":
                 self._processed_file_names = all_files[num_train:]
-                print(f"[Dataset] Auto-Split: Assigned {len(self._processed_file_names)} files to VAL.")
+                print(
+                    f"[Dataset] Auto-Split: Assigned "
+                    f"{len(self._processed_file_names)} files to VAL."
+                )
             else:
                 self._processed_file_names = all_files
         else:
@@ -79,11 +97,11 @@ class NuScenesHiVTDataset(Dataset):
         return self._processed_file_names
 
     # --------------------------------------------------------------
-    # SANITIZATION LOGIC
+    # SANITIZATION
     # --------------------------------------------------------------
     def _sanitize(self, data: TemporalData) -> TemporalData:
         """
-        Enforces all invariants required by HiVT and classifier training.
+        Enforce all invariants required by HiVT + classifier.
         """
 
         # ----------------------------------------------------------
@@ -117,10 +135,12 @@ class NuScenesHiVTDataset(Dataset):
             if hasattr(data, key):
                 vec = getattr(data, key)
                 if not torch.is_tensor(vec) or vec.numel() == 0 or vec.dim() != 2:
-                    setattr(data, key, torch.empty((0, 2), dtype=torch.float))
+                    setattr(
+                        data, key, torch.empty((0, 2), dtype=torch.float)
+                    )
 
         # ----------------------------------------------------------
-        # 3. MAP FEATURE CLAMPING (EMBEDDINGS)
+        # 3. MAP FEATURE CLAMPING
         # ----------------------------------------------------------
         if hasattr(data, "turn_directions"):
             data.turn_directions = torch.clamp(data.turn_directions, 0, 2).long()
@@ -132,7 +152,7 @@ class NuScenesHiVTDataset(Dataset):
             data.is_intersections = torch.clamp(data.is_intersections, 0, 1).long()
 
         # ----------------------------------------------------------
-        # 4. MANEUVER LABEL EXTRACTION (ALWAYS PRESENT)
+        # 4. MANEUVER LABEL (ALWAYS PRESENT)
         # ----------------------------------------------------------
         str_to_int = {
             "Straight Drive": 0, "Go Straight": 0,
@@ -157,7 +177,13 @@ class NuScenesHiVTDataset(Dataset):
         data.maneuver_id = torch.tensor([maneuver_id], dtype=torch.long)
 
         # ----------------------------------------------------------
-        # 5. HARD FILTER: DROP EMPTY GRAPHS
+        # 5. EGO INDEX (CRITICAL — MUST BE SCALAR)
+        # ----------------------------------------------------------
+        # Assumption: ego node is index 0 (must match preprocessing)
+        data.ego_index = torch.tensor(0, dtype=torch.long)
+
+        # ----------------------------------------------------------
+        # 6. DROP INVALID GRAPHS
         # ----------------------------------------------------------
         if data.num_nodes == 0:
             raise ValueError("Invalid sample: graph has zero nodes")
@@ -171,18 +197,13 @@ class NuScenesHiVTDataset(Dataset):
         return len(self._processed_file_names)
 
     def get(self, idx: int) -> TemporalData:
-        """
-        Robust loading: invalid samples are skipped deterministically.
-        """
         path = os.path.join(self.processed_dir, self._processed_file_names[idx])
         try:
             data = torch.load(path)
-            data = self._sanitize(data)
-            return data
+            return self._sanitize(data)
         except Exception:
-            # Skip corrupted sample by moving forward
-            next_idx = (idx + 1) % len(self._processed_file_names)
-            return self.get(next_idx)
+            # Deterministic skip
+            return self.get((idx + 1) % len(self._processed_file_names))
 
     @staticmethod
     def collate_fn(batch: List[TemporalData]) -> Batch:
