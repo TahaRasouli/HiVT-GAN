@@ -132,13 +132,13 @@ def main():
 
 
     trainer = pl.Trainer(
-    accelerator="gpu",
-    devices=1,
-    strategy="single_device",   # important
-    precision="16-mixed",
-    num_sanity_val_steps=0,
-    limit_val_batches=0, 
-    check_val_every_n_epoch=1,
+        accelerator="gpu",
+        devices=1,                     # explicit
+        strategy="single_device",       # avoid NCCL/DDP entirely
+        precision="16-mixed",
+        max_epochs=args.max_epochs,
+        num_sanity_val_steps=0,         # you already debugged val
+        logger=True,
     )
 
     print("[Info] Starting Linear Probe Training...")
