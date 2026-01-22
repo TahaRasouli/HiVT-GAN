@@ -124,8 +124,9 @@ def main():
     )
     
     early_stop = EarlyStopping(monitor="val_loss", patience=5, mode="min")
-
     use_gpu = torch.cuda.is_available() and args.devices > 0
+    strategy = DDPStrategy(find_unused_parameters=True) if use_gpu else "auto"
+
 
     trainer = pl.Trainer(
         accelerator="gpu" if use_gpu else "cpu",
