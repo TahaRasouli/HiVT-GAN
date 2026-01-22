@@ -80,63 +80,40 @@ class ManeuverClassifier(pl.LightningModule):
                 f"Expected backbone output [1, total_nodes, D], got {tuple(out.shape)}"
             )
 
-        assert hasattr(batch, "ptr"), "Batch missing ptr"
         assert hasattr(batch, "ego_index"), "Batch missing ego_index"
 
-        ptr = batch.ptr.long()                    # [num_graphs + 1]
-        ego_idx = batch.ego_index.long()          # [num_graphs]
-        num_graphs = int(batch.num_graphs)
+        ego_idx = batch.ego_index.long().to(out.device)  # GLOBAL indices
         total_nodes = int(out.size(1))
 
-        if ego_idx.numel() != num_graphs:
+        # --------------------------------------------------
+        # Validate GLOBAL ego indices
+        # --------------------------------------------------
+        if ego_idx.min() < 0 or ego_idx.max() >= total_nodes:
             raise RuntimeError(
-                f"ego_index length mismatch: expected {num_graphs}, got {ego_idx.numel()}"
-            )
-
-        # --------------------------------------------------
-        # Compute global ego indices (LOCAL → GLOBAL)
-        # --------------------------------------------------
-        nodes_per_graph = ptr[1:] - ptr[:-1]
-
-        if not torch.all((ego_idx >= 0) & (ego_idx < nodes_per_graph)):
-            raise RuntimeError(
-                f"Invalid ego_index (must be local per graph). "
-                f"ego_idx min={int(ego_idx.min())}, max={int(ego_idx.max())}, "
-                f"nodes_per_graph min={int(nodes_per_graph.min())}, "
-                f"max={int(nodes_per_graph.max())}"
-            )
-
-        ego_global = ptr[:-1] + ego_idx  # [num_graphs]
-
-        # --------------------------------------------------
-        # Final bounds check (CUDA-safe)
-        # --------------------------------------------------
-        if ego_global.min() < 0 or ego_global.max() >= total_nodes:
-            raise RuntimeError(
-                f"Computed ego_global out of bounds. "
-                f"min={int(ego_global.min())}, max={int(ego_global.max())}, "
+                f"Invalid GLOBAL ego_index. "
+                f"min={int(ego_idx.min())}, max={int(ego_idx.max())}, "
                 f"total_nodes={total_nodes}"
             )
 
         # --------------------------------------------------
-        # DEBUG (only once)
+        # DEBUG (once)
         # --------------------------------------------------
         if self.global_step == 0:
             print("backbone out shape:", tuple(out.shape))
-            print("num_graphs:", num_graphs)
             print("total_nodes:", total_nodes)
-            print("ego_idx min/max:",
+            print("num_graphs:", int(batch.num_graphs))
+            print("ego_index shape:", tuple(ego_idx.shape))
+            print("ego_index min/max:",
                 int(ego_idx.min()), int(ego_idx.max()))
-            print("ego_global min/max:",
-                int(ego_global.min()), int(ego_global.max()))
 
         # --------------------------------------------------
-        # Extract ego embeddings
+        # Extract ego embeddings (GLOBAL indexing)
         # --------------------------------------------------
-        ego_embeds = out[0, ego_global, :]  # [num_graphs, D]
+        ego_embeds = out[0, ego_idx, :]  # [num_graphs, D]
 
-        logits = self.head(ego_embeds)      # [num_graphs, num_classes]
+        logits = self.head(ego_embeds)   # [num_graphs, num_classes]
         return logits
+
 
 
 
