@@ -40,13 +40,17 @@ class TemporalData(Data):
 
 
     def __cat_dim__(self, key, value, store=None):
-        # Indices are concatenated along dim=1 in PyG
-        # if key in ("edge_index", "lane_actor_index"):
-        #     return 1
-        # return super().__cat_dim__(key, value, store)
+        # Graph-level attributes (DO NOT concatenate)
         if key == "ego_index":
             return None
-        return super().__cat_dim__(key, value, *args, **kwargs)
+
+        # Index tensors concatenate along dim=1
+        if key in ("edge_index", "lane_actor_index"):
+            return 1
+
+        # Default PyG behavior
+        return super().__cat_dim__(key, value, store)
+
 
     def __inc__(self, key, value, store=None):
         if key == "edge_index":
