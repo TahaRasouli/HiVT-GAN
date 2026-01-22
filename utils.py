@@ -39,17 +39,17 @@ class TemporalData(Data):
                 self[f'edge_attr_{t}'] = edge_attrs[t]
 
 
-    def __cat_dim__(self, key, value, store=None):
-        # Graph-level attributes (DO NOT concatenate)
-        if key == "ego_index":
-            return None
-
-        # Index tensors concatenate along dim=1
+    def __cat_dim__(self, key, value, store=None, *args, **kwargs):
+        # Indices concatenated along dim=1
         if key in ("edge_index", "lane_actor_index"):
             return 1
 
-        # Default PyG behavior
-        return super().__cat_dim__(key, value, store)
+        # Per-graph scalar attributes concatenated along dim=0 -> [B]
+        if key in ("ego_index", "maneuver_id"):
+            return 0
+
+        return super().__cat_dim__(key, value, store, *args, **kwargs)
+
 
 
     def __inc__(self, key, value, store=None):

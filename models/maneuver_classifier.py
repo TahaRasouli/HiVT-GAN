@@ -69,6 +69,9 @@ class ManeuverClassifier(pl.LightningModule):
         with torch.no_grad():
             out = self.backbone(batch)
             if self.global_step == 0:
+                print("ego_idx min/max:", int(ego_idx.min().cpu()), int(ego_idx.max().cpu()))
+                print("nodes_per_graph min/max:", int(nodes_per_graph.min().cpu()), int(nodes_per_graph.max().cpu()))
+
                 print("backbone out shape:", tuple(out.shape))
                 if hasattr(batch, "ptr"):
                     print("ptr[-1] total_nodes:", int(batch.ptr[-1]))
@@ -92,8 +95,40 @@ class ManeuverClassifier(pl.LightningModule):
             ego_embeds = global_embed  # already one embedding per graph
 
         # [1, num_graphs, D]
-        elif global_embed.dim() == 3 and global_embed.size(0) == 1 and global_embed.size(1) == num_graphs:
-            ego_embeds = global_embed[0]  # [num_graphs, D]
+        elif global_embed.dim() == 3 and global_embed.size(0) == 1:
+            assert hasattr(batch, "ptr"), "Batch missing ptr (required for flattened node offsets)"
+
+            ptr = batch.ptr.long()
+            ego_idx = batch.ego_index.to(global_embed.device).long()  # [B]
+            nodes_per_graph = (ptr[1:] - ptr[:-1]).to(ego_idx.device)  # [B]
+
+            total_nodes = int(global_embed.size(1))
+
+            # Case C1: ego_index is LOCAL within each graph
+            if torch.all((ego_idx >= 0) & (ego_idx < nodes_per_graph)):
+                ego_global = (ptr[:-1].to(ego_idx.device) + ego_idx)
+
+            # Case C2: ego_index is already GLOBAL
+            elif torch.all((ego_idx >= 0) & (ego_idx < total_nodes)):
+                ego_global = ego_idx
+
+            else:
+                raise RuntimeError(
+                    f"ego_index is neither local nor global valid. "
+                    f"ego_idx min={int(ego_idx.min().cpu())}, max={int(ego_idx.max().cpu())}, "
+                    f"nodes_per_graph min={int(nodes_per_graph.min().cpu())}, max={int(nodes_per_graph.max().cpu())}, "
+                    f"total_nodes={total_nodes}"
+                )
+
+            # Final bounds check (prevents CUDA abort)
+            max_idx = int(ego_global.max().detach().cpu())
+            min_idx = int(ego_global.min().detach().cpu())
+            if min_idx < 0 or max_idx >= total_nodes:
+                raise RuntimeError(
+                    f"Computed ego_global out of bounds. min={min_idx}, max={max_idx}, total_nodes={total_nodes}"
+                )
+
+            ego_embeds = global_embed[0, ego_global, :]  # [B, D]
 
         # -------- Case B: graph-batched node embeddings --------
         # [num_graphs, N, D]  (N nodes-per-graph, padded or fixed)
