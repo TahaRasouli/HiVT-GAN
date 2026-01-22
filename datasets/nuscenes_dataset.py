@@ -5,16 +5,10 @@ from typing import Optional
 from torch_geometric.data import Dataset, Batch
 from utils import TemporalData
 
-# --- UPDATED MAPPING ---
+# --- MAPPING ---
 MANEUVER_MAP = {
-    "Straight Drive": 0,
-    "Left Turn": 1,
-    "Right Turn": 2,
-    "U-Turn": 3,
-    "Lane Change Left": 4,
-    "Lane Change Right": 5,
-    "Stationary Stop": 6,
-    "Unknown": -1
+    "Straight Drive": 0, "Left Turn": 1, "Right Turn": 2, "U-Turn": 3,
+    "Lane Change Left": 4, "Lane Change Right": 5, "Stationary Stop": 6, "Unknown": -1
 }
 
 LANE_TYPE_MAP = {
@@ -63,61 +57,41 @@ class NuScenesHiVTDataset(Dataset):
             print(f"Corrupt file: {path}")
             return self.get((idx + 1) % len(self))
 
-        # 1. Sanitize FIRST (Fixes bad indices before we do anything else)
+        # --- CRITICAL: SANITIZE BEFORE ANYTHING ELSE ---
         data = self._sanitize(data)
         
-        # --- [FIX] INJECT MISSING ROTATE_MAT ---
-        # The model expects 'rotate_mat'. If missing, we create an Identity matrix.
-        if not hasattr(data, 'rotate_mat') and 'rotate_mat' not in data:
-            # Determine number of nodes (agents) to shape the matrix correctly
-            if hasattr(data, 'x') and data.x is not None:
-                num_nodes = data.x.size(0)
-            elif hasattr(data, 'num_nodes'):
-                num_nodes = data.num_nodes
-            else:
-                num_nodes = 1 # Fallback
-            
-            # Create Identity Matrix: [num_nodes, 2, 2]
+        # --- INJECT MISSING ROTATE_MAT ---
+        if not hasattr(data, 'rotate_mat') or data.rotate_mat is None:
+            # Use the sanitized num_nodes
+            num_nodes = data.num_nodes 
             identity_rot = torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_nodes, 1, 1)
             data.rotate_mat = identity_rot
 
-        # --- 2. ROBUST CAPTION EXTRACTION ---
-        cap_dict = {}
-        if isinstance(data, dict):
-             cap_dict = data.get('caption_dict', {})
-        else:
-             cap_dict = getattr(data, 'caption_dict', {})
-
-        # Extract components (defaults if missing)
+        # --- CAPTION EXTRACTION ---
+        cap_dict = getattr(data, 'caption_dict', {}) if not isinstance(data, dict) else data.get('caption_dict', {})
+        
         man_text = cap_dict.get('maneuver_type', "")
         lane_text = cap_dict.get('lane_status', "")
         scene_desc = cap_dict.get('scene_description', "")
         
-        # Fallback for category logic
         cat_str = getattr(data, 'maneuver_category', "Unknown")
         if isinstance(cat_str, list): cat_str = cat_str[0]
         
-        # --- 3. CONSTRUCT FULL TEXT ---
         full_text = f"{man_text} {lane_text} {scene_desc}".strip()
         if len(full_text) < 5: full_text = "Traffic scene."
 
-        # --- 4. BERT TOKENIZATION ---
+        # --- BERT TOKENIZATION ---
         if self.tokenizer is not None:
             enc = self.tokenizer(
-                full_text, 
-                return_tensors='pt', 
-                padding='max_length', 
-                truncation=True, 
-                max_length=64 
+                full_text, return_tensors='pt', padding='max_length', truncation=True, max_length=64 
             )
             data.input_ids = enc['input_ids'].squeeze(0)
             data.attention_mask = enc['attention_mask'].squeeze(0)
 
-        # --- 5. MAP LABELS FOR AUX LOSS ---
+        # --- LABELS ---
         m_id = MANEUVER_MAP.get(cat_str, -1)
         data.maneuver_id = torch.tensor([m_id], dtype=torch.long)
-        data.maneuver_category = cat_str
-
+        
         l_type = cap_dict.get('lane_type', "Unknown")
         l_id = -1
         for key, val in LANE_TYPE_MAP.items():
@@ -127,70 +101,81 @@ class NuScenesHiVTDataset(Dataset):
         return data
 
     def _sanitize(self, data):
-        # 1. Determine Valid Limits
-        num_nodes = 0
-        if hasattr(data, 'x') and data.x is not None:
-            num_nodes = data.x.size(0)
-        elif hasattr(data, 'num_nodes'):
-            num_nodes = data.num_nodes
+        """
+        The Nuclear Option: Strictly enforce index bounds to prevent
+        local_encoder.py and global_interactor.py from crashing.
+        """
+        
+        # 1. ESTABLISH GROUND TRUTH SIZES
+        # We trust 'x' (Actors) and 'lane_vectors' (Lanes) as the source of truth.
+        
+        # Check Actors
+        if hasattr(data, 'x') and torch.is_tensor(data.x):
+            real_num_nodes = data.x.size(0)
+        else:
+            # Fallback if x is missing (unlikely in HiVT)
+            real_num_nodes = data.num_nodes if hasattr(data, 'num_nodes') else 0
+        
+        # FORCE data.num_nodes to match x. 
+        # This fixes PyG Batching offsets.
+        data.num_nodes = real_num_nodes
 
-        num_lanes = 0
+        # Check Lanes
         if hasattr(data, 'lane_vectors') and torch.is_tensor(data.lane_vectors):
-            num_lanes = data.lane_vectors.size(0)
+            real_num_lanes = data.lane_vectors.size(0)
+        else:
+            real_num_lanes = 0
+            data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
 
-        # 2. Fix Lane-Actor Index (The Source of the Crash)
+        # 2. SANITIZE LANE-ACTOR INDICES (The source of your crash)
+        # Structure: [2, E] -> Row 0: Lane Index, Row 1: Actor Index
         if hasattr(data, "lane_actor_index"):
-             lai = data.lane_actor_index
-             
-             # Ensure tensor structure
-             if not torch.is_tensor(lai) or lai.numel() == 0:
-                 data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
-             else:
-                 if lai.dim() == 1: 
-                     lai = lai.reshape(2, 1)
-                 
-                 # --- CRITICAL FILTERING ---
-                 # Check Row 0 against num_lanes
-                 mask_lanes = (lai[0] < num_lanes) & (lai[0] >= 0)
-                 
-                 # Check Row 1 against num_nodes
-                 mask_actors = (lai[1] < num_nodes) & (lai[1] >= 0)
-                 
-                 # Only keep edges where BOTH are valid
-                 valid_mask = mask_lanes & mask_actors
+            lai = data.lane_actor_index
+            
+            # If we have NO lanes, we cannot have ANY connections.
+            if real_num_lanes == 0 or not torch.is_tensor(lai) or lai.numel() == 0:
+                data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
+                data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
+            else:
+                if lai.dim() == 1: lai = lai.reshape(2, 1)
+                
+                # Filter Out-of-Bounds
+                # Row 0 must be < real_num_lanes
+                # Row 1 must be < real_num_nodes
+                mask_lanes = (lai[0] < real_num_lanes) & (lai[0] >= 0)
+                mask_actors = (lai[1] < real_num_nodes) & (lai[1] >= 0)
+                valid_mask = mask_lanes & mask_actors
+                
+                # Apply Mask
+                data.lane_actor_index = lai[:, valid_mask]
+                
+                # Handle vectors
+                if hasattr(data, "lane_actor_vectors") and torch.is_tensor(data.lane_actor_vectors):
+                    if data.lane_actor_vectors.shape[0] == valid_mask.shape[0]:
+                        data.lane_actor_vectors = data.lane_actor_vectors[valid_mask]
+                    else:
+                        # If shapes don't match, the vectors are garbage. Reset them.
+                        data.lane_actor_vectors = torch.empty((data.lane_actor_index.shape[1], 2), dtype=torch.float)
 
-                 # Apply filter
-                 data.lane_actor_index = lai[:, valid_mask]
-                 
-                 # Also sync the 'lane_actor_vectors' if they exist
-                 if hasattr(data, "lane_actor_vectors") and torch.is_tensor(data.lane_actor_vectors):
-                     # Only filter if shapes match (just in case)
-                     if data.lane_actor_vectors.shape[0] == lai.shape[1]:
-                         data.lane_actor_vectors = data.lane_actor_vectors[valid_mask]
-                     elif data.lane_actor_vectors.shape[0] == 0:
-                         pass # It's already empty
-                     else:
-                         # Mismatch shape: unsafe to keep, clear it to be safe
-                         data.lane_actor_vectors = torch.empty((data.lane_actor_index.shape[1], 2), dtype=torch.float)
-
-        # 3. Standard Safety Checks for Empty Vectors
-        if hasattr(data, "lane_actor_vectors"):
-             lav = data.lane_actor_vectors
-             if not torch.is_tensor(lav) or lav.numel() == 0:
-                 data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
-
-        if hasattr(data, "lane_vectors"):
-             lv = data.lane_vectors
-             if not torch.is_tensor(lv) or lv.numel() == 0:
-                 data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
-                 
+        # 3. SANITIZE EDGE_INDEX (Agent-Agent interactions)
         if hasattr(data, "edge_index"):
-             ei = data.edge_index
-             if ei.numel() == 0: 
-                 data.edge_index = ei.reshape(2, 0)
-             elif ei.dim() == 1: 
-                 data.edge_index = ei.reshape(2, 1)
-                 
+            ei = data.edge_index
+            if not torch.is_tensor(ei) or ei.numel() == 0:
+                data.edge_index = torch.empty((2, 0), dtype=torch.long)
+            else:
+                if ei.dim() == 1: ei = ei.reshape(2, 1)
+                
+                # Both rows must be < real_num_nodes
+                mask_src = (ei[0] < real_num_nodes) & (ei[0] >= 0)
+                mask_dst = (ei[1] < real_num_nodes) & (ei[1] >= 0)
+                valid_mask = mask_src & mask_dst
+                
+                data.edge_index = ei[:, valid_mask]
+                
+                # We don't sanitize edge_attr here because global_interactor 
+                # recalculates relative positions on the fly usually, 
+                # but if there are specific attributes, they should be filtered here too.
+
         return data
 
     @staticmethod
