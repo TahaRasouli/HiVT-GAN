@@ -54,30 +54,42 @@ class ManeuverClassifier(pl.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
+        targets = batch.maneuver_id.view(-1).long()
+
+        if targets.numel() == 0:
+            return None
+
         logits = self(batch)
-        targets = batch.maneuver_id.squeeze().long()
-        
         loss = self.criterion(logits, targets)
+
         preds = torch.argmax(logits, dim=1)
-        
         self.train_acc(preds, targets)
+
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train_acc", self.train_acc, on_epoch=True, prog_bar=True)
+
         return loss
 
+
     def validation_step(self, batch, batch_idx):
+        # Extract targets FIRST
+        targets = batch.maneuver_id.view(-1).long()
+
+        # HARD GUARD: skip empty validation batches
+        if targets.numel() == 0:
+            return None
+
         logits = self(batch)
-        targets = batch.maneuver_id.squeeze().long()
-        
+
         loss = self.criterion(logits, targets)
         preds = torch.argmax(logits, dim=1)
-        
-        # Update metrics
+
         self.val_acc(preds, targets)
         self.val_f1_per_class(preds, targets)
-        
+
         self.log("val_loss", loss, prog_bar=True)
         return loss
+
 
     def on_validation_epoch_end(self):
         """
