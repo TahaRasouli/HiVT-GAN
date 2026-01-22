@@ -15,6 +15,18 @@ LANE_TYPE_MAP = {
     "Single-lane": 0, "2-lane": 1, "3-lane": 2, "4-lane": 3, "Multi-lane": 4, "Unknown": -1
 }
 
+# --- CRITICAL FIX: Custom Data Class for Correct Batching ---
+class HiVTTemporalData(TemporalData):
+    def __inc__(self, key, value, *args, **kwargs):
+        if key == 'lane_actor_index':
+            # Bipartite graph handling:
+            # Row 0 (Lanes) -> Increment by number of lanes
+            # Row 1 (Actors) -> Increment by number of nodes
+            return (self['lane_vectors'].size(0), self.num_nodes)
+        else:
+            # Default behavior for edge_index, etc.
+            return super().__inc__(key, value, *args, **kwargs)
+
 class NuScenesHiVTDataset(Dataset):
     def __init__(
         self,
@@ -45,7 +57,7 @@ class NuScenesHiVTDataset(Dataset):
     def len(self) -> int:
         return len(self._file_paths)
 
-    def get(self, idx: int) -> TemporalData:
+    def get(self, idx: int):
         path = self._file_paths[idx]
         try:
             # Load with weights_only=False to support custom objects
@@ -57,17 +69,16 @@ class NuScenesHiVTDataset(Dataset):
             print(f"Corrupt file: {path}")
             return self.get((idx + 1) % len(self))
 
-        # --- CRITICAL: SANITIZE BEFORE ANYTHING ELSE ---
+        # 1. Sanitize Data (Remove bad indices)
         data = self._sanitize(data)
         
-        # --- INJECT MISSING ROTATE_MAT ---
+        # 2. Inject Rotate Mat if missing
         if not hasattr(data, 'rotate_mat') or data.rotate_mat is None:
-            # Use the sanitized num_nodes
             num_nodes = data.num_nodes 
             identity_rot = torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_nodes, 1, 1)
             data.rotate_mat = identity_rot
 
-        # --- CAPTION EXTRACTION ---
+        # 3. Extract Text/Labels
         cap_dict = getattr(data, 'caption_dict', {}) if not isinstance(data, dict) else data.get('caption_dict', {})
         
         man_text = cap_dict.get('maneuver_type', "")
@@ -80,7 +91,6 @@ class NuScenesHiVTDataset(Dataset):
         full_text = f"{man_text} {lane_text} {scene_desc}".strip()
         if len(full_text) < 5: full_text = "Traffic scene."
 
-        # --- BERT TOKENIZATION ---
         if self.tokenizer is not None:
             enc = self.tokenizer(
                 full_text, return_tensors='pt', padding='max_length', truncation=True, max_length=64 
@@ -88,7 +98,6 @@ class NuScenesHiVTDataset(Dataset):
             data.input_ids = enc['input_ids'].squeeze(0)
             data.attention_mask = enc['attention_mask'].squeeze(0)
 
-        # --- LABELS ---
         m_id = MANEUVER_MAP.get(cat_str, -1)
         data.maneuver_id = torch.tensor([m_id], dtype=torch.long)
         
@@ -98,83 +107,68 @@ class NuScenesHiVTDataset(Dataset):
             if key in l_type: l_id = val; break
         data.lane_type_id = torch.tensor([l_id], dtype=torch.long)
         
-        return data
+        # --- 4. CONVERT TO HiVTTemporalData ---
+        # We must cast the data object to our custom class to enable the 
+        # correct __inc__ logic during batching.
+        safe_data = HiVTTemporalData()
+        for key, value in data.to_dict().items():
+            safe_data[key] = value
+            
+        # Ensure num_nodes is carried over explicitly
+        safe_data.num_nodes = data.num_nodes
+        
+        return safe_data
 
     def _sanitize(self, data):
         """
-        The Nuclear Option: Strictly enforce index bounds to prevent
-        local_encoder.py and global_interactor.py from crashing.
+        Sanitizes input data to ensure index validity.
         """
-        
-        # 1. ESTABLISH GROUND TRUTH SIZES
-        # We trust 'x' (Actors) and 'lane_vectors' (Lanes) as the source of truth.
-        
-        # Check Actors
+        # 1. ESTABLISH TRUTH
         if hasattr(data, 'x') and torch.is_tensor(data.x):
             real_num_nodes = data.x.size(0)
         else:
-            # Fallback if x is missing (unlikely in HiVT)
             real_num_nodes = data.num_nodes if hasattr(data, 'num_nodes') else 0
-        
-        # FORCE data.num_nodes to match x. 
-        # This fixes PyG Batching offsets.
         data.num_nodes = real_num_nodes
 
-        # Check Lanes
         if hasattr(data, 'lane_vectors') and torch.is_tensor(data.lane_vectors):
             real_num_lanes = data.lane_vectors.size(0)
         else:
             real_num_lanes = 0
             data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
 
-        # 2. SANITIZE LANE-ACTOR INDICES (The source of your crash)
-        # Structure: [2, E] -> Row 0: Lane Index, Row 1: Actor Index
+        # 2. SANITIZE LANE-ACTOR INDICES
         if hasattr(data, "lane_actor_index"):
             lai = data.lane_actor_index
             
-            # If we have NO lanes, we cannot have ANY connections.
             if real_num_lanes == 0 or not torch.is_tensor(lai) or lai.numel() == 0:
                 data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
                 data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
             else:
                 if lai.dim() == 1: lai = lai.reshape(2, 1)
                 
-                # Filter Out-of-Bounds
-                # Row 0 must be < real_num_lanes
-                # Row 1 must be < real_num_nodes
+                # Row 0 < num_lanes, Row 1 < num_nodes
                 mask_lanes = (lai[0] < real_num_lanes) & (lai[0] >= 0)
                 mask_actors = (lai[1] < real_num_nodes) & (lai[1] >= 0)
                 valid_mask = mask_lanes & mask_actors
                 
-                # Apply Mask
                 data.lane_actor_index = lai[:, valid_mask]
                 
-                # Handle vectors
                 if hasattr(data, "lane_actor_vectors") and torch.is_tensor(data.lane_actor_vectors):
                     if data.lane_actor_vectors.shape[0] == valid_mask.shape[0]:
                         data.lane_actor_vectors = data.lane_actor_vectors[valid_mask]
                     else:
-                        # If shapes don't match, the vectors are garbage. Reset them.
                         data.lane_actor_vectors = torch.empty((data.lane_actor_index.shape[1], 2), dtype=torch.float)
 
-        # 3. SANITIZE EDGE_INDEX (Agent-Agent interactions)
+        # 3. SANITIZE EDGE_INDEX
         if hasattr(data, "edge_index"):
             ei = data.edge_index
             if not torch.is_tensor(ei) or ei.numel() == 0:
                 data.edge_index = torch.empty((2, 0), dtype=torch.long)
             else:
                 if ei.dim() == 1: ei = ei.reshape(2, 1)
-                
-                # Both rows must be < real_num_nodes
                 mask_src = (ei[0] < real_num_nodes) & (ei[0] >= 0)
                 mask_dst = (ei[1] < real_num_nodes) & (ei[1] >= 0)
-                valid_mask = mask_src & mask_dst
-                
-                data.edge_index = ei[:, valid_mask]
-                
-                # We don't sanitize edge_attr here because global_interactor 
-                # recalculates relative positions on the fly usually, 
-                # but if there are specific attributes, they should be filtered here too.
+                data.edge_index = ei[:, mask_src & mask_dst]
 
         return data
 
