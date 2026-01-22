@@ -67,27 +67,52 @@ class ManeuverClassifier(pl.LightningModule):
     def forward(self, batch):
         self.backbone.eval()
         with torch.no_grad():
-            global_embed = self.backbone(batch)  # [B, N, 128]
+            global_embed = self.backbone(batch)
 
-        assert global_embed.dim() == 3, (
-            f"Expected [B, N, D], got {global_embed.shape}"
-        )
-
-        B, N, D = global_embed.shape
-
+        num_graphs = batch.num_graphs
         assert hasattr(batch, "ego_index"), "Batch missing ego_index"
-        assert batch.ego_index.numel() == B, (
-            f"ego_index must have length B={B}, "
+
+        # ego_index should be one per graph
+        assert batch.ego_index.numel() == num_graphs, (
+            f"ego_index must have length num_graphs={num_graphs}, "
             f"got {batch.ego_index.numel()}"
         )
 
-        ego_embeds = global_embed[
-            torch.arange(B, device=global_embed.device),
-            batch.ego_index
-        ]  # [B, 128]
+        # ------------------------------------------------------------
+        # Case 1: [num_graphs, N, D]  (graph-batched)
+        # ------------------------------------------------------------
+        if global_embed.dim() == 3 and global_embed.size(0) == num_graphs:
+            ego_embeds = global_embed[
+                torch.arange(num_graphs, device=global_embed.device),
+                batch.ego_index
+            ]  # [num_graphs, D]
 
-        logits = self.head(ego_embeds)  # [B, num_classes]
+        # ------------------------------------------------------------
+        # Case 2: [1, total_nodes, D] (single-batch)
+        # ------------------------------------------------------------
+        elif global_embed.dim() == 3 and global_embed.size(0) == 1:
+            assert hasattr(batch, "ptr"), "Batch missing ptr (required for node offsets)"
+            # ptr: [num_graphs + 1] node offsets
+            ego_global = batch.ptr[:-1].to(global_embed.device) + batch.ego_index.to(global_embed.device)
+            ego_embeds = global_embed[0, ego_global, :]  # [num_graphs, D]
+
+        # ------------------------------------------------------------
+        # Case 3: [total_nodes, D] (fully flattened)
+        # ------------------------------------------------------------
+        elif global_embed.dim() == 2:
+            assert hasattr(batch, "ptr"), "Batch missing ptr (required for node offsets)"
+            ego_global = batch.ptr[:-1].to(global_embed.device) + batch.ego_index.to(global_embed.device)
+            ego_embeds = global_embed[ego_global, :]  # [num_graphs, D]
+
+        else:
+            raise RuntimeError(
+                f"Unsupported backbone output shape {tuple(global_embed.shape)} "
+                f"for num_graphs={num_graphs}"
+            )
+
+        logits = self.head(ego_embeds)  # [num_graphs, num_classes]
         return logits
+
 
     # --------------------------------------------------------------
     # TRAINING STEP
@@ -126,7 +151,7 @@ class ManeuverClassifier(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         if batch_idx == 0:
             print("ego_index shape:", batch.ego_index.shape)
-            
+
         logits = self(batch)
         targets = batch.maneuver_id.view(-1)
 
