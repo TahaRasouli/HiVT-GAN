@@ -154,19 +154,14 @@ class CVAEDecoder(nn.Module):
         self.num_modes = num_modes
         self.future_steps = future_steps
         
-        # 1. Posterior Network (Encoder)
-        # Input: Context + Ground Truth Trajectory (Flattened)
-        # Output: Mean and LogVariance for z
+        # 1. Posterior & 2. Prior (Keep existing code...)
         self.posterior_net = nn.Sequential(
             nn.Linear(embed_dim + future_steps * 2, embed_dim),
             nn.LayerNorm(embed_dim),
             nn.ReLU(),
-            nn.Linear(embed_dim, latent_dim * 2) # Outputs [mu, logvar]
+            nn.Linear(embed_dim, latent_dim * 2)
         )
         
-        # 2. Prior Network
-        # Input: Context only
-        # Output: Mean and LogVariance for z
         self.prior_net = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.LayerNorm(embed_dim),
@@ -174,64 +169,68 @@ class CVAEDecoder(nn.Module):
             nn.Linear(embed_dim, latent_dim * 2)
         )
         
-        # 3. Generator (The Decoder)
-        # Input: Context + Sampled z
-        # Output: Predicted Trajectory
-        self.generator = nn.Sequential(
+        # 3. Generator Feature Extractor (Shared)
+        # We split the original generator so we can access the hidden state
+        self.generator_features = nn.Sequential(
             nn.Linear(embed_dim + latent_dim, embed_dim),
             nn.LayerNorm(embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim),
             nn.LayerNorm(embed_dim),
+            nn.ReLU()
+            # We stop here to fork
+        )
+
+        # 4. Trajectory Head (The original output layer)
+        self.trajectory_head = nn.Linear(embed_dim, future_steps * 2)
+
+        # 5. [NEW] Caption Head (The Superfast Classifier)
+        # Outputs 7 scores (one for each maneuver class)
+        self.caption_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
             nn.ReLU(),
-            nn.Linear(embed_dim, future_steps * 2) # Output [x, y] flattened
+            nn.Linear(embed_dim // 2, 7)
         )
 
     def forward(self, context, y_gt=None):
         """
         context: [Batch, Embed_Dim]
-        y_gt: [Batch, Future_Steps, 2] (Optional, only for training)
+        y_gt: [Batch, Future_Steps, 2] (Optional, only for training CVAE)
         """
-        # A. Always compute Prior (what we expect z to be)
+        # A. Prior / Posterior Logic (Keep existing...)
         prior_out = self.prior_net(context)
         prior_mu, prior_logvar = prior_out.chunk(2, dim=-1)
         
         z = None
         kld_loss = torch.tensor(0.0, device=context.device)
         
-        # B. Training Logic (Use Posterior)
         if self.training and y_gt is not None:
-            # Flatten GT to [Batch, Steps*2]
             y_flat = y_gt.reshape(y_gt.size(0), -1)
-            
-            # Concatenate Context + Future
             post_input = torch.cat([context, y_flat], dim=-1)
             post_out = self.posterior_net(post_input)
             post_mu, post_logvar = post_out.chunk(2, dim=-1)
-            
-            # Reparameterization Trick: z = mu + sigma * epsilon
             std = torch.exp(0.5 * post_logvar)
             eps = torch.randn_like(std)
             z = post_mu + eps * std
-            
-            # KLD Loss: Measures divergence between Posterior and Prior
-            # We want the Posterior (which sees the future) to teach the Prior
             kld_loss = -0.5 * torch.sum(1 + post_logvar - prior_logvar - 
                                       (post_mu - prior_mu).pow(2) / torch.exp(prior_logvar) - 
                                       torch.exp(post_logvar) / torch.exp(prior_logvar), dim=1).mean()
-        
-        # C. Inference Logic (Use Prior)
         else:
-            # Sample z from Prior
             std = torch.exp(0.5 * prior_logvar)
             eps = torch.randn_like(std)
             z = prior_mu + eps * std
             
-        # D. Generate
+        # B. Generator Forward Pass
         gen_input = torch.cat([context, z], dim=-1)
-        y_hat = self.generator(gen_input)
         
-        # Reshape back to [Batch, Steps, 2]
+        # 1. Get Shared Features
+        features = self.generator_features(gen_input)
+        
+        # 2. Head A: Trajectory
+        y_hat = self.trajectory_head(features)
         y_hat = y_hat.reshape(-1, self.future_steps, 2)
         
-        return y_hat, kld_loss
+        # 3. [NEW] Head B: Caption
+        caption_logits = self.caption_head(features) # [Batch, 7]
+        
+        return y_hat, kld_loss, caption_logits
