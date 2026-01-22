@@ -22,7 +22,8 @@ class HiVTTemporalData(TemporalData):
             # Bipartite graph handling:
             # Row 0 (Lanes) -> Increment by number of lanes
             # Row 1 (Actors) -> Increment by number of nodes
-            return (self['lane_vectors'].size(0), self.num_nodes)
+            # FIX: Must return shape [2, 1] to broadcast over [2, NumEdges]
+            return torch.tensor([[self['lane_vectors'].size(0)], [self.num_nodes]])
         else:
             # Default behavior for edge_index, etc.
             return super().__inc__(key, value, *args, **kwargs)
