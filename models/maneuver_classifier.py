@@ -165,14 +165,14 @@ class ManeuverClassifier(pl.LightningModule):
         self.val_f1_per_class.update(preds, targets)
 
         self.log(
-    "val_acc",
-        self.val_acc,
-        on_step=False,
-        on_epoch=True,
-        prog_bar=True,
-        sync_dist=True,
-        batch_size=targets.size(0),
-    )
+            "val_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+            batch_size=targets.size(0),
+        )
 
         return loss
 
