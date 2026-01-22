@@ -1,6 +1,7 @@
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from models.cvae_gan import CVAE_GAN
 from torch_geometric.nn import global_max_pool
 
@@ -9,11 +10,13 @@ class CaptionFinetuner(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         
-        # 1. Load Backbone
+        # 1. Load Backbone (strict=False to ignore original decoder heads if needed)
         print(f"Loading backbone from {pretrained_ckpt}...")
         self.model = CVAE_GAN.load_from_checkpoint(pretrained_ckpt, strict=False)
 
-        # 2. Define the Classifier (The Head)
+        # 2. Define the Classifier Head
+        # HiVT hidden_dim is usually 128.
+        # Output is 7 classes (based on your MANEUVER_MAP).
         self.classifier = nn.Sequential(
             nn.Linear(128, 128),
             nn.ReLU(),
@@ -26,48 +29,40 @@ class CaptionFinetuner(pl.LightningModule):
         for param in self.model.parameters():
             param.requires_grad = False
             
-        # Note: We do NOT need to manually unfreeze self.classifier.
-        # Since it was just created in __init__, requires_grad is True by default.
-
-        # 4. Weighted Loss
+        # 4. Class Weights (To handle imbalanced maneuvers like U-Turns)
         weights = torch.tensor([
             1.0,   # 0: Straight
-            15.0,  # 1: Left
-            15.0,  # 2: Right
+            10.0,  # 1: Left
+            10.0,  # 2: Right
             50.0,  # 3: U-Turn
-            25.0,  # 4: Lane L
-            25.0,  # 5: Lane R
+            20.0,  # 4: Lane L
+            20.0,  # 5: Lane R
             5.0    # 6: Stop
         ])
         self.register_buffer("class_weights", weights)
         self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights)
+        
         self.validation_step_outputs = []
 
     def forward(self, data):
-        # 1. Get Embeddings
+        # 1. Get Local Embeddings
         local_embed = self.model.local_encoder(data)
+        
+        # 2. Get Global Interactions
         global_embed = self.model.global_interactor(data, local_embed)
         
-        # --- DEBUG PRINT (Optional: Remove after fixing) ---
-        # print(f"Global Embed Shape: {global_embed.shape}")
-        # print(f"Batch Vector Shape: {data.batch.shape}")
-        # ---------------------------------------------------
-
-        # 2. SELECT EGO AGENT (Fix for Batch Size 1 Error)
-        # Instead of pooling, we grab the 0-th node of every graph in the batch.
-        # data.ptr contains the start index of each graph in the batch.
-        # data.ptr[:-1] gives us the indices [0, num_nodes_1, num_nodes_1+num_nodes_2, ...]
+        # 3. SELECT EGO AGENT (Critical Fix for Batch Size Error)
+        # HiVT places the Ego agent at index 0 of every graph.
+        # data.ptr contains the start index of every graph in the batch.
+        # We use this to pick the specific embedding for the ego vehicle.
         if hasattr(data, 'ptr'):
             ego_indices = data.ptr[:-1]
             graph_embed = global_embed[ego_indices]
         else:
-            # Fallback for some PyG versions or if ptr is missing (unlikely)
-            # This replicates "Select index 0 where batch changes"
-            # But relying on ptr is safer for HiVT
+            # Fallback for old PyG versions
             graph_embed = global_max_pool(global_embed, data.batch)
 
-        # 3. CLASSIFICATION
-        # Now graph_embed is GUARANTEED to be [Batch_Size, Hidden_Dim]
+        # 4. Classification
         logits = self.classifier(graph_embed) 
         
         return logits
@@ -80,7 +75,7 @@ class CaptionFinetuner(pl.LightningModule):
         
         acc = (torch.argmax(logits, dim=1) == target).float().mean()
         
-        # Use data.num_graphs for correct batch size logging in PyG
+        # Logging
         self.log("train_loss", loss, prog_bar=True, batch_size=data.num_graphs)
         self.log("train_acc", acc, prog_bar=True, batch_size=data.num_graphs)
         return loss
@@ -119,5 +114,5 @@ class CaptionFinetuner(pl.LightningModule):
         self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
-        # --- FIX: Optimize self.classifier, NOT self.model.decoder... ---
+        # Only optimize the classifier head!
         return torch.optim.Adam(self.classifier.parameters(), lr=1e-3)
