@@ -127,30 +127,53 @@ class NuScenesHiVTDataset(Dataset):
         return data
 
     def _sanitize(self, data):
-        # 1. Check for bad dimensions in Lane-Actor Index
+        # 1. Determine Valid Limits
+        num_nodes = 0
+        if hasattr(data, 'x') and data.x is not None:
+            num_nodes = data.x.size(0)
+        elif hasattr(data, 'num_nodes'):
+            num_nodes = data.num_nodes
+
+        num_lanes = 0
+        if hasattr(data, 'lane_vectors') and torch.is_tensor(data.lane_vectors):
+            num_lanes = data.lane_vectors.size(0)
+
+        # 2. Fix Lane-Actor Index (The Source of the Crash)
         if hasattr(data, "lane_actor_index"):
              lai = data.lane_actor_index
+             
+             # Ensure tensor structure
              if not torch.is_tensor(lai) or lai.numel() == 0:
                  data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
-             elif lai.dim() == 1: 
-                 data.lane_actor_index = lai.reshape(2, 1)
+             else:
+                 if lai.dim() == 1: 
+                     lai = lai.reshape(2, 1)
+                 
+                 # --- CRITICAL FILTERING ---
+                 # Check Row 0 against num_lanes
+                 mask_lanes = (lai[0] < num_lanes) & (lai[0] >= 0)
+                 
+                 # Check Row 1 against num_nodes
+                 mask_actors = (lai[1] < num_nodes) & (lai[1] >= 0)
+                 
+                 # Only keep edges where BOTH are valid
+                 valid_mask = mask_lanes & mask_actors
 
-             # --- CRITICAL FIX FOR CUDA ASSERTION ERROR ---
-             # Filter out edges that point to non-existent agents
-             if hasattr(data, 'x') and data.x is not None:
-                 num_nodes = data.x.size(0)
-                 # dim 0 is lane index, dim 1 is actor index. We check dim 1.
-                 # Ensure indices are within [0, num_nodes - 1]
-                 mask = (data.lane_actor_index[1] < num_nodes) & (data.lane_actor_index[1] >= 0)
+                 # Apply filter
+                 data.lane_actor_index = lai[:, valid_mask]
                  
-                 # Apply mask
-                 data.lane_actor_index = data.lane_actor_index[:, mask]
-                 
-                 # Also filter corresponding vectors if they exist
+                 # Also sync the 'lane_actor_vectors' if they exist
                  if hasattr(data, "lane_actor_vectors") and torch.is_tensor(data.lane_actor_vectors):
-                     if data.lane_actor_vectors.shape[0] == mask.shape[0]: # Ensure sizes match before filtering
-                        data.lane_actor_vectors = data.lane_actor_vectors[mask]
+                     # Only filter if shapes match (just in case)
+                     if data.lane_actor_vectors.shape[0] == lai.shape[1]:
+                         data.lane_actor_vectors = data.lane_actor_vectors[valid_mask]
+                     elif data.lane_actor_vectors.shape[0] == 0:
+                         pass # It's already empty
+                     else:
+                         # Mismatch shape: unsafe to keep, clear it to be safe
+                         data.lane_actor_vectors = torch.empty((data.lane_actor_index.shape[1], 2), dtype=torch.float)
 
+        # 3. Standard Safety Checks for Empty Vectors
         if hasattr(data, "lane_actor_vectors"):
              lav = data.lane_actor_vectors
              if not torch.is_tensor(lav) or lav.numel() == 0:
@@ -167,6 +190,7 @@ class NuScenesHiVTDataset(Dataset):
                  data.edge_index = ei.reshape(2, 0)
              elif ei.dim() == 1: 
                  data.edge_index = ei.reshape(2, 1)
+                 
         return data
 
     @staticmethod
