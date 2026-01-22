@@ -9,21 +9,27 @@ class CaptionFinetuner(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         
-        # 1. Load Backbone (strict=False to ignore missing caption_head)
+        # 1. Load Backbone
         print(f"Loading backbone from {pretrained_ckpt}...")
         self.model = CVAE_GAN.load_from_checkpoint(pretrained_ckpt, strict=False)
+
+        # 2. Define the Classifier (The Head)
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 7) 
+        )
         
-        # 2. Freeze Backbone
+        # 3. Freeze Backbone
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
             
-        # 3. Unfreeze Caption Head
-        for param in self.model.decoder.caption_head.parameters():
-            param.requires_grad = True
-            
-        # 4. WEIGHTED LOSS (The Fix)
-        # Weights roughly inverse to frequency to prevent "Straight Drive" bias
+        # Note: We do NOT need to manually unfreeze self.classifier.
+        # Since it was just created in __init__, requires_grad is True by default.
+
+        # 4. Weighted Loss
         weights = torch.tensor([
             1.0,   # 0: Straight
             15.0,  # 1: Left
@@ -34,29 +40,21 @@ class CaptionFinetuner(pl.LightningModule):
             5.0    # 6: Stop
         ])
         self.register_buffer("class_weights", weights)
-        
         self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights)
         self.validation_step_outputs = []
 
     def forward(self, data):
-        # Inference: Prior -> Z -> Decoder -> Logits
+        # 1. Get Embeddings (Frozen Backbone)
         local_embed = self.model.local_encoder(data)
         global_embed = self.model.global_interactor(data, local_embed)
         
-        # --- FIX STARTS HERE ---
-        
-        # 1. Pool the node embeddings PER GRAPH in the batch.
-        #    'data.batch' tells PyG which node belongs to which graph (0 to 63).
-        #    Result shape: [batch_size, hidden_dim] (e.g., [64, 128])
+        # 2. POOLING: [Num Nodes, Dim] -> [Batch Size, Dim]
         graph_embed = global_max_pool(global_embed, data.batch)
         
-        # 2. Pass this graph-level embedding to your classifier
-        #    (Assumes self.classifier or similar exists - check your variable name)
-        caption_logits = self.classifier(graph_embed) 
+        # 3. CLASSIFICATION: [Batch Size, Dim] -> [Batch Size, 7]
+        logits = self.classifier(graph_embed) 
         
-        # --- FIX ENDS HERE ---
-        
-        return caption_logits
+        return logits
 
     def training_step(self, data, batch_idx):
         logits = self(data)
@@ -64,8 +62,9 @@ class CaptionFinetuner(pl.LightningModule):
         
         loss = self.ce_loss(logits, target)
         
-        # Log accuracy (non-weighted, just raw correctness)
         acc = (torch.argmax(logits, dim=1) == target).float().mean()
+        
+        # Use data.num_graphs for correct batch size logging in PyG
         self.log("train_loss", loss, prog_bar=True, batch_size=data.num_graphs)
         self.log("train_acc", acc, prog_bar=True, batch_size=data.num_graphs)
         return loss
@@ -104,4 +103,5 @@ class CaptionFinetuner(pl.LightningModule):
         self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.model.decoder.caption_head.parameters(), lr=1e-3)
+        # --- FIX: Optimize self.classifier, NOT self.model.decoder... ---
+        return torch.optim.Adam(self.classifier.parameters(), lr=1e-3)
