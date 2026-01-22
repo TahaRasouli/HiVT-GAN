@@ -67,51 +67,103 @@ class ManeuverClassifier(pl.LightningModule):
     def forward(self, batch):
         self.backbone.eval()
         with torch.no_grad():
-            global_embed = self.backbone(batch)
+            out = self.backbone(batch)
+            if self.global_step == 0:
+                print("backbone out shape:", tuple(out.shape))
+                if hasattr(batch, "ptr"):
+                    print("ptr[-1] total_nodes:", int(batch.ptr[-1]))
+                print("num_graphs:", int(batch.num_graphs))
 
-        num_graphs = batch.num_graphs
+
+        num_graphs = int(batch.num_graphs)
         assert hasattr(batch, "ego_index"), "Batch missing ego_index"
-
-        # ego_index should be one per graph
         assert batch.ego_index.numel() == num_graphs, (
-            f"ego_index must have length num_graphs={num_graphs}, "
-            f"got {batch.ego_index.numel()}"
+            f"ego_index must have length num_graphs={num_graphs}, got {batch.ego_index.numel()}"
         )
 
-        # ------------------------------------------------------------
-        # Case 1: [num_graphs, N, D]  (graph-batched)
-        # ------------------------------------------------------------
-        if global_embed.dim() == 3 and global_embed.size(0) == num_graphs:
+        # Normalize to tensor
+        global_embed = out
+        if not torch.is_tensor(global_embed):
+            raise RuntimeError(f"Backbone returned non-tensor type: {type(global_embed)}")
+
+        # -------- Case A: per-graph embeddings already --------
+        # [num_graphs, D]
+        if global_embed.dim() == 2 and global_embed.size(0) == num_graphs:
+            ego_embeds = global_embed  # already one embedding per graph
+
+        # [1, num_graphs, D]
+        elif global_embed.dim() == 3 and global_embed.size(0) == 1 and global_embed.size(1) == num_graphs:
+            ego_embeds = global_embed[0]  # [num_graphs, D]
+
+        # -------- Case B: graph-batched node embeddings --------
+        # [num_graphs, N, D]  (N nodes-per-graph, padded or fixed)
+        elif global_embed.dim() == 3 and global_embed.size(0) == num_graphs:
+            # ego_index must be within N
+            N = int(global_embed.size(1))
+            ego_idx = batch.ego_index.to(global_embed.device).long()
+            if int(ego_idx.max().detach().cpu()) >= N or int(ego_idx.min().detach().cpu()) < 0:
+                raise RuntimeError(
+                    f"ego_index out of range for per-graph node dim. "
+                    f"min={int(ego_idx.min().cpu())}, max={int(ego_idx.max().cpu())}, N={N}, "
+                    f"global_embed.shape={tuple(global_embed.shape)}"
+                )
+
             ego_embeds = global_embed[
                 torch.arange(num_graphs, device=global_embed.device),
-                batch.ego_index
+                ego_idx,
             ]  # [num_graphs, D]
 
-        # ------------------------------------------------------------
-        # Case 2: [1, total_nodes, D] (single-batch)
-        # ------------------------------------------------------------
+        # -------- Case C: single-batch node embeddings --------
+        # [1, total_nodes, D] or [total_nodes, D]
         elif global_embed.dim() == 3 and global_embed.size(0) == 1:
-            assert hasattr(batch, "ptr"), "Batch missing ptr (required for node offsets)"
-            # ptr: [num_graphs + 1] node offsets
-            ego_global = batch.ptr[:-1].to(global_embed.device) + batch.ego_index.to(global_embed.device)
+            assert hasattr(batch, "ptr"), "Batch missing ptr (required for flattened node offsets)"
+            ego_idx = batch.ego_index.long()
+
+            # ptr gives node offsets into flattened node dimension
+            ptr = batch.ptr.long()  # [num_graphs+1]
+            ego_global = (ptr[:-1] + ego_idx).to(global_embed.device)  # [num_graphs]
+
+            total_nodes = int(global_embed.size(1))
+            max_idx = int(ego_global.max().detach().cpu())
+            min_idx = int(ego_global.min().detach().cpu())
+            if min_idx < 0 or max_idx >= total_nodes:
+                raise RuntimeError(
+                    f"Computed ego_global out of bounds for flattened node dim. "
+                    f"min={min_idx}, max={max_idx}, total_nodes={total_nodes}, "
+                    f"ptr[-1]={int(ptr[-1])}, num_graphs={num_graphs}, "
+                    f"global_embed.shape={tuple(global_embed.shape)}"
+                )
+
             ego_embeds = global_embed[0, ego_global, :]  # [num_graphs, D]
 
-        # ------------------------------------------------------------
-        # Case 3: [total_nodes, D] (fully flattened)
-        # ------------------------------------------------------------
         elif global_embed.dim() == 2:
-            assert hasattr(batch, "ptr"), "Batch missing ptr (required for node offsets)"
-            ego_global = batch.ptr[:-1].to(global_embed.device) + batch.ego_index.to(global_embed.device)
+            # [total_nodes, D]
+            assert hasattr(batch, "ptr"), "Batch missing ptr (required for flattened node offsets)"
+            ego_idx = batch.ego_index.long()
+            ptr = batch.ptr.long()
+            ego_global = (ptr[:-1] + ego_idx).to(global_embed.device)
+
+            total_nodes = int(global_embed.size(0))
+            max_idx = int(ego_global.max().detach().cpu())
+            min_idx = int(ego_global.min().detach().cpu())
+            if min_idx < 0 or max_idx >= total_nodes:
+                raise RuntimeError(
+                    f"Computed ego_global out of bounds for flattened node dim. "
+                    f"min={min_idx}, max={max_idx}, total_nodes={total_nodes}, "
+                    f"ptr[-1]={int(ptr[-1])}, num_graphs={num_graphs}, "
+                    f"global_embed.shape={tuple(global_embed.shape)}"
+                )
+
             ego_embeds = global_embed[ego_global, :]  # [num_graphs, D]
 
         else:
             raise RuntimeError(
-                f"Unsupported backbone output shape {tuple(global_embed.shape)} "
-                f"for num_graphs={num_graphs}"
+                f"Unsupported backbone output shape {tuple(global_embed.shape)} for num_graphs={num_graphs}"
             )
 
         logits = self.head(ego_embeds)  # [num_graphs, num_classes]
         return logits
+
 
 
     # --------------------------------------------------------------
