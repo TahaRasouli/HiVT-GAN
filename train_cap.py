@@ -81,7 +81,7 @@ def main():
     parser.add_argument("--pin_memory", type=bool, default=False)
     parser.add_argument("--persistent_workers", type=bool, default=False)
 
-    
+
 
     args = parser.parse_args()
 
@@ -97,8 +97,8 @@ def main():
     # ---------------------------------------------------------
     datamodule = NuScenesHiVTDataModule(
         root=args.root,
-        train_batch_size=args.train_batch_size,
-        val_batch_size=args.val_batch_size,
+        train_batch_size=args.batch_size,
+        val_batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
