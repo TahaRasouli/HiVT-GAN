@@ -132,9 +132,9 @@ def main():
 
 
     trainer = pl.Trainer(
-        accelerator="gpu",
-        devices=1,
-        strategy="single_device",   # CRITICAL: disables DDP/NCCL entirely
+        accelerator="cuda",          # ✅ NOT "gpu"
+        devices=[0],                 # ✅ must be list in PL 2.x
+        strategy="single_device",    # ✅ disables DDP/NCCL entirely
         precision="16-mixed",
         max_epochs=args.max_epochs,
         logger=True,
