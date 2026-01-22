@@ -40,7 +40,7 @@ class CaptionFinetuner(pl.LightningModule):
     def forward(self, data):
         # Inference: Prior -> Z -> Decoder -> Logits
         local_embed = self.model.local_encoder(data)
-        global_embed = self.model.global_encoder(data, local_embed)
+        global_embed = self.model.global_interactor(data, local_embed)
         _, _, caption_logits = self.model.decoder(global_embed, y_gt=None)
         return caption_logits
 
