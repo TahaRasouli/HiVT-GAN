@@ -78,6 +78,10 @@ def main():
     parser.add_argument("--max_epochs", type=int, default=20)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--pin_memory", type=bool, default=False)
+    parser.add_argument("--persistent_workers", type=bool, default=False)
+
+    
 
     args = parser.parse_args()
 
@@ -93,12 +97,14 @@ def main():
     # ---------------------------------------------------------
     datamodule = NuScenesHiVTDataModule(
         root=args.root,
-        train_batch_size=args.batch_size,
-        val_batch_size=args.batch_size,
+        train_batch_size=args.train_batch_size,
+        val_batch_size=args.val_batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
     )
+
 
     # ---------------------------------------------------------
     # 3. Load Backbone & Initialize Classifier
@@ -128,18 +134,17 @@ def main():
     
     early_stop = EarlyStopping(monitor="val_loss", patience=5, mode="min")
     use_gpu = torch.cuda.is_available() and args.devices > 0
+    
     strategy = DDPStrategy(find_unused_parameters=True) if use_gpu else "auto"
-
-
     trainer = pl.Trainer(
-        accelerator="cuda",          # ✅ NOT "gpu"
-        devices=[0],                 # ✅ must be list in PL 2.x
-        strategy="single_device",    # ✅ disables DDP/NCCL entirely
-        precision="16-mixed",
+        accelerator="gpu",
+        devices=args.devices,
+        strategy=strategy,
+        precision="16-mixed",  
+        # gradient_clip_val=0.5,
         max_epochs=args.max_epochs,
-        logger=True,
-        enable_checkpointing=True,
-        num_sanity_val_steps=0,
+        callbacks=[checkpoint_callback], # Critical to include this
+        log_every_n_steps=50,
     )
 
     print("[Info] Starting Linear Probe Training...")
