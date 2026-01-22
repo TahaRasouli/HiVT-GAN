@@ -165,13 +165,14 @@ class ManeuverClassifier(pl.LightningModule):
         self.val_f1_per_class.update(preds, targets)
 
         self.log(
-            "val_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            batch_size=targets.size(0),
-        )
+    "val_acc",
+        self.val_acc,
+        on_step=False,
+        on_epoch=True,
+        prog_bar=True,
+        sync_dist=True,
+        batch_size=targets.size(0),
+    )
 
         return loss
 
@@ -179,8 +180,11 @@ class ManeuverClassifier(pl.LightningModule):
     # VALIDATION EPOCH END
     # --------------------------------------------------------------
     def on_validation_epoch_end(self):
-        self.val_acc.reset()
+        f1 = self.val_f1_per_class.compute()
+        for i, name in enumerate(self.class_names):
+            self.log(f"val_f1_{name}", f1[i], prog_bar=False)
         self.val_f1_per_class.reset()
+        self.val_acc.reset()
 
     # --------------------------------------------------------------
     # OPTIMIZER
