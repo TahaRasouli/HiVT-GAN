@@ -72,11 +72,8 @@ class NuScenesHiVTDataset(Dataset):
         # 1. Sanitize Data (The Critical Step)
         data = self._sanitize(data)
         
-        # --- CRITICAL FIX: SKIP EMPTY GRAPHS ---
-        # If the sample has 0 nodes after sanitization, it will crash the model's ego-selection.
-        # We recursively try the next index.
+        # --- SKIP EMPTY GRAPHS ---
         if data.num_nodes == 0:
-            # print(f"Skipping empty sample: {path}") # Uncomment to see skipped files
             return self.get((idx + 1) % len(self))
 
         # 2. Inject Rotate Mat if missing
@@ -123,7 +120,7 @@ class NuScenesHiVTDataset(Dataset):
 
     def _sanitize(self, data):
         """
-        Full-Spectrum Sanitization for Nodes AND Lanes.
+        Full-Spectrum Sanitization including Categorical Clamping.
         """
         # --- A. CONSISTENT NODE COUNT ---
         node_counts = []
@@ -134,8 +131,7 @@ class NuScenesHiVTDataset(Dataset):
         if len(node_counts) > 0:
             valid_num_nodes = min(node_counts)
         else:
-            # If no node tensors exist, this graph is effectively empty
-            valid_num_nodes = 0
+            valid_num_nodes = 0 # No valid nodes
 
         # Crop Node Tensors
         node_keys = ['x', 'positions', 'padding_mask', 'bos_mask', 'rotate_angles', 'y']
@@ -145,10 +141,8 @@ class NuScenesHiVTDataset(Dataset):
                 if torch.is_tensor(tensor) and tensor.size(0) > valid_num_nodes:
                     setattr(data, key, tensor[:valid_num_nodes])
         data.num_nodes = valid_num_nodes
-
-        # If we have 0 nodes, stop here. The get() method will skip this file.
-        if valid_num_nodes == 0:
-            return data
+        
+        if valid_num_nodes == 0: return data
 
         # --- B. FIX AV_INDEX ---
         if hasattr(data, 'av_index') and torch.is_tensor(data.av_index):
@@ -189,11 +183,9 @@ class NuScenesHiVTDataset(Dataset):
                 data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
             else:
                 if lai.dim() == 1: lai = lai.reshape(2, 1)
-                
                 mask_lanes = (lai[0] < real_num_lanes) & (lai[0] >= 0)
                 mask_actors = (lai[1] < valid_num_nodes) & (lai[1] >= 0)
                 valid_mask = mask_lanes & mask_actors
-                
                 data.lane_actor_index = lai[:, valid_mask]
                 
                 if hasattr(data, "lane_actor_vectors") and torch.is_tensor(data.lane_actor_vectors):
@@ -213,14 +205,17 @@ class NuScenesHiVTDataset(Dataset):
                 mask_dst = (ei[1] < valid_num_nodes) & (ei[1] >= 0)
                 data.edge_index = ei[:, mask_src & mask_dst]
 
-        # --- E. CLAMP CATEGORICAL INDICES ---
+        # --- E. CLAMP CATEGORICAL INDICES (Prevents Embedding Crashes) ---
         if hasattr(data, 'is_intersections') and torch.is_tensor(data.is_intersections):
+            # Clamp to [0, 1]
             data.is_intersections = torch.clamp(data.is_intersections, min=0, max=1)
 
         if hasattr(data, 'traffic_controls') and torch.is_tensor(data.traffic_controls):
+            # Clamp to [0, 1]
             data.traffic_controls = torch.clamp(data.traffic_controls, min=0, max=1)
 
         if hasattr(data, 'turn_directions') and torch.is_tensor(data.turn_directions):
+            # Clamp to [0, 2]
             data.turn_directions = torch.clamp(data.turn_directions, min=0, max=2)
 
         return data
