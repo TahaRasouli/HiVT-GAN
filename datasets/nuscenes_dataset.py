@@ -19,11 +19,8 @@ LANE_TYPE_MAP = {
 class HiVTTemporalData(TemporalData):
     def __inc__(self, key, value, *args, **kwargs):
         if key == 'lane_actor_index':
-            # Bipartite graph: Row 0 (Lanes), Row 1 (Actors)
-            # Must return shape [2, 1] for broadcasting
             return torch.tensor([[self['lane_vectors'].size(0)], [self.num_nodes]])
         elif key == 'edge_index' or 'edge_index' in key:
-            # Agent-Agent graph -> Increment by num_nodes
             return self.num_nodes
         else:
             return super().__inc__(key, value, *args, **kwargs)
@@ -69,7 +66,7 @@ class NuScenesHiVTDataset(Dataset):
             print(f"Corrupt file: {path}")
             return self.get((idx + 1) % len(self))
 
-        # 1. Sanitize Data (The Critical Step)
+        # 1. Sanitize Data
         data = self._sanitize(data)
         
         # --- SKIP EMPTY GRAPHS ---
@@ -120,25 +117,28 @@ class NuScenesHiVTDataset(Dataset):
 
     def _sanitize(self, data):
         """
-        Full-Spectrum Sanitization including Categorical Clamping.
+        Full-Spectrum Sanitization including Mask Alignment.
         """
         # --- A. CONSISTENT NODE COUNT ---
         node_counts = []
         if hasattr(data, 'x') and torch.is_tensor(data.x): node_counts.append(data.x.size(0))
         if hasattr(data, 'positions') and torch.is_tensor(data.positions): node_counts.append(data.positions.size(0))
-        if hasattr(data, 'padding_mask') and torch.is_tensor(data.padding_mask): node_counts.append(data.padding_mask.size(0))
+        
+        # Note: We rely on X and Positions for the "True" node count. 
+        # Masks might be longer (ghosts), so we don't include them in the min() calculation, we crop TO the min.
         
         if len(node_counts) > 0:
             valid_num_nodes = min(node_counts)
         else:
-            valid_num_nodes = 0 # No valid nodes
+            valid_num_nodes = 0
 
-        # Crop Node Tensors
+        # Crop ALL Node Tensors (Including Masks)
         node_keys = ['x', 'positions', 'padding_mask', 'bos_mask', 'rotate_angles', 'y']
         for key in node_keys:
             if hasattr(data, key):
                 tensor = getattr(data, key)
                 if torch.is_tensor(tensor) and tensor.size(0) > valid_num_nodes:
+                    # Slice the first dimension
                     setattr(data, key, tensor[:valid_num_nodes])
         data.num_nodes = valid_num_nodes
         
@@ -166,7 +166,6 @@ class NuScenesHiVTDataset(Dataset):
         else:
             real_num_lanes = 0
             
-        # Crop Lane Tensors
         lane_keys = ['lane_vectors', 'is_intersections', 'turn_directions', 'traffic_controls']
         for key in lane_keys:
             if hasattr(data, key):
@@ -194,7 +193,7 @@ class NuScenesHiVTDataset(Dataset):
                     else:
                         data.lane_actor_vectors = torch.empty((data.lane_actor_index.shape[1], 2), dtype=torch.float)
 
-        # 2. Edge Index (Agent-Agent)
+        # 2. Edge Index
         if hasattr(data, "edge_index"):
             ei = data.edge_index
             if not torch.is_tensor(ei) or ei.numel() == 0:
@@ -205,17 +204,14 @@ class NuScenesHiVTDataset(Dataset):
                 mask_dst = (ei[1] < valid_num_nodes) & (ei[1] >= 0)
                 data.edge_index = ei[:, mask_src & mask_dst]
 
-        # --- E. CLAMP CATEGORICAL INDICES (Prevents Embedding Crashes) ---
+        # --- E. CLAMP CATEGORICAL INDICES ---
         if hasattr(data, 'is_intersections') and torch.is_tensor(data.is_intersections):
-            # Clamp to [0, 1]
             data.is_intersections = torch.clamp(data.is_intersections, min=0, max=1)
 
         if hasattr(data, 'traffic_controls') and torch.is_tensor(data.traffic_controls):
-            # Clamp to [0, 1]
             data.traffic_controls = torch.clamp(data.traffic_controls, min=0, max=1)
 
         if hasattr(data, 'turn_directions') and torch.is_tensor(data.turn_directions):
-            # Clamp to [0, 2]
             data.turn_directions = torch.clamp(data.turn_directions, min=0, max=2)
 
         return data
