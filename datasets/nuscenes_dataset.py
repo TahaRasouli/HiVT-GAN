@@ -7,8 +7,8 @@ from utils import TemporalData
 
 class NuScenesHiVTDataset(Dataset):
     """
-    HiVT-compatible nuScenes dataset with explicit ego indexing.
-    Robust against CUDA index crashes.
+    HiVT-compatible nuScenes dataset.
+    Robust against empty graphs, invalid indices, and CUDA crashes.
     """
 
     def __init__(
@@ -24,7 +24,9 @@ class NuScenesHiVTDataset(Dataset):
         self.transform = transform
         self._directory = f"{split}_processed"
 
-        # 1. Structure Detection
+        # --------------------------------------------------------------
+        # 1. STRUCTURE DETECTION
+        # --------------------------------------------------------------
         standard_path = os.path.join(self.root, self._directory)
         if os.path.isdir(standard_path):
             self._processed_dir = standard_path
@@ -36,10 +38,14 @@ class NuScenesHiVTDataset(Dataset):
         else:
             raise FileNotFoundError(f"Could not find data in {standard_path} OR {self.root}")
 
-        # 2. File Listing
+        # --------------------------------------------------------------
+        # 2. FILE LISTING
+        # --------------------------------------------------------------
         all_files = sorted(f for f in os.listdir(self._processed_dir) if f.endswith(".pt"))
 
-        # 3. Split Logic
+        # --------------------------------------------------------------
+        # 3. SPLIT LOGIC
+        # --------------------------------------------------------------
         if self.is_flat:
             num_total = len(all_files)
             num_val = int(num_total * val_ratio)
@@ -61,6 +67,9 @@ class NuScenesHiVTDataset(Dataset):
 
         super().__init__(root, transform=transform)
 
+    # --------------------------------------------------------------
+    # REQUIRED PROPERTIES
+    # --------------------------------------------------------------
     @property
     def processed_dir(self) -> str:
         return self._processed_dir
@@ -69,50 +78,50 @@ class NuScenesHiVTDataset(Dataset):
     def processed_file_names(self) -> List[str]:
         return self._processed_file_names
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # SANITIZATION LOGIC
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     def _sanitize(self, data: TemporalData) -> TemporalData:
         """
-        Enforces strict invariants required by HiVT and GPU-safe indexing.
+        Enforces all invariants required by HiVT and classifier training.
         """
 
-        # --------------------------------------------------------------
-        # 1. GRAPH INDEX SANITIZATION
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
+        # 1. RANGE-SAFE GRAPH INDICES
+        # ----------------------------------------------------------
         if hasattr(data, "lane_actor_index") and hasattr(data, "lane_vectors"):
             lai = data.lane_actor_index
             num_lanes = data.lane_vectors.size(0)
             num_actors = data.num_nodes
 
-            valid = (lai[0] >= 0) & (lai[0] < num_lanes) & \
-                    (lai[1] >= 0) & (lai[1] < num_actors)
-
+            valid = (
+                (lai[0] >= 0) & (lai[0] < num_lanes) &
+                (lai[1] >= 0) & (lai[1] < num_actors)
+            )
             data.lane_actor_index = lai[:, valid]
-
 
         if hasattr(data, "edge_index"):
             ei = data.edge_index
             num_nodes = data.num_nodes
 
-            valid = (ei[0] >= 0) & (ei[0] < num_nodes) & \
-                    (ei[1] >= 0) & (ei[1] < num_nodes)
-
+            valid = (
+                (ei[0] >= 0) & (ei[0] < num_nodes) &
+                (ei[1] >= 0) & (ei[1] < num_nodes)
+            )
             data.edge_index = ei[:, valid]
 
-
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
         # 2. VECTOR SHAPE FIXES
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
         for key in ["lane_actor_vectors", "lane_vectors"]:
             if hasattr(data, key):
                 vec = getattr(data, key)
                 if not torch.is_tensor(vec) or vec.numel() == 0 or vec.dim() != 2:
                     setattr(data, key, torch.empty((0, 2), dtype=torch.float))
 
-        # --------------------------------------------------------------
-        # 3. MAP FEATURE CLAMPING (EMBEDDING SAFETY)
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
+        # 3. MAP FEATURE CLAMPING (EMBEDDINGS)
+        # ----------------------------------------------------------
         if hasattr(data, "turn_directions"):
             data.turn_directions = torch.clamp(data.turn_directions, 0, 2).long()
 
@@ -122,9 +131,9 @@ class NuScenesHiVTDataset(Dataset):
         if hasattr(data, "is_intersections"):
             data.is_intersections = torch.clamp(data.is_intersections, 0, 1).long()
 
-        # --------------------------------------------------------------
-        # 4. MANEUVER LABEL EXTRACTION
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
+        # 4. MANEUVER LABEL EXTRACTION (ALWAYS PRESENT)
+        # ----------------------------------------------------------
         str_to_int = {
             "Straight Drive": 0, "Go Straight": 0,
             "Left Turn": 1, "Turn Left": 1,
@@ -139,38 +148,41 @@ class NuScenesHiVTDataset(Dataset):
         if hasattr(data, "maneuver_category"):
             label_str = data.maneuver_category
         elif hasattr(data, "caption_dict"):
-            label_str = data.caption_dict.get("category") or data.caption_dict.get("maneuver_category")
+            label_str = (
+                data.caption_dict.get("category")
+                or data.caption_dict.get("maneuver_category")
+            )
 
         maneuver_id = str_to_int.get(label_str, 0)
         data.maneuver_id = torch.tensor([maneuver_id], dtype=torch.long)
 
-        # --------------------------------------------------------------
-        # 5. EXPLICIT EGO INDEX (OPTION A)
-        # --------------------------------------------------------------
-        if not hasattr(data, "ego_index"):
-            # ASSUMPTION: ego node is index 0 (must match preprocessing)
-            data.ego_index = torch.tensor([0], dtype=torch.long)
-        else:
-            data.ego_index = data.ego_index.reshape(1).long()
-
-        # Safety invariant
-        assert data.ego_index.item() < data.num_nodes, (
-            f"Ego index {data.ego_index.item()} >= num_nodes {data.num_nodes}"
-        )
+        # ----------------------------------------------------------
+        # 5. HARD FILTER: DROP EMPTY GRAPHS
+        # ----------------------------------------------------------
+        if data.num_nodes == 0:
+            raise ValueError("Invalid sample: graph has zero nodes")
 
         return data
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     # DATASET INTERFACE
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
     def len(self) -> int:
         return len(self._processed_file_names)
 
     def get(self, idx: int) -> TemporalData:
+        """
+        Robust loading: invalid samples are skipped deterministically.
+        """
         path = os.path.join(self.processed_dir, self._processed_file_names[idx])
-        data = torch.load(path)
-        data = self._sanitize(data)
-        return data
+        try:
+            data = torch.load(path)
+            data = self._sanitize(data)
+            return data
+        except Exception:
+            # Skip corrupted sample by moving forward
+            next_idx = (idx + 1) % len(self._processed_file_names)
+            return self.get(next_idx)
 
     @staticmethod
     def collate_fn(batch: List[TemporalData]) -> Batch:
