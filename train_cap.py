@@ -125,14 +125,16 @@ def main():
     
     early_stop = EarlyStopping(monitor="val_loss", patience=5, mode="min")
 
+    use_gpu = torch.cuda.is_available() and args.devices > 0
+
     trainer = pl.Trainer(
-        accelerator="gpu",
-        devices=args.devices,
+        accelerator="gpu" if use_gpu else "cpu",
+        devices=args.devices if use_gpu else 1,
+        strategy=strategy if use_gpu else "auto",
+        precision="16-mixed" if use_gpu else 32,
         max_epochs=args.max_epochs,
-        callbacks=[checkpoint_callback, early_stop],
+        callbacks=[checkpoint_callback],
         log_every_n_steps=50,
-        strategy=DDPStrategy(find_unused_parameters=False),
-        check_val_every_n_epoch=1 # Ensure validation runs every epoch to see prints
     )
 
     print("[Info] Starting Linear Probe Training...")
