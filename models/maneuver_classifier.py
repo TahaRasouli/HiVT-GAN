@@ -45,15 +45,13 @@ class ManeuverClassifier(pl.LightningModule):
     def forward(self, batch):
         self.backbone.eval()
         with torch.no_grad():
-            # HiVT returns [Total_Nodes, 128]
+            # HiVT backbone returns [batch_size, 128]
             global_embed = self.backbone(batch)
-        
-        # Ego Selection: Ego is always at batch.ptr[:-1]
-        ego_indices = batch.ptr[:-1]
-        ego_embeds = global_embed[ego_indices]
-        
-        logits = self.head(ego_embeds)
+
+        # global_embed is already ego-centric and graph-level
+        logits = self.head(global_embed)
         return logits
+
 
     def training_step(self, batch, batch_idx):
         logits = self(batch)
