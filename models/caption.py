@@ -1,58 +1,59 @@
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from argparse import ArgumentParser
 from models.cvae_gan import CVAE_GAN
-from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 
 class CaptionFinetuner(pl.LightningModule):
     def __init__(self, pretrained_ckpt):
         super().__init__()
         self.save_hyperparameters()
         
-        # 1. Load Pre-trained CVAE_GAN
-        # strict=False is CRITICAL. It loads the backbone weights but ignores 
-        # that the checkpoint is missing the 'decoder.caption_head' weights.
+        # 1. Load Backbone (strict=False to ignore missing caption_head)
         print(f"Loading backbone from {pretrained_ckpt}...")
         self.model = CVAE_GAN.load_from_checkpoint(pretrained_ckpt, strict=False)
         
-        # 2. Freeze the Backbone
+        # 2. Freeze Backbone
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
             
-        # 3. Unfreeze ONLY the Caption Head
-        # These are the only weights that will be updated.
+        # 3. Unfreeze Caption Head
         for param in self.model.decoder.caption_head.parameters():
             param.requires_grad = True
             
-        self.ce_loss = nn.CrossEntropyLoss()
+        # 4. WEIGHTED LOSS (The Fix)
+        # Weights roughly inverse to frequency to prevent "Straight Drive" bias
+        weights = torch.tensor([
+            1.0,   # 0: Straight
+            15.0,  # 1: Left
+            15.0,  # 2: Right
+            50.0,  # 3: U-Turn
+            25.0,  # 4: Lane L
+            25.0,  # 5: Lane R
+            5.0    # 6: Stop
+        ])
+        self.register_buffer("class_weights", weights)
+        
+        self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights)
         self.validation_step_outputs = []
 
     def forward(self, data):
-        # Inference Logic: Use the CVAE Prior -> Z -> Decoder
+        # Inference: Prior -> Z -> Decoder -> Logits
         local_embed = self.model.local_encoder(data)
         global_embed = self.model.global_encoder(data, local_embed)
         _, _, caption_logits = self.model.decoder(global_embed, y_gt=None)
         return caption_logits
 
     def training_step(self, data, batch_idx):
-        # 1. Forward
-        # We pass y_gt=None to force the model to use the Prior (inference path)
-        # This ensures the classifier learns from the latent space used at runtime.
         logits = self(data)
-        
-        # 2. Label
         target = data.maneuver_label.squeeze()
         
-        # 3. Loss
         loss = self.ce_loss(logits, target)
         
-        # 4. Metrics
+        # Log accuracy (non-weighted, just raw correctness)
         acc = (torch.argmax(logits, dim=1) == target).float().mean()
         self.log("train_loss", loss, prog_bar=True, batch_size=data.num_graphs)
         self.log("train_acc", acc, prog_bar=True, batch_size=data.num_graphs)
-        
         return loss
 
     def validation_step(self, data, batch_idx):
@@ -89,48 +90,4 @@ class CaptionFinetuner(pl.LightningModule):
         self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
-        # Optimize ONLY the new head
         return torch.optim.Adam(self.model.decoder.caption_head.parameters(), lr=1e-3)
-
-def main():
-    pl.seed_everything(42)
-    parser = ArgumentParser()
-    parser.add_argument("--ckpt_path", type=str, required=True, help="Path to your CVAE checkpoint")
-    parser.add_argument("--root", type=str, required=True, help="Dataset root")
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--devices", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=10)
-    args = parser.parse_args()
-
-    datamodule = NuScenesHiVTDataModule(
-        root=args.root, 
-        split_file="balanced_splits.json", 
-        train_batch_size=args.batch_size, 
-        val_batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=8,
-        pin_memory=True
-    )
-    
-    model = CaptionFinetuner(pretrained_ckpt=args.ckpt_path)
-    
-    trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        accelerator="gpu",
-        devices=args.devices,
-        enable_checkpointing=True,
-        check_val_every_n_epoch=1,
-        callbacks=[
-            pl.callbacks.ModelCheckpoint(
-                monitor="val_acc", 
-                mode="max", 
-                filename="fast_caption_head-{epoch:02d}-{val_acc:.2f}"
-            )
-        ]
-    )
-    
-    print("--- Starting Superfast Caption Head Training ---")
-    trainer.fit(model, datamodule)
-
-if __name__ == "__main__":
-    main()
