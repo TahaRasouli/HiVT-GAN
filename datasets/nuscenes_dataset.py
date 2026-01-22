@@ -63,13 +63,14 @@ class NuScenesHiVTDataset(Dataset):
             print(f"Corrupt file: {path}")
             return self.get((idx + 1) % len(self))
 
+        # 1. Sanitize FIRST (Fixes bad indices before we do anything else)
         data = self._sanitize(data)
         
         # --- [FIX] INJECT MISSING ROTATE_MAT ---
         # The model expects 'rotate_mat'. If missing, we create an Identity matrix.
         if not hasattr(data, 'rotate_mat') and 'rotate_mat' not in data:
             # Determine number of nodes (agents) to shape the matrix correctly
-            if hasattr(data, 'x'):
+            if hasattr(data, 'x') and data.x is not None:
                 num_nodes = data.x.size(0)
             elif hasattr(data, 'num_nodes'):
                 num_nodes = data.num_nodes
@@ -77,12 +78,10 @@ class NuScenesHiVTDataset(Dataset):
                 num_nodes = 1 # Fallback
             
             # Create Identity Matrix: [num_nodes, 2, 2]
-            # This assumes the data is already in the correct coordinate frame 
-            # or that no rotation is needed.
             identity_rot = torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_nodes, 1, 1)
             data.rotate_mat = identity_rot
 
-        # --- 1. ROBUST CAPTION EXTRACTION ---
+        # --- 2. ROBUST CAPTION EXTRACTION ---
         cap_dict = {}
         if isinstance(data, dict):
              cap_dict = data.get('caption_dict', {})
@@ -98,11 +97,11 @@ class NuScenesHiVTDataset(Dataset):
         cat_str = getattr(data, 'maneuver_category', "Unknown")
         if isinstance(cat_str, list): cat_str = cat_str[0]
         
-        # --- 2. CONSTRUCT FULL TEXT ---
+        # --- 3. CONSTRUCT FULL TEXT ---
         full_text = f"{man_text} {lane_text} {scene_desc}".strip()
         if len(full_text) < 5: full_text = "Traffic scene."
 
-        # --- 3. BERT TOKENIZATION ---
+        # --- 4. BERT TOKENIZATION ---
         if self.tokenizer is not None:
             enc = self.tokenizer(
                 full_text, 
@@ -114,7 +113,7 @@ class NuScenesHiVTDataset(Dataset):
             data.input_ids = enc['input_ids'].squeeze(0)
             data.attention_mask = enc['attention_mask'].squeeze(0)
 
-        # --- 4. MAP LABELS FOR AUX LOSS ---
+        # --- 5. MAP LABELS FOR AUX LOSS ---
         m_id = MANEUVER_MAP.get(cat_str, -1)
         data.maneuver_id = torch.tensor([m_id], dtype=torch.long)
         data.maneuver_category = cat_str
@@ -128,12 +127,29 @@ class NuScenesHiVTDataset(Dataset):
         return data
 
     def _sanitize(self, data):
+        # 1. Check for bad dimensions in Lane-Actor Index
         if hasattr(data, "lane_actor_index"):
              lai = data.lane_actor_index
              if not torch.is_tensor(lai) or lai.numel() == 0:
                  data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
              elif lai.dim() == 1: 
                  data.lane_actor_index = lai.reshape(2, 1)
+
+             # --- CRITICAL FIX FOR CUDA ASSERTION ERROR ---
+             # Filter out edges that point to non-existent agents
+             if hasattr(data, 'x') and data.x is not None:
+                 num_nodes = data.x.size(0)
+                 # dim 0 is lane index, dim 1 is actor index. We check dim 1.
+                 # Ensure indices are within [0, num_nodes - 1]
+                 mask = (data.lane_actor_index[1] < num_nodes) & (data.lane_actor_index[1] >= 0)
+                 
+                 # Apply mask
+                 data.lane_actor_index = data.lane_actor_index[:, mask]
+                 
+                 # Also filter corresponding vectors if they exist
+                 if hasattr(data, "lane_actor_vectors") and torch.is_tensor(data.lane_actor_vectors):
+                     if data.lane_actor_vectors.shape[0] == mask.shape[0]: # Ensure sizes match before filtering
+                        data.lane_actor_vectors = data.lane_actor_vectors[mask]
 
         if hasattr(data, "lane_actor_vectors"):
              lav = data.lane_actor_vectors
