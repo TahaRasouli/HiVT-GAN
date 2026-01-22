@@ -5,7 +5,7 @@ from tqdm import tqdm
 from datasets.nuscenes_dataset import NuScenesHiVTDataset
 
 def validate_val_set(root):
-    split_file = "./balanced_splits.json"
+    split_file = os.path.join(root, "balanced_splits.json")
     
     print("Initializing Validation Dataset...")
     # We explicitly load the 'val' split
