@@ -1,8 +1,9 @@
 import os
 import json
 import torch
+import torch.nn.functional as F
 from typing import Optional
-from torch_geometric.data import Dataset, Batch
+from torch_geometric.data import Dataset, Batch, Data
 from utils import TemporalData
 
 # --- MAPPING ---
@@ -24,10 +25,12 @@ class NuScenesHiVTDataset(Dataset):
         transform=None,
         root: str = None, 
         max_samples: Optional[int] = None,
+        min_historical_steps: int = 20,
     ):
         self.split = split
         self.transform = transform
         self.tokenizer = tokenizer
+        self.min_historical_steps = min_historical_steps
         
         if not os.path.exists(split_file):
             raise FileNotFoundError(f"Split file not found: {split_file}")
@@ -56,20 +59,23 @@ class NuScenesHiVTDataset(Dataset):
             print(f"Corrupt file: {path}")
             return self.get((idx + 1) % len(self))
 
-        # 1. Sanitize Data
+        # 1. Sanitize Data (Crop & Align)
         data = self._sanitize(data)
         
-        # SKIP EMPTY GRAPHS
+        # 2. Skip Empty Graphs
         if data.num_nodes == 0:
             return self.get((idx + 1) % len(self))
 
-        # 2. Inject Rotate Mat if missing
+        # 3. Temporal Padding (Ensure history >= 20 steps)
+        data = self._pad_temporal(data)
+
+        # 4. Inject Rotate Mat if missing
         if not hasattr(data, 'rotate_mat') or data.rotate_mat is None:
             num_nodes = data.num_nodes 
             identity_rot = torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_nodes, 1, 1)
             data.rotate_mat = identity_rot
 
-        # 3. Extract Text/Labels
+        # 5. Extract Text/Labels
         cap_dict = getattr(data, 'caption_dict', {}) if not isinstance(data, dict) else data.get('caption_dict', {})
         cat_str = getattr(data, 'maneuver_category', "Unknown")
         if isinstance(cat_str, list): cat_str = cat_str[0]
@@ -84,22 +90,40 @@ class NuScenesHiVTDataset(Dataset):
 
         data.maneuver_id = torch.tensor([MANEUVER_MAP.get(cat_str, -1)], dtype=torch.long)
         
-        # 4. Use standard TemporalData (We handle batching in collate_fn now)
+        l_type = cap_dict.get('lane_type', "Unknown")
+        l_id = -1
+        for key, val in LANE_TYPE_MAP.items():
+            if key in l_type: l_id = val; break
+        data.lane_type_id = torch.tensor([l_id], dtype=torch.long)
+
+        # 6. Convert to TemporalData
         out_data = TemporalData()
         for key, value in data.to_dict().items():
             out_data[key] = value
         out_data.num_nodes = data.num_nodes
+        
         return out_data
 
+    def _pad_temporal(self, data):
+        if not hasattr(data, 'x') or data.x is None: return data
+        current_steps = data.x.size(1)
+        if current_steps >= self.min_historical_steps: return data
+        pad = self.min_historical_steps - current_steps
+        
+        data.x = F.pad(data.x, (0, 0, 0, pad))
+        if hasattr(data, 'positions'): data.positions = F.pad(data.positions, (0, 0, 0, pad))
+        if hasattr(data, 'rotate_angles'): data.rotate_angles = F.pad(data.rotate_angles, (0, pad))
+        if hasattr(data, 'padding_mask'): data.padding_mask = F.pad(data.padding_mask, (0, pad), value=True)
+        if hasattr(data, 'bos_mask'): data.bos_mask = F.pad(data.bos_mask, (0, pad), value=True)
+        return data
+
     def _sanitize(self, data):
-        # A. Node Count Alignment
+        # A. Node Count
         node_counts = []
         if hasattr(data, 'x') and torch.is_tensor(data.x): node_counts.append(data.x.size(0))
         if hasattr(data, 'positions') and torch.is_tensor(data.positions): node_counts.append(data.positions.size(0))
-        
         valid_num_nodes = min(node_counts) if node_counts else 0
         
-        # Crop Node Tensors
         for key in ['x', 'positions', 'padding_mask', 'bos_mask', 'rotate_angles', 'y']:
             if hasattr(data, key):
                 tensor = getattr(data, key)
@@ -116,12 +140,11 @@ class NuScenesHiVTDataset(Dataset):
                 data.av_index = data.av_index[data.av_index < valid_num_nodes]
                 if data.av_index.numel() == 0: data.av_index = torch.tensor([0], device=data.x.device)
 
-        # C. Lane Count Alignment
+        # C. Lane Count
         lane_counts = []
         if hasattr(data, 'lane_vectors') and torch.is_tensor(data.lane_vectors): lane_counts.append(data.lane_vectors.size(0))
-        if hasattr(data, 'is_intersections') and torch.is_tensor(data.is_intersections): lane_counts.append(data.is_intersections.size(0))
-        
         real_num_lanes = min(lane_counts) if lane_counts else 0
+        
         for key in ['lane_vectors', 'is_intersections', 'turn_directions', 'traffic_controls']:
             if hasattr(data, key):
                 tensor = getattr(data, key)
@@ -150,7 +173,7 @@ class NuScenesHiVTDataset(Dataset):
                 data.edge_index = torch.empty((2, 0), dtype=torch.long)
             else:
                 if ei.dim() == 1: ei = ei.reshape(2, 1)
-                valid_mask = (ei[0] < valid_num_nodes) & (ei[1] < valid_num_nodes)
+                valid_mask = (ei[0] < valid_num_nodes) & (ei[1] < valid_num_nodes) & (ei[0] >= 0) & (ei[1] >= 0)
                 data.edge_index = ei[:, valid_mask]
 
         # E. Clamp Categorical
@@ -165,18 +188,19 @@ class NuScenesHiVTDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch_list):
-        # 1. Standard PyG Batching (Handles x, positions, edge_index, etc.)
+        # 1. Base Batching (Stacks tensors)
         batch = Batch.from_data_list(batch_list)
         
-        # 2. MANUAL FIX for Lane-Actor Index (The Source of Crashes)
-        # We manually calculate offsets to guarantee correctness
+        # 2. MANUAL RE-BATCHING of Indices (Guarantees Correctness)
         lane_actor_indices = []
         lane_actor_vectors = []
+        edge_indices = []
+        
         lane_offset = 0
         node_offset = 0
         
         for data in batch_list:
-            # Shift Indices
+            # Re-calc Lane-Actor Index
             if hasattr(data, 'lane_actor_index') and data.lane_actor_index.numel() > 0:
                 lai = data.lane_actor_index.clone()
                 lai[0] += lane_offset # Row 0: Lanes
@@ -186,12 +210,18 @@ class NuScenesHiVTDataset(Dataset):
                 if hasattr(data, 'lane_actor_vectors'):
                     lane_actor_vectors.append(data.lane_actor_vectors)
             
+            # Re-calc Edge Index
+            if hasattr(data, 'edge_index') and data.edge_index.numel() > 0:
+                ei = data.edge_index.clone()
+                ei += node_offset # Both rows: Actors
+                edge_indices.append(ei)
+
             # Update Offsets
             if hasattr(data, 'lane_vectors') and data.lane_vectors is not None:
                 lane_offset += data.lane_vectors.size(0)
             node_offset += data.num_nodes
             
-        # Overwrite the batched index with our manually calculated one
+        # Overwrite Batch Attributes
         if len(lane_actor_indices) > 0:
             batch.lane_actor_index = torch.cat(lane_actor_indices, dim=1)
             if len(lane_actor_vectors) > 0:
@@ -199,5 +229,10 @@ class NuScenesHiVTDataset(Dataset):
         else:
             batch.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
             batch.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
+
+        if len(edge_indices) > 0:
+            batch.edge_index = torch.cat(edge_indices, dim=1)
+        else:
+            batch.edge_index = torch.empty((2, 0), dtype=torch.long)
             
         return batch
