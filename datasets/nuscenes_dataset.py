@@ -1,7 +1,6 @@
 import os
 import json
 import torch
-import torch.nn.functional as F
 from typing import Optional
 from torch_geometric.data import Dataset, Batch
 from utils import TemporalData
@@ -16,18 +15,6 @@ LANE_TYPE_MAP = {
     "Single-lane": 0, "2-lane": 1, "3-lane": 2, "4-lane": 3, "Multi-lane": 4, "Unknown": -1
 }
 
-# --- CUSTOM DATA CLASS FOR CORRECT BATCHING ---
-class HiVTTemporalData(TemporalData):
-    def __inc__(self, key, value, *args, **kwargs):
-        if key == 'lane_actor_index':
-            # Bipartite graph: Row 0 (Lanes), Row 1 (Actors)
-            return torch.tensor([[self['lane_vectors'].size(0)], [self.num_nodes]])
-        elif key == 'edge_index' or 'edge_index' in key:
-            # Agent-Agent graph -> Increment by num_nodes
-            return self.num_nodes
-        else:
-            return super().__inc__(key, value, *args, **kwargs)
-
 class NuScenesHiVTDataset(Dataset):
     def __init__(
         self,
@@ -37,12 +24,10 @@ class NuScenesHiVTDataset(Dataset):
         transform=None,
         root: str = None, 
         max_samples: Optional[int] = None,
-        min_historical_steps: int = 20, # HiVT standard
     ):
         self.split = split
         self.transform = transform
         self.tokenizer = tokenizer
-        self.min_historical_steps = min_historical_steps
         
         if not os.path.exists(split_file):
             raise FileNotFoundError(f"Split file not found: {split_file}")
@@ -71,16 +56,12 @@ class NuScenesHiVTDataset(Dataset):
             print(f"Corrupt file: {path}")
             return self.get((idx + 1) % len(self))
 
-        # 1. Sanitize Data (Spatial alignment)
+        # 1. Sanitize Data
         data = self._sanitize(data)
         
-        # --- SKIP EMPTY GRAPHS ---
+        # SKIP EMPTY GRAPHS
         if data.num_nodes == 0:
             return self.get((idx + 1) % len(self))
-
-        # --- CRITICAL FIX: TEMPORAL PADDING ---
-        # Ensure data has at least 'min_historical_steps' (20) frames
-        data = self._pad_temporal(data)
 
         # 2. Inject Rotate Mat if missing
         if not hasattr(data, 'rotate_mat') or data.rotate_mat is None:
@@ -90,131 +71,64 @@ class NuScenesHiVTDataset(Dataset):
 
         # 3. Extract Text/Labels
         cap_dict = getattr(data, 'caption_dict', {}) if not isinstance(data, dict) else data.get('caption_dict', {})
-        man_text = cap_dict.get('maneuver_type', "")
-        lane_text = cap_dict.get('lane_status', "")
-        scene_desc = cap_dict.get('scene_description', "")
-        
         cat_str = getattr(data, 'maneuver_category', "Unknown")
         if isinstance(cat_str, list): cat_str = cat_str[0]
         
-        full_text = f"{man_text} {lane_text} {scene_desc}".strip()
+        full_text = f"{cap_dict.get('maneuver_type', '')} {cap_dict.get('lane_status', '')} {cap_dict.get('scene_description', '')}".strip()
         if len(full_text) < 5: full_text = "Traffic scene."
 
         if self.tokenizer is not None:
-            enc = self.tokenizer(
-                full_text, return_tensors='pt', padding='max_length', truncation=True, max_length=64 
-            )
+            enc = self.tokenizer(full_text, return_tensors='pt', padding='max_length', truncation=True, max_length=64)
             data.input_ids = enc['input_ids'].squeeze(0)
             data.attention_mask = enc['attention_mask'].squeeze(0)
 
-        m_id = MANEUVER_MAP.get(cat_str, -1)
-        data.maneuver_id = torch.tensor([m_id], dtype=torch.long)
+        data.maneuver_id = torch.tensor([MANEUVER_MAP.get(cat_str, -1)], dtype=torch.long)
         
-        l_type = cap_dict.get('lane_type', "Unknown")
-        l_id = -1
-        for key, val in LANE_TYPE_MAP.items():
-            if key in l_type: l_id = val; break
-        data.lane_type_id = torch.tensor([l_id], dtype=torch.long)
-        
-        # --- 4. CONVERT TO HiVTTemporalData ---
-        safe_data = HiVTTemporalData()
+        # 4. Use standard TemporalData (We handle batching in collate_fn now)
+        out_data = TemporalData()
         for key, value in data.to_dict().items():
-            safe_data[key] = value
-        safe_data.num_nodes = data.num_nodes
-        
-        return safe_data
-
-    def _pad_temporal(self, data):
-        """
-        Pads temporal tensors (x, positions, masks) to ensure they match model's expected history.
-        """
-        if not hasattr(data, 'x') or data.x is None:
-            return data
-            
-        current_steps = data.x.size(1)
-        if current_steps >= self.min_historical_steps:
-            return data # No padding needed
-            
-        pad_amt = self.min_historical_steps - current_steps
-        
-        # Pad x: [N, T, D] -> Pad T (dim 1)
-        # F.pad format for 3D tensor: (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right, ...)
-        # We want to pad 2nd last dimension (Time) on the right.
-        data.x = F.pad(data.x, (0, 0, 0, pad_amt))
-        
-        # Pad positions: [N, T, 2]
-        if hasattr(data, 'positions'):
-            data.positions = F.pad(data.positions, (0, 0, 0, pad_amt))
-            
-        # Pad rotate_angles: [N, T]
-        if hasattr(data, 'rotate_angles'):
-            data.rotate_angles = F.pad(data.rotate_angles, (0, pad_amt))
-            
-        # Pad padding_mask: [N, T] -> Pad with TRUE (invalid)
-        if hasattr(data, 'padding_mask'):
-            data.padding_mask = F.pad(data.padding_mask, (0, pad_amt), value=True)
-            
-        # Pad bos_mask: [N, T] -> Pad with TRUE (invalid/no signal)
-        if hasattr(data, 'bos_mask'):
-            data.bos_mask = F.pad(data.bos_mask, (0, pad_amt), value=True)
-            
-        return data
+            out_data[key] = value
+        out_data.num_nodes = data.num_nodes
+        return out_data
 
     def _sanitize(self, data):
-        """
-        Full-Spectrum Sanitization.
-        """
-        # --- A. CONSISTENT NODE COUNT ---
+        # A. Node Count Alignment
         node_counts = []
         if hasattr(data, 'x') and torch.is_tensor(data.x): node_counts.append(data.x.size(0))
         if hasattr(data, 'positions') and torch.is_tensor(data.positions): node_counts.append(data.positions.size(0))
         
-        if len(node_counts) > 0:
-            valid_num_nodes = min(node_counts)
-        else:
-            valid_num_nodes = 0
-
+        valid_num_nodes = min(node_counts) if node_counts else 0
+        
         # Crop Node Tensors
-        node_keys = ['x', 'positions', 'padding_mask', 'bos_mask', 'rotate_angles', 'y']
-        for key in node_keys:
+        for key in ['x', 'positions', 'padding_mask', 'bos_mask', 'rotate_angles', 'y']:
             if hasattr(data, key):
                 tensor = getattr(data, key)
                 if torch.is_tensor(tensor) and tensor.size(0) > valid_num_nodes:
                     setattr(data, key, tensor[:valid_num_nodes])
         data.num_nodes = valid_num_nodes
-        
         if valid_num_nodes == 0: return data
 
-        # --- B. FIX AV_INDEX ---
+        # B. AV Index
         if hasattr(data, 'av_index') and torch.is_tensor(data.av_index):
-            if data.av_index.numel() == 1:
-                if data.av_index.item() >= valid_num_nodes:
-                    data.av_index.fill_(0)
-            else:
+            if data.av_index.numel() == 1 and data.av_index.item() >= valid_num_nodes:
+                data.av_index.fill_(0)
+            elif data.av_index.numel() > 1:
                 data.av_index = data.av_index[data.av_index < valid_num_nodes]
-                if data.av_index.numel() == 0:
-                    data.av_index = torch.tensor([0], device=data.x.device if hasattr(data, 'x') else 'cpu')
+                if data.av_index.numel() == 0: data.av_index = torch.tensor([0], device=data.x.device)
 
-        # --- C. CONSISTENT LANE COUNT ---
+        # C. Lane Count Alignment
         lane_counts = []
         if hasattr(data, 'lane_vectors') and torch.is_tensor(data.lane_vectors): lane_counts.append(data.lane_vectors.size(0))
         if hasattr(data, 'is_intersections') and torch.is_tensor(data.is_intersections): lane_counts.append(data.is_intersections.size(0))
-        if hasattr(data, 'turn_directions') and torch.is_tensor(data.turn_directions): lane_counts.append(data.turn_directions.size(0))
-        if hasattr(data, 'traffic_controls') and torch.is_tensor(data.traffic_controls): lane_counts.append(data.traffic_controls.size(0))
-
-        if len(lane_counts) > 0:
-            real_num_lanes = min(lane_counts)
-        else:
-            real_num_lanes = 0
-            
-        lane_keys = ['lane_vectors', 'is_intersections', 'turn_directions', 'traffic_controls']
-        for key in lane_keys:
+        
+        real_num_lanes = min(lane_counts) if lane_counts else 0
+        for key in ['lane_vectors', 'is_intersections', 'turn_directions', 'traffic_controls']:
             if hasattr(data, key):
                 tensor = getattr(data, key)
                 if torch.is_tensor(tensor) and tensor.size(0) > real_num_lanes:
                     setattr(data, key, tensor[:real_num_lanes])
 
-        # --- D. FILTER EDGES ---
+        # D. Filter Edges
         if hasattr(data, "lane_actor_index"):
             lai = data.lane_actor_index
             if real_num_lanes == 0 or not torch.is_tensor(lai) or lai.numel() == 0:
@@ -222,11 +136,8 @@ class NuScenesHiVTDataset(Dataset):
                 data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
             else:
                 if lai.dim() == 1: lai = lai.reshape(2, 1)
-                mask_lanes = (lai[0] < real_num_lanes) & (lai[0] >= 0)
-                mask_actors = (lai[1] < valid_num_nodes) & (lai[1] >= 0)
-                valid_mask = mask_lanes & mask_actors
+                valid_mask = (lai[0] < real_num_lanes) & (lai[1] < valid_num_nodes) & (lai[0] >= 0) & (lai[1] >= 0)
                 data.lane_actor_index = lai[:, valid_mask]
-                
                 if hasattr(data, "lane_actor_vectors") and torch.is_tensor(data.lane_actor_vectors):
                     if data.lane_actor_vectors.shape[0] == valid_mask.shape[0]:
                         data.lane_actor_vectors = data.lane_actor_vectors[valid_mask]
@@ -239,11 +150,10 @@ class NuScenesHiVTDataset(Dataset):
                 data.edge_index = torch.empty((2, 0), dtype=torch.long)
             else:
                 if ei.dim() == 1: ei = ei.reshape(2, 1)
-                mask_src = (ei[0] < valid_num_nodes) & (ei[0] >= 0)
-                mask_dst = (ei[1] < valid_num_nodes) & (ei[1] >= 0)
-                data.edge_index = ei[:, mask_src & mask_dst]
+                valid_mask = (ei[0] < valid_num_nodes) & (ei[1] < valid_num_nodes)
+                data.edge_index = ei[:, valid_mask]
 
-        # --- E. CLAMP CATEGORICAL INDICES ---
+        # E. Clamp Categorical
         if hasattr(data, 'is_intersections') and torch.is_tensor(data.is_intersections):
             data.is_intersections = torch.clamp(data.is_intersections, min=0, max=1)
         if hasattr(data, 'traffic_controls') and torch.is_tensor(data.traffic_controls):
@@ -254,5 +164,40 @@ class NuScenesHiVTDataset(Dataset):
         return data
 
     @staticmethod
-    def collate_fn(batch):
-        return Batch.from_data_list(batch)
+    def collate_fn(batch_list):
+        # 1. Standard PyG Batching (Handles x, positions, edge_index, etc.)
+        batch = Batch.from_data_list(batch_list)
+        
+        # 2. MANUAL FIX for Lane-Actor Index (The Source of Crashes)
+        # We manually calculate offsets to guarantee correctness
+        lane_actor_indices = []
+        lane_actor_vectors = []
+        lane_offset = 0
+        node_offset = 0
+        
+        for data in batch_list:
+            # Shift Indices
+            if hasattr(data, 'lane_actor_index') and data.lane_actor_index.numel() > 0:
+                lai = data.lane_actor_index.clone()
+                lai[0] += lane_offset # Row 0: Lanes
+                lai[1] += node_offset # Row 1: Actors
+                lane_actor_indices.append(lai)
+                
+                if hasattr(data, 'lane_actor_vectors'):
+                    lane_actor_vectors.append(data.lane_actor_vectors)
+            
+            # Update Offsets
+            if hasattr(data, 'lane_vectors') and data.lane_vectors is not None:
+                lane_offset += data.lane_vectors.size(0)
+            node_offset += data.num_nodes
+            
+        # Overwrite the batched index with our manually calculated one
+        if len(lane_actor_indices) > 0:
+            batch.lane_actor_index = torch.cat(lane_actor_indices, dim=1)
+            if len(lane_actor_vectors) > 0:
+                batch.lane_actor_vectors = torch.cat(lane_actor_vectors, dim=0)
+        else:
+            batch.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
+            batch.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
+            
+        return batch
