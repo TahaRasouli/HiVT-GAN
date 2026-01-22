@@ -72,7 +72,7 @@ def check_batch(batch, batch_idx):
 def main():
     # Update this path to your actual processed data root
     root = "/mount/studenten/projects/rasoulta/dataset/tmpl-captioned"
-    split_file = os.path.join(root, "split_datas.json")
+    split_file = os.path.join(root, "balanced_splits.json")
     
     print("Initializing Dataset...")
     # We set max_samples=None to check everything
