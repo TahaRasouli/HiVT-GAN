@@ -38,7 +38,7 @@ def main():
         val_batch_size=args.val_batch_size,
         num_workers=args.num_workers,
         tokenizer=tokenizer, 
-        pin_memory=True,
+        pin_memory=False, # <--- CRITICAL FIX: Disable pinning to stop memory corruption
         persistent_workers=(args.num_workers > 0)
     )
 
@@ -50,7 +50,6 @@ def main():
     )
     early_stop = EarlyStopping(monitor='val_acc', patience=5, mode='max')
 
-    # 5. Trainer
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator='gpu',
@@ -58,10 +57,7 @@ def main():
         callbacks=[checkpoint_callback, early_stop],
         log_every_n_steps=10,
         strategy='ddp_find_unused_parameters_true' if args.devices > 1 else 'auto',
-        
-        # --- ADD THESE TWO LINES ---
-        num_sanity_val_steps=0,  # Skip the crash-prone sanity check
-        limit_val_batches=0.0    # Temporarily disable validation to see if training runs
+        num_sanity_val_steps=0 # Skip sanity check to get straight to training
     )
 
     print("Starting Training...")

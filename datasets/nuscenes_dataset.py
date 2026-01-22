@@ -71,25 +71,21 @@ class NuScenesHiVTDataset(Dataset):
 
         # 4. REGENERATE ROTATE MAT (Robust Version)
         num_nodes = data.num_nodes
-        if hasattr(data, 'rotate_angles') and data.rotate_angles is not None:
-            if data.rotate_angles.numel() == 0:
-                 data.rotate_mat = torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_nodes, 1, 1)
+        if hasattr(data, 'rotate_angles') and data.rotate_angles is not None and data.rotate_angles.numel() > 0:
+            if data.rotate_angles.dim() == 1:
+                theta = data.rotate_angles
+            elif data.rotate_angles.dim() == 2:
+                theta = data.rotate_angles[:, -1]
             else:
-                if data.rotate_angles.dim() == 1:
-                    theta = data.rotate_angles
-                elif data.rotate_angles.dim() == 2:
-                    theta = data.rotate_angles[:, -1]
-                else:
-                    theta = torch.zeros(num_nodes, device=data.x.device)
+                theta = torch.zeros(num_nodes, device=data.x.device)
 
-                # Ensure theta matches num_nodes (just in case)
-                if theta.size(0) != num_nodes:
-                    theta = theta[:num_nodes]
+            if theta.size(0) != num_nodes: # Double check size
+                theta = F.pad(theta, (0, max(0, num_nodes - theta.size(0))))[:num_nodes]
 
-                cos, sin = theta.cos(), theta.sin()
-                row1 = torch.stack([cos, -sin], dim=1)
-                row2 = torch.stack([sin, cos], dim=1)
-                data.rotate_mat = torch.stack([row1, row2], dim=1)
+            cos, sin = theta.cos(), theta.sin()
+            row1 = torch.stack([cos, -sin], dim=1)
+            row2 = torch.stack([sin, cos], dim=1)
+            data.rotate_mat = torch.stack([row1, row2], dim=1)
         else:
             data.rotate_mat = torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_nodes, 1, 1)
 
@@ -130,11 +126,8 @@ class NuScenesHiVTDataset(Dataset):
         
         data.x = F.pad(data.x, (0, 0, 0, pad))
         if hasattr(data, 'positions'): data.positions = F.pad(data.positions, (0, 0, 0, pad))
-        
-        # Only pad rotate_angles if it's 2D [N, T]
         if hasattr(data, 'rotate_angles') and data.rotate_angles.dim() == 2:
              data.rotate_angles = F.pad(data.rotate_angles, (0, pad))
-             
         if hasattr(data, 'padding_mask'): data.padding_mask = F.pad(data.padding_mask, (0, pad), value=True)
         if hasattr(data, 'bos_mask'): data.bos_mask = F.pad(data.bos_mask, (0, pad), value=True)
         return data
@@ -153,9 +146,7 @@ class NuScenesHiVTDataset(Dataset):
                     setattr(data, key, tensor[:valid_num_nodes])
         data.num_nodes = valid_num_nodes
         
-        # Force delete bad rotate_mat
         if hasattr(data, 'rotate_mat'): del data.rotate_mat
-        
         if valid_num_nodes == 0: return data
 
         # B. AV Index
