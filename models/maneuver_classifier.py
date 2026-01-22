@@ -63,37 +63,31 @@ class ManeuverClassifier(pl.LightningModule):
     # FORWARD (EGO POOLING WITH FALLBACK)
     # --------------------------------------------------------------
     def forward(self, batch):
-        """
-        Returns logits of shape [B, num_classes].
-        """
         self.backbone.eval()
         with torch.no_grad():
-            node_embeddings = self.backbone(batch)
-            # Expected: [B, N, 128]
+            # Backbone output: [B, N, 128]
+            global_embed = self.backbone(batch)
 
-        if node_embeddings.dim() != 3:
-            raise RuntimeError(f"Expected backbone output [B,N,D], got {node_embeddings.shape}")
+        assert global_embed.dim() == 3, (
+            f"Expected [B, N, D], got {global_embed.shape}"
+        )
 
-        B, N, D = node_embeddings.shape
-        if B == 0 or N == 0:
-            # Empty batch / empty graph case
-            return torch.empty((0, self.head[-1].out_features), device=node_embeddings.device)
+        B, N, D = global_embed.shape
 
-        # Prefer ego_index if present; otherwise default to 0
-        if hasattr(batch, "ego_index"):
-            ego_idx = batch.ego_index.view(-1).long()
-            if ego_idx.numel() != B:
-                # If ego_index exists but doesn't match, fall back
-                ego_idx = torch.zeros((B,), dtype=torch.long, device=node_embeddings.device)
-        else:
-            ego_idx = torch.zeros((B,), dtype=torch.long, device=node_embeddings.device)
+        assert hasattr(batch, "ego_index"), "Batch missing ego_index"
+        assert batch.ego_index.numel() == B, (
+            f"ego_index must have length B={B}, got {batch.ego_index.numel()}"
+        )
 
-        # Bound check
-        ego_idx = torch.clamp(ego_idx, 0, N - 1)
+        # Extract one ego per graph
+        ego_embeds = global_embed[
+            torch.arange(B, device=global_embed.device),
+            batch.ego_index
+        ]  # [B, 128]
 
-        ego_embed = node_embeddings[torch.arange(B, device=node_embeddings.device), ego_idx]  # [B, D]
-        logits = self.head(ego_embed)  # [B, num_classes]
+        logits = self.head(ego_embeds)  # [B, num_classes]
         return logits
+
 
     # --------------------------------------------------------------
     # TRAINING STEP
@@ -140,21 +134,16 @@ class ManeuverClassifier(pl.LightningModule):
     # VALIDATION STEP
     # --------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
-        # Forward
-        logits = self(batch)                  # [B, num_classes]
-        targets = batch.maneuver_id.view(-1)  # [B]
+        logits = self(batch)                   # [B, 7]
+        targets = batch.maneuver_id.view(-1)   # [B]
 
-        # Loss
         loss = self.criterion(logits, targets)
 
-        # Predictions
         preds = torch.argmax(logits, dim=1)
 
-        # Metrics (accumulated across epoch)
         self.val_acc.update(preds, targets)
         self.val_f1_per_class.update(preds, targets)
 
-        # Log ONLY epoch-level values (no spam)
         self.log(
             "val_loss",
             loss,
@@ -165,6 +154,7 @@ class ManeuverClassifier(pl.LightningModule):
         )
 
         return loss
+
 
 
     # --------------------------------------------------------------
