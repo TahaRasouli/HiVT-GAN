@@ -46,7 +46,7 @@ class CaptionFinetuner(pl.LightningModule):
 
     def training_step(self, data, batch_idx):
         logits = self(data)
-        target = data.maneuver_label.squeeze()
+        target = data.maneuver_id.squeeze()
         
         loss = self.ce_loss(logits, target)
         
@@ -58,7 +58,7 @@ class CaptionFinetuner(pl.LightningModule):
 
     def validation_step(self, data, batch_idx):
         logits = self(data)
-        target = data.maneuver_label.squeeze()
+        target = data.maneuver_id.squeeze()
         loss = self.ce_loss(logits, target)
         
         preds = torch.argmax(logits, dim=1)
