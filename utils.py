@@ -41,9 +41,12 @@ class TemporalData(Data):
 
     def __cat_dim__(self, key, value, store=None):
         # Indices are concatenated along dim=1 in PyG
-        if key in ("edge_index", "lane_actor_index"):
-            return 1
-        return super().__cat_dim__(key, value, store)
+        # if key in ("edge_index", "lane_actor_index"):
+        #     return 1
+        # return super().__cat_dim__(key, value, store)
+        if key == "ego_index":
+            return None
+        return super().__cat_dim__(key, value, *args, **kwargs)
 
     def __inc__(self, key, value, store=None):
         if key == "edge_index":

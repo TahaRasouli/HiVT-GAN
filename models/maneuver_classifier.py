@@ -124,6 +124,9 @@ class ManeuverClassifier(pl.LightningModule):
     # VALIDATION STEP
     # --------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
+        if batch_idx == 0:
+            print("ego_index shape:", batch.ego_index.shape)
+            
         logits = self(batch)
         targets = batch.maneuver_id.view(-1)
 
