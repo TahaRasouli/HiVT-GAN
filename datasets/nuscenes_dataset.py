@@ -80,25 +80,26 @@ class NuScenesHiVTDataset(Dataset):
         # --------------------------------------------------------------
         # 1. GRAPH INDEX SANITIZATION
         # --------------------------------------------------------------
-        if hasattr(data, "lane_actor_index"):
+        if hasattr(data, "lane_actor_index") and hasattr(data, "lane_vectors"):
             lai = data.lane_actor_index
-            if not torch.is_tensor(lai):
-                data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
-            elif lai.numel() == 0:
-                data.lane_actor_index = lai.reshape(2, 0)
-            elif lai.dim() == 1 and lai.size(0) == 2:
-                data.lane_actor_index = lai.reshape(2, 1)
-            elif lai.dim() != 2 or lai.size(0) != 2:
-                data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
+            num_lanes = data.lane_vectors.size(0)
+            num_actors = data.num_nodes
+
+            valid = (lai[0] >= 0) & (lai[0] < num_lanes) & \
+                    (lai[1] >= 0) & (lai[1] < num_actors)
+
+            data.lane_actor_index = lai[:, valid]
+
 
         if hasattr(data, "edge_index"):
             ei = data.edge_index
-            if not torch.is_tensor(ei) or ei.numel() == 0:
-                data.edge_index = torch.empty((2, 0), dtype=torch.long)
-            elif ei.dim() == 1 and ei.size(0) == 2:
-                data.edge_index = ei.reshape(2, 1)
-            elif ei.dim() != 2 or ei.size(0) != 2:
-                data.edge_index = torch.empty((2, 0), dtype=torch.long)
+            num_nodes = data.num_nodes
+
+            valid = (ei[0] >= 0) & (ei[0] < num_nodes) & \
+                    (ei[1] >= 0) & (ei[1] < num_nodes)
+
+            data.edge_index = ei[:, valid]
+
 
         # --------------------------------------------------------------
         # 2. VECTOR SHAPE FIXES
