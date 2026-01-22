@@ -100,10 +100,10 @@ def main():
     # ---------------------------------------------------------
     # 3. Load Backbone & Initialize Classifier
     # ---------------------------------------------------------
-    print(f"[Info] Loading Frozen Backbone from: {args.backbone_ckpt}")
+    print(f"[Info] Loading Frozen Backbone from: {args.ckpt_path}")
     
     # Load CVAE (strict=False ignores extra GAN keys if present)
-    backbone = CVAE.load_from_checkpoint(args.backbone_ckpt)
+    backbone = CVAE.load_from_checkpoint(args.ckpt_path)
     
     # Initialize our wrapping model
     model = ManeuverClassifier(
