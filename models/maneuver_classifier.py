@@ -6,7 +6,7 @@ from torchmetrics import Accuracy, F1Score
 
 class ManeuverClassifier(pl.LightningModule):
     """
-    Graph-level maneuver classifier on top of a frozen HiVT / CVAE backbone.
+    Ego-centric maneuver classifier on top of a frozen HiVT / CVAE backbone.
     """
 
     def __init__(
@@ -20,7 +20,7 @@ class ManeuverClassifier(pl.LightningModule):
         self.save_hyperparameters(ignore=["frozen_backbone"])
 
         # ----------------------------------------------------------
-        # 1. BACKBONE (FROZEN)
+        # 1. FROZEN BACKBONE
         # ----------------------------------------------------------
         self.backbone = frozen_backbone
         self.backbone.eval()
@@ -59,7 +59,7 @@ class ManeuverClassifier(pl.LightningModule):
         ]
 
     # --------------------------------------------------------------
-    # FORWARD
+    # FORWARD (EGO POOLING)
     # --------------------------------------------------------------
     def forward(self, batch):
         """
@@ -67,21 +67,28 @@ class ManeuverClassifier(pl.LightningModule):
         """
         self.backbone.eval()
         with torch.no_grad():
-            global_embed = self.backbone(batch)
+            node_embeddings = self.backbone(batch)
+            # node_embeddings: [B, N, 128]
 
-        # Normalize backbone output shape
-        # Acceptable:
-        #   [B, D]
-        #   [B, 1, D] -> squeeze
-        if global_embed.dim() == 3 and global_embed.size(1) == 1:
-            global_embed = global_embed.squeeze(1)
-
-        # Final safety
-        assert global_embed.dim() == 2, (
-            f"Backbone output must be [B,D], got {global_embed.shape}"
+        assert node_embeddings.dim() == 3, (
+            f"Expected [B,N,D] from backbone, got {node_embeddings.shape}"
         )
 
-        logits = self.head(global_embed)
+        B = node_embeddings.size(0)
+
+        # Ego indices must exist and be valid
+        assert hasattr(batch, "ego_index"), "Batch missing ego_index"
+        ego_idx = batch.ego_index.view(-1)
+
+        assert ego_idx.numel() == B, (
+            f"Ego index mismatch: B={B}, ego_idx={ego_idx}"
+        )
+
+        # Ego pooling
+        ego_embed = node_embeddings[torch.arange(B, device=ego_idx.device), ego_idx]
+        # ego_embed: [B, 128]
+
+        logits = self.head(ego_embed)
         return logits
 
     # --------------------------------------------------------------
@@ -89,16 +96,10 @@ class ManeuverClassifier(pl.LightningModule):
     # --------------------------------------------------------------
     def training_step(self, batch, batch_idx):
         targets = batch.maneuver_id.view(-1).long()
-
-        # Skip empty batches (Lightning + PyG edge case)
         if targets.numel() == 0:
             return None
 
         logits = self(batch)
-
-        # Shape hygiene
-        logits = logits.view(logits.size(0), -1)
-        targets = targets.view(-1)
 
         assert logits.size(0) == targets.size(0), (
             f"Train N mismatch: logits {logits.shape}, targets {targets.shape}"
@@ -119,16 +120,10 @@ class ManeuverClassifier(pl.LightningModule):
     # --------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
         targets = batch.maneuver_id.view(-1).long()
-
-        # Skip empty batches
         if targets.numel() == 0:
             return None
 
         logits = self(batch)
-
-        # Shape hygiene
-        logits = logits.view(logits.size(0), -1)
-        targets = targets.view(-1)
 
         assert logits.size(0) == targets.size(0), (
             f"Val N mismatch: logits {logits.shape}, targets {targets.shape}"
