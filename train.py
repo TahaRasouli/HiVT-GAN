@@ -28,24 +28,22 @@ def main():
     # 2. DataModule
     print("Setting up DataModule...")
     
-    # --- FIX START ---
-    # Use the root path to find the split file. 
-    # Change "split_datas.json" to "balanced_splits.json" ONLY if you are sure that file exists in args.root
-    split_path = os.path.join(args.root, "split_datas.json") 
-    
+    # --- FIX: Dynamically find the split file ---
+    split_path = os.path.join(args.root, "split_datas.json")
     if not os.path.exists(split_path):
-        print(f"Warning: {split_path} not found. Trying balanced_splits.json...")
+        # Fallback if you renamed it
         split_path = os.path.join(args.root, "balanced_splits.json")
-    # --- FIX END ---
-
+        if not os.path.exists(split_path):
+            raise FileNotFoundError(f"Could not find split file in {args.root}")
+    
     datamodule = NuScenesHiVTDataModule(
         root=args.root,
         split_file=split_path,
         train_batch_size=args.train_batch_size,
         val_batch_size=args.val_batch_size,
         num_workers=args.num_workers,
-        tokenizer=tokenizer,
-        pin_memory=True,
+        tokenizer=tokenizer, 
+        pin_memory=True, # Set to False if you see cuda errors again
         persistent_workers=(args.num_workers > 0)
     )
 
@@ -71,7 +69,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator='gpu',
-        devices=args.devices, # This will use the list [1] if you pass --devices 1 and set CUDA_VISIBLE_DEVICES
+        devices=args.devices,
         callbacks=[checkpoint_callback, early_stop],
         log_every_n_steps=10,
         strategy='ddp_find_unused_parameters_true' if args.devices > 1 else 'auto'
