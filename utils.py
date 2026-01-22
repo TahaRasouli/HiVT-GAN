@@ -1,8 +1,8 @@
 from typing import List, Optional, Tuple
-
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
+import random
 
 
 class TemporalData(Data):
@@ -144,3 +144,76 @@ def init_weights(m: nn.Module) -> None:
                 nn.init.zeros_(param)
             elif 'bias_hh' in name:
                 nn.init.zeros_(param)
+
+
+class VariationalCaptionGenerator:
+    def __init__(self):
+        # We define lists of templates for variety.
+        # {lane_desc} is a placeholder for your dataset's lane caption.
+        self.templates = {
+            # 0: Straight Drive
+            0: [
+                "The vehicle is proceeding straight along the {lane_desc}.",
+                "Continuing straight on the {lane_desc}.",
+                "Driving forward through the {lane_desc}.",
+                "The ego vehicle maintains a straight course on the {lane_desc}."
+            ],
+            # 1: Left Turn
+            1: [
+                "The vehicle is executing a left turn at the {lane_desc}.",
+                "Initiating a left turn from the {lane_desc}.",
+                "Turning left through the {lane_desc}.",
+                "The car is banking left at the {lane_desc}."
+            ],
+            # 2: Right Turn
+            2: [
+                "The vehicle is making a right turn at the {lane_desc}.",
+                "Initiating a right turn from the {lane_desc}.",
+                "Turning right through the {lane_desc}.",
+                "The car is banking right at the {lane_desc}."
+            ],
+            # 3: U-Turn
+            3: [
+                "The vehicle is performing a U-turn at the {lane_desc}.",
+                "Executing a 180-degree turn at the {lane_desc}.",
+                "Reversing direction via a U-turn at the {lane_desc}."
+            ],
+            # 4: Lane Change Left
+            4: [
+                "The vehicle is merging into the left lane.",
+                "Changing lanes to the left from the {lane_desc}.",
+                "Drifting left to change lanes."
+            ],
+            # 5: Lane Change Right
+            5: [
+                "The vehicle is merging into the right lane.",
+                "Changing lanes to the right from the {lane_desc}.",
+                "Drifting right to change lanes."
+            ],
+            # 6: Stationary
+            6: [
+                "The vehicle is stationary at the {lane_desc}.",
+                "The vehicle has stopped at the {lane_desc}.",
+                "Waiting at the {lane_desc}."
+            ]
+        }
+
+    def generate(self, maneuver_id, lane_caption="road"):
+        """
+        Input:
+            maneuver_id (int): 0-6
+            lane_caption (str): Metadata from your dataset (e.g., "Intersection", "Highway")
+        Output:
+            str: A randomly selected, filled sentence.
+        """
+        # 1. Get the list of templates for this maneuver
+        options = self.templates.get(maneuver_id, ["Unknown maneuver."])
+        
+        # 2. Pick one at random
+        template = random.choice(options)
+        
+        # 3. Fill in the lane context
+        # Clean up the lane caption if necessary (e.g., lowercasing)
+        clean_lane = lane_caption.lower() if lane_caption else "road"
+        
+        return template.format(lane_desc=clean_lane)
