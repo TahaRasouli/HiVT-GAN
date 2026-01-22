@@ -21,23 +21,30 @@ def main():
     parser.add_argument('--num_workers', type=int, default=8)
     args = parser.parse_args()
 
-    # 1. Initialize Tokenizer (Required by your Dataset class)
+    # 1. Initialize Tokenizer
     print("Initializing BERT Tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 
     # 2. DataModule
     print("Setting up DataModule...")
-    # Your dataset expects split_file to be inside root or passed explicitly. 
-    # Assuming 'balanced_splits.json' is in the root folder based on your previous logs.
-    split_path = "./balanced_splits.json"
     
+    # --- FIX START ---
+    # Use the root path to find the split file. 
+    # Change "split_datas.json" to "balanced_splits.json" ONLY if you are sure that file exists in args.root
+    split_path = os.path.join(args.root, "split_datas.json") 
+    
+    if not os.path.exists(split_path):
+        print(f"Warning: {split_path} not found. Trying balanced_splits.json...")
+        split_path = os.path.join(args.root, "balanced_splits.json")
+    # --- FIX END ---
+
     datamodule = NuScenesHiVTDataModule(
         root=args.root,
         split_file=split_path,
         train_batch_size=args.train_batch_size,
         val_batch_size=args.val_batch_size,
         num_workers=args.num_workers,
-        tokenizer=tokenizer, # Pass tokenizer here
+        tokenizer=tokenizer,
         pin_memory=True,
         persistent_workers=(args.num_workers > 0)
     )
@@ -64,7 +71,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator='gpu',
-        devices=args.devices,
+        devices=args.devices, # This will use the list [1] if you pass --devices 1 and set CUDA_VISIBLE_DEVICES
         callbacks=[checkpoint_callback, early_stop],
         log_every_n_steps=10,
         strategy='ddp_find_unused_parameters_true' if args.devices > 1 else 'auto'

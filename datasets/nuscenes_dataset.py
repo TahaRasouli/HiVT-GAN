@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import torch.nn.functional as F
 from typing import Optional
 from torch_geometric.data import Dataset, Batch
 from utils import TemporalData
@@ -19,8 +20,10 @@ LANE_TYPE_MAP = {
 class HiVTTemporalData(TemporalData):
     def __inc__(self, key, value, *args, **kwargs):
         if key == 'lane_actor_index':
+            # Bipartite graph: Row 0 (Lanes), Row 1 (Actors)
             return torch.tensor([[self['lane_vectors'].size(0)], [self.num_nodes]])
         elif key == 'edge_index' or 'edge_index' in key:
+            # Agent-Agent graph -> Increment by num_nodes
             return self.num_nodes
         else:
             return super().__inc__(key, value, *args, **kwargs)
@@ -34,10 +37,12 @@ class NuScenesHiVTDataset(Dataset):
         transform=None,
         root: str = None, 
         max_samples: Optional[int] = None,
+        min_historical_steps: int = 20, # HiVT standard
     ):
         self.split = split
         self.transform = transform
         self.tokenizer = tokenizer
+        self.min_historical_steps = min_historical_steps
         
         if not os.path.exists(split_file):
             raise FileNotFoundError(f"Split file not found: {split_file}")
@@ -66,12 +71,16 @@ class NuScenesHiVTDataset(Dataset):
             print(f"Corrupt file: {path}")
             return self.get((idx + 1) % len(self))
 
-        # 1. Sanitize Data
+        # 1. Sanitize Data (Spatial alignment)
         data = self._sanitize(data)
         
         # --- SKIP EMPTY GRAPHS ---
         if data.num_nodes == 0:
             return self.get((idx + 1) % len(self))
+
+        # --- CRITICAL FIX: TEMPORAL PADDING ---
+        # Ensure data has at least 'min_historical_steps' (20) frames
+        data = self._pad_temporal(data)
 
         # 2. Inject Rotate Mat if missing
         if not hasattr(data, 'rotate_mat') or data.rotate_mat is None:
@@ -115,30 +124,62 @@ class NuScenesHiVTDataset(Dataset):
         
         return safe_data
 
+    def _pad_temporal(self, data):
+        """
+        Pads temporal tensors (x, positions, masks) to ensure they match model's expected history.
+        """
+        if not hasattr(data, 'x') or data.x is None:
+            return data
+            
+        current_steps = data.x.size(1)
+        if current_steps >= self.min_historical_steps:
+            return data # No padding needed
+            
+        pad_amt = self.min_historical_steps - current_steps
+        
+        # Pad x: [N, T, D] -> Pad T (dim 1)
+        # F.pad format for 3D tensor: (last_dim_left, last_dim_right, 2nd_last_left, 2nd_last_right, ...)
+        # We want to pad 2nd last dimension (Time) on the right.
+        data.x = F.pad(data.x, (0, 0, 0, pad_amt))
+        
+        # Pad positions: [N, T, 2]
+        if hasattr(data, 'positions'):
+            data.positions = F.pad(data.positions, (0, 0, 0, pad_amt))
+            
+        # Pad rotate_angles: [N, T]
+        if hasattr(data, 'rotate_angles'):
+            data.rotate_angles = F.pad(data.rotate_angles, (0, pad_amt))
+            
+        # Pad padding_mask: [N, T] -> Pad with TRUE (invalid)
+        if hasattr(data, 'padding_mask'):
+            data.padding_mask = F.pad(data.padding_mask, (0, pad_amt), value=True)
+            
+        # Pad bos_mask: [N, T] -> Pad with TRUE (invalid/no signal)
+        if hasattr(data, 'bos_mask'):
+            data.bos_mask = F.pad(data.bos_mask, (0, pad_amt), value=True)
+            
+        return data
+
     def _sanitize(self, data):
         """
-        Full-Spectrum Sanitization including Mask Alignment.
+        Full-Spectrum Sanitization.
         """
         # --- A. CONSISTENT NODE COUNT ---
         node_counts = []
         if hasattr(data, 'x') and torch.is_tensor(data.x): node_counts.append(data.x.size(0))
         if hasattr(data, 'positions') and torch.is_tensor(data.positions): node_counts.append(data.positions.size(0))
         
-        # Note: We rely on X and Positions for the "True" node count. 
-        # Masks might be longer (ghosts), so we don't include them in the min() calculation, we crop TO the min.
-        
         if len(node_counts) > 0:
             valid_num_nodes = min(node_counts)
         else:
             valid_num_nodes = 0
 
-        # Crop ALL Node Tensors (Including Masks)
+        # Crop Node Tensors
         node_keys = ['x', 'positions', 'padding_mask', 'bos_mask', 'rotate_angles', 'y']
         for key in node_keys:
             if hasattr(data, key):
                 tensor = getattr(data, key)
                 if torch.is_tensor(tensor) and tensor.size(0) > valid_num_nodes:
-                    # Slice the first dimension
                     setattr(data, key, tensor[:valid_num_nodes])
         data.num_nodes = valid_num_nodes
         
@@ -174,7 +215,6 @@ class NuScenesHiVTDataset(Dataset):
                     setattr(data, key, tensor[:real_num_lanes])
 
         # --- D. FILTER EDGES ---
-        # 1. Lane-Actor Index
         if hasattr(data, "lane_actor_index"):
             lai = data.lane_actor_index
             if real_num_lanes == 0 or not torch.is_tensor(lai) or lai.numel() == 0:
@@ -193,7 +233,6 @@ class NuScenesHiVTDataset(Dataset):
                     else:
                         data.lane_actor_vectors = torch.empty((data.lane_actor_index.shape[1], 2), dtype=torch.float)
 
-        # 2. Edge Index
         if hasattr(data, "edge_index"):
             ei = data.edge_index
             if not torch.is_tensor(ei) or ei.numel() == 0:
@@ -207,10 +246,8 @@ class NuScenesHiVTDataset(Dataset):
         # --- E. CLAMP CATEGORICAL INDICES ---
         if hasattr(data, 'is_intersections') and torch.is_tensor(data.is_intersections):
             data.is_intersections = torch.clamp(data.is_intersections, min=0, max=1)
-
         if hasattr(data, 'traffic_controls') and torch.is_tensor(data.traffic_controls):
             data.traffic_controls = torch.clamp(data.traffic_controls, min=0, max=1)
-
         if hasattr(data, 'turn_directions') and torch.is_tensor(data.turn_directions):
             data.turn_directions = torch.clamp(data.turn_directions, min=0, max=2)
 
