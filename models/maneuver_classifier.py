@@ -67,166 +67,75 @@ class ManeuverClassifier(pl.LightningModule):
     def forward(self, batch):
         self.backbone.eval()
         with torch.no_grad():
-            out = self.backbone(batch)
-            if self.global_step == 0:
-                print("ego_idx min/max:", int(ego_idx.min().cpu()), int(ego_idx.max().cpu()))
-                print("nodes_per_graph min/max:", int(nodes_per_graph.min().cpu()), int(nodes_per_graph.max().cpu()))
+            out = self.backbone(batch)  # expected [1, total_nodes, D]
 
-                print("backbone out shape:", tuple(out.shape))
-                if hasattr(batch, "ptr"):
-                    print("ptr[-1] total_nodes:", int(batch.ptr[-1]))
-                print("num_graphs:", int(batch.num_graphs))
+        # --------------------------------------------------
+        # Basic checks
+        # --------------------------------------------------
+        if not torch.is_tensor(out):
+            raise RuntimeError(f"Backbone returned non-tensor: {type(out)}")
 
-
-        num_graphs = int(batch.num_graphs)
-        assert hasattr(batch, "ego_index"), "Batch missing ego_index"
-        assert batch.ego_index.numel() == num_graphs, (
-            f"ego_index must have length num_graphs={num_graphs}, got {batch.ego_index.numel()}"
-        )
-
-        # Normalize to tensor
-        global_embed = out
-        if not torch.is_tensor(global_embed):
-            raise RuntimeError(f"Backbone returned non-tensor type: {type(global_embed)}")
-
-        # -------- Case A: per-graph embeddings already --------
-        # [num_graphs, D]
-        if global_embed.dim() == 2 and global_embed.size(0) == num_graphs:
-            ego_embeds = global_embed  # already one embedding per graph
-
-        # [1, num_graphs, D]
-        elif global_embed.dim() == 3 and global_embed.size(0) == 1:
-            assert hasattr(batch, "ptr"), "Batch missing ptr (required for flattened node offsets)"
-
-            ptr = batch.ptr.long()
-            ego_idx = batch.ego_index.to(global_embed.device).long()  # [B]
-            nodes_per_graph = (ptr[1:] - ptr[:-1]).to(ego_idx.device)  # [B]
-
-            total_nodes = int(global_embed.size(1))
-
-            # Case C1: ego_index is LOCAL within each graph
-            if torch.all((ego_idx >= 0) & (ego_idx < nodes_per_graph)):
-                ego_global = (ptr[:-1].to(ego_idx.device) + ego_idx)
-
-            # Case C2: ego_index is already GLOBAL
-            elif torch.all((ego_idx >= 0) & (ego_idx < total_nodes)):
-                ego_global = ego_idx
-
-            else:
-                raise RuntimeError(
-                    f"ego_index is neither local nor global valid. "
-                    f"ego_idx min={int(ego_idx.min().cpu())}, max={int(ego_idx.max().cpu())}, "
-                    f"nodes_per_graph min={int(nodes_per_graph.min().cpu())}, max={int(nodes_per_graph.max().cpu())}, "
-                    f"total_nodes={total_nodes}"
-                )
-
-            # Final bounds check (prevents CUDA abort)
-            max_idx = int(ego_global.max().detach().cpu())
-            min_idx = int(ego_global.min().detach().cpu())
-            if min_idx < 0 or max_idx >= total_nodes:
-                raise RuntimeError(
-                    f"Computed ego_global out of bounds. min={min_idx}, max={max_idx}, total_nodes={total_nodes}"
-                )
-
-            ego_embeds = global_embed[0, ego_global, :]  # [B, D]
-
-        # -------- Case B: graph-batched node embeddings --------
-        # [num_graphs, N, D]  (N nodes-per-graph, padded or fixed)
-        elif global_embed.dim() == 3 and global_embed.size(0) == 1:
-            assert hasattr(batch, "ptr"), "Batch missing ptr"
-
-            ptr = batch.ptr.long()
-            ego_idx = batch.ego_index.to(global_embed.device).long()  # <-- define first
-            nodes_per_graph = (ptr[1:] - ptr[:-1]).to(ego_idx.device)
-
-            # DEBUG (safe now)
-            if self.global_step == 0:
-                print("ego_idx shape:", ego_idx.shape)
-                print("ego_idx min/max:", int(ego_idx.min().cpu()), int(ego_idx.max().cpu()))
-                print("nodes_per_graph min/max:",
-                    int(nodes_per_graph.min().cpu()),
-                    int(nodes_per_graph.max().cpu()))
-                print("ptr[-1] total_nodes:", int(ptr[-1].cpu()))
-
-            total_nodes = global_embed.size(1)
-
-            # Case 1: ego_index is LOCAL
-            if torch.all((ego_idx >= 0) & (ego_idx < nodes_per_graph)):
-                ego_global = ptr[:-1].to(ego_idx.device) + ego_idx
-
-            # Case 2: ego_index is already GLOBAL
-            elif torch.all((ego_idx >= 0) & (ego_idx < total_nodes)):
-                ego_global = ego_idx
-
-            else:
-                raise RuntimeError(
-                    f"Invalid ego_index values. "
-                    f"ego_idx min={int(ego_idx.min())}, max={int(ego_idx.max())}, "
-                    f"nodes_per_graph max={int(nodes_per_graph.max())}, "
-                    f"total_nodes={total_nodes}"
-                )
-
-            # Final safety check
-            if ego_global.min() < 0 or ego_global.max() >= total_nodes:
-                raise RuntimeError(
-                    f"Computed ego_global out of bounds: "
-                    f"min={int(ego_global.min())}, "
-                    f"max={int(ego_global.max())}, "
-                    f"total_nodes={total_nodes}"
-                )
-
-            ego_embeds = global_embed[0, ego_global, :]
-
-
-        # -------- Case C: single-batch node embeddings --------
-        # [1, total_nodes, D] or [total_nodes, D]
-        elif global_embed.dim() == 3 and global_embed.size(0) == 1:
-            assert hasattr(batch, "ptr"), "Batch missing ptr (required for flattened node offsets)"
-            ego_idx = batch.ego_index.long()
-
-            # ptr gives node offsets into flattened node dimension
-            ptr = batch.ptr.long()  # [num_graphs+1]
-            ego_global = (ptr[:-1] + ego_idx).to(global_embed.device)  # [num_graphs]
-
-            total_nodes = int(global_embed.size(1))
-            max_idx = int(ego_global.max().detach().cpu())
-            min_idx = int(ego_global.min().detach().cpu())
-            if min_idx < 0 or max_idx >= total_nodes:
-                raise RuntimeError(
-                    f"Computed ego_global out of bounds for flattened node dim. "
-                    f"min={min_idx}, max={max_idx}, total_nodes={total_nodes}, "
-                    f"ptr[-1]={int(ptr[-1])}, num_graphs={num_graphs}, "
-                    f"global_embed.shape={tuple(global_embed.shape)}"
-                )
-
-            ego_embeds = global_embed[0, ego_global, :]  # [num_graphs, D]
-
-        elif global_embed.dim() == 2:
-            # [total_nodes, D]
-            assert hasattr(batch, "ptr"), "Batch missing ptr (required for flattened node offsets)"
-            ego_idx = batch.ego_index.long()
-            ptr = batch.ptr.long()
-            ego_global = (ptr[:-1] + ego_idx).to(global_embed.device)
-
-            total_nodes = int(global_embed.size(0))
-            max_idx = int(ego_global.max().detach().cpu())
-            min_idx = int(ego_global.min().detach().cpu())
-            if min_idx < 0 or max_idx >= total_nodes:
-                raise RuntimeError(
-                    f"Computed ego_global out of bounds for flattened node dim. "
-                    f"min={min_idx}, max={max_idx}, total_nodes={total_nodes}, "
-                    f"ptr[-1]={int(ptr[-1])}, num_graphs={num_graphs}, "
-                    f"global_embed.shape={tuple(global_embed.shape)}"
-                )
-
-            ego_embeds = global_embed[ego_global, :]  # [num_graphs, D]
-
-        else:
+        if out.dim() != 3 or out.size(0) != 1:
             raise RuntimeError(
-                f"Unsupported backbone output shape {tuple(global_embed.shape)} for num_graphs={num_graphs}"
+                f"Expected backbone output [1, total_nodes, D], got {tuple(out.shape)}"
             )
 
-        logits = self.head(ego_embeds)  # [num_graphs, num_classes]
+        assert hasattr(batch, "ptr"), "Batch missing ptr"
+        assert hasattr(batch, "ego_index"), "Batch missing ego_index"
+
+        ptr = batch.ptr.long()                    # [num_graphs + 1]
+        ego_idx = batch.ego_index.long()          # [num_graphs]
+        num_graphs = int(batch.num_graphs)
+        total_nodes = int(out.size(1))
+
+        if ego_idx.numel() != num_graphs:
+            raise RuntimeError(
+                f"ego_index length mismatch: expected {num_graphs}, got {ego_idx.numel()}"
+            )
+
+        # --------------------------------------------------
+        # Compute global ego indices (LOCAL → GLOBAL)
+        # --------------------------------------------------
+        nodes_per_graph = ptr[1:] - ptr[:-1]
+
+        if not torch.all((ego_idx >= 0) & (ego_idx < nodes_per_graph)):
+            raise RuntimeError(
+                f"Invalid ego_index (must be local per graph). "
+                f"ego_idx min={int(ego_idx.min())}, max={int(ego_idx.max())}, "
+                f"nodes_per_graph min={int(nodes_per_graph.min())}, "
+                f"max={int(nodes_per_graph.max())}"
+            )
+
+        ego_global = ptr[:-1] + ego_idx  # [num_graphs]
+
+        # --------------------------------------------------
+        # Final bounds check (CUDA-safe)
+        # --------------------------------------------------
+        if ego_global.min() < 0 or ego_global.max() >= total_nodes:
+            raise RuntimeError(
+                f"Computed ego_global out of bounds. "
+                f"min={int(ego_global.min())}, max={int(ego_global.max())}, "
+                f"total_nodes={total_nodes}"
+            )
+
+        # --------------------------------------------------
+        # DEBUG (only once)
+        # --------------------------------------------------
+        if self.global_step == 0:
+            print("backbone out shape:", tuple(out.shape))
+            print("num_graphs:", num_graphs)
+            print("total_nodes:", total_nodes)
+            print("ego_idx min/max:",
+                int(ego_idx.min()), int(ego_idx.max()))
+            print("ego_global min/max:",
+                int(ego_global.min()), int(ego_global.max()))
+
+        # --------------------------------------------------
+        # Extract ego embeddings
+        # --------------------------------------------------
+        ego_embeds = out[0, ego_global, :]  # [num_graphs, D]
+
+        logits = self.head(ego_embeds)      # [num_graphs, num_classes]
         return logits
 
 
