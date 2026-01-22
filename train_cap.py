@@ -12,9 +12,7 @@ from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.cvae import CVAE
 from models.maneuver_classifier import ManeuverClassifier
 from datasets.nuscenes_dataset import NuScenesHiVTDataset
-import faulthandler, sys
-faulthandler.enable(file=sys.stderr)
-faulthandler.dump_traceback_later(60, repeat=True)
+
 
 # Optimization
 torch.set_float32_matmul_precision('medium')
