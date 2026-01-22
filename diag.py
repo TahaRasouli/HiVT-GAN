@@ -27,7 +27,7 @@ def check_tensor(data, key, min_val=None, max_val=None, check_dim_0_size=None):
                 raise ValueError(f"'{key}' contains value {tensor.max()} which is >= limit {max_val}")
 
 def diagnose(root):
-    split_file = os.path.join(root, "split_datas.json")
+    split_file = os.path.join(root, "/mount/studenten/projects/rasoulta/dataset/tmpl-captioned/balanced_splits.json")
     if not os.path.exists(split_file):
         print(f"Error: Could not find {split_file}")
         return
