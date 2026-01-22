@@ -2,6 +2,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from models.cvae_gan import CVAE_GAN
+from torch_geometric.nn import global_max_pool
 
 class CaptionFinetuner(pl.LightningModule):
     def __init__(self, pretrained_ckpt):
@@ -41,7 +42,20 @@ class CaptionFinetuner(pl.LightningModule):
         # Inference: Prior -> Z -> Decoder -> Logits
         local_embed = self.model.local_encoder(data)
         global_embed = self.model.global_interactor(data, local_embed)
-        _, _, caption_logits = self.model.decoder(global_embed, y_gt=None)
+        
+        # --- FIX STARTS HERE ---
+        
+        # 1. Pool the node embeddings PER GRAPH in the batch.
+        #    'data.batch' tells PyG which node belongs to which graph (0 to 63).
+        #    Result shape: [batch_size, hidden_dim] (e.g., [64, 128])
+        graph_embed = global_max_pool(global_embed, data.batch)
+        
+        # 2. Pass this graph-level embedding to your classifier
+        #    (Assumes self.classifier or similar exists - check your variable name)
+        caption_logits = self.classifier(graph_embed) 
+        
+        # --- FIX ENDS HERE ---
+        
         return caption_logits
 
     def training_step(self, data, batch_idx):
