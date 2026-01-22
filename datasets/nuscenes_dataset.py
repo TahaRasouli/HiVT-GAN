@@ -78,58 +78,70 @@ class NuScenesHiVTDataset(Dataset):
         return self._processed_file_names
 
     def _sanitize(self, data):
-        # Always [2, E]
+        # --- 1. Geometry Sanitization (Standard HiVT logic) ---
         if hasattr(data, "lane_actor_index"):
             lai = data.lane_actor_index
-            if not torch.is_tensor(lai):
-                data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
-            elif lai.numel() == 0:
-                data.lane_actor_index = lai.reshape(2, 0)
-            elif lai.dim() == 1 and lai.size(0) == 2:
-                data.lane_actor_index = lai.reshape(2, 1)
+            if not torch.is_tensor(lai): data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
+            elif lai.numel() == 0: data.lane_actor_index = lai.reshape(2, 0)
+            elif lai.dim() == 1 and lai.size(0) == 2: data.lane_actor_index = lai.reshape(2, 1)
             elif lai.dim() != 2 or lai.size(0) != 2:
-                # Fix common corruption where shape is inverted
-                if lai.size(1) == 2 and lai.size(0) != 2:
-                     data.lane_actor_index = lai.t()
-                else:
-                    data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
+                if lai.size(1) == 2 and lai.size(0) != 2: data.lane_actor_index = lai.t()
+                else: data.lane_actor_index = torch.empty((2, 0), dtype=torch.long)
 
-        # Always [E, 2]
         if hasattr(data, "lane_actor_vectors"):
             lav = data.lane_actor_vectors
-            if not torch.is_tensor(lav):
-                data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
-            elif lav.numel() == 0:
-                data.lane_actor_vectors = lav.reshape(0, 2)
-            elif lav.dim() != 2 or lav.size(-1) != 2:
-                data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
+            if not torch.is_tensor(lav): data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
+            elif lav.numel() == 0: data.lane_actor_vectors = lav.reshape(0, 2)
+            elif lav.dim() != 2 or lav.size(-1) != 2: data.lane_actor_vectors = torch.empty((0, 2), dtype=torch.float)
 
-        # Always [L, 2]
         if hasattr(data, "lane_vectors"):
             lv = data.lane_vectors
-            if not torch.is_tensor(lv):
-                data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
-            elif lv.numel() == 0:
-                data.lane_vectors = lv.reshape(0, 2)
-            elif lv.dim() != 2 or lv.size(-1) != 2:
-                 data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
+            if not torch.is_tensor(lv): data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
+            elif lv.numel() == 0: data.lane_vectors = lv.reshape(0, 2)
+            elif lv.dim() != 2 or lv.size(-1) != 2: data.lane_vectors = torch.empty((0, 2), dtype=torch.float)
 
-        # Always [2, E]
         if hasattr(data, "edge_index"):
             ei = data.edge_index
-            if ei.numel() == 0:
-                data.edge_index = ei.reshape(2, 0)
-            elif ei.dim() == 1 and ei.size(0) == 2:
-                data.edge_index = ei.reshape(2, 1)
-            elif ei.dim() != 2 or ei.size(0) != 2:
-                 data.edge_index = torch.empty((2, 0), dtype=torch.long)
-                 
-        # Ensure maneuver_id is accessible for the classifier
-        # Sometimes it's nested in caption_dict or a list
-        if not hasattr(data, "maneuver_id"):
-            if hasattr(data, "caption_dict") and "maneuver_id" in data.caption_dict:
-                 data.maneuver_id = torch.tensor([data.caption_dict["maneuver_id"]])
+            if ei.numel() == 0: data.edge_index = ei.reshape(2, 0)
+            elif ei.dim() == 1 and ei.size(0) == 2: data.edge_index = ei.reshape(2, 1)
+            elif ei.dim() != 2 or ei.size(0) != 2: data.edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        # --- 2. EXACT STRING MAPPING (The Fix) ---
         
+        # Based on your scan results:
+        str_to_int = {
+            'Straight Drive': 0,
+            'Left Turn': 1,
+            'Right Turn': 2,
+            'U-Turn': 3,
+            'Lane Change Left': 4,
+            'Lane Change Right': 5,
+            'Stationary Stop': 6
+        }
+
+        # 1. Find the label string
+        label_str = None
+        
+        # Check top-level attribute
+        if hasattr(data, 'maneuver_category'):
+            label_str = data.maneuver_category
+        # Check dictionary fallback
+        elif hasattr(data, 'caption_dict') and 'category' in data.caption_dict:
+            label_str = data.caption_dict['category']
+        # Check dictionary fallback (maneuver_category key inside dict)
+        elif hasattr(data, 'caption_dict') and 'maneuver_category' in data.caption_dict:
+            label_str = data.caption_dict['maneuver_category']
+
+        # 2. Map to Integer
+        if label_str in str_to_int:
+            maneuver_id = str_to_int[label_str]
+        else:
+            # If label is missing or weird, default to Straight (0) to prevent crash
+            maneuver_id = 0
+
+        # 3. Assign as LongTensor [1]
+        data.maneuver_id = torch.tensor([maneuver_id], dtype=torch.long)
+
         return data
 
     # --------------------------------------------------
