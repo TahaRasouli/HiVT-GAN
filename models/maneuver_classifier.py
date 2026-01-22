@@ -116,56 +116,65 @@ class ManeuverClassifier(pl.LightningModule):
         preds = torch.argmax(logits, dim=1)
 
         self.train_acc(preds, targets)
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_acc", self.train_acc, on_epoch=True, prog_bar=True)
+        self.log(
+            "train_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=targets.size(0),
+        )
+
+        self.log(
+            "train_acc",
+            self.train_acc,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=targets.size(0),
+        )
+
         return loss
 
     # --------------------------------------------------------------
     # VALIDATION STEP
     # --------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
-        targets = batch.maneuver_id.view(-1).long()
-        if targets.numel() == 0:
-            return None
+        # Forward
+        logits = self(batch)                  # [B, num_classes]
+        targets = batch.maneuver_id.view(-1)  # [B]
 
-        logits = self(batch)
-        if logits.numel() == 0:
-            return None
-
-        assert logits.dim() == 2, f"logits must be [B,C], got {logits.shape}"
-        assert targets.dim() == 1, f"targets must be [B], got {targets.shape}"
-        assert logits.size(0) == targets.size(0), f"N mismatch: logits {logits.shape}, targets {targets.shape}"
-
+        # Loss
         loss = self.criterion(logits, targets)
+
+        # Predictions
         preds = torch.argmax(logits, dim=1)
 
-        self.val_acc(preds, targets)
-        self.val_f1_per_class(preds, targets)
-        self.log("val_loss", loss, prog_bar=True)
+        # Metrics (accumulated across epoch)
+        self.val_acc.update(preds, targets)
+        self.val_f1_per_class.update(preds, targets)
+
+        # Log ONLY epoch-level values (no spam)
+        self.log(
+            "val_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=targets.size(0),
+        )
+
         return loss
+
 
     # --------------------------------------------------------------
     # VALIDATION EPOCH END
     # --------------------------------------------------------------
     def on_validation_epoch_end(self):
-        f1_scores = self.val_f1_per_class.compute()
-        acc = self.val_acc.compute()
-
-        print("\n" + "=" * 40)
-        print(f"Epoch {self.current_epoch} Results")
-        print("-" * 40)
-        print(f"Overall Accuracy: {acc:.4f}")
-        print("-" * 40)
-        print(f"{'Class':<15} | {'F1 Score':<10}")
-        print("-" * 40)
-
-        for i, name in enumerate(self.class_names):
-            print(f"{name:<15} | {f1_scores[i].item():.4f}")
-
-        print("=" * 40 + "\n")
-
-        self.val_f1_per_class.reset()
-        self.val_acc.reset()
+        if self.current_epoch % 5 != 0:
+            self.val_f1_per_class.reset()
+            self.val_acc.reset()
+            return
 
     # --------------------------------------------------------------
     # OPTIMIZER

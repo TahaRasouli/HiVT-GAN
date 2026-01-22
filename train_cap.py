@@ -135,6 +135,8 @@ def main():
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback],
         log_every_n_steps=50,
+        enable_progress_bar=False,
+        enable_model_summary=True,
     )
 
     print("[Info] Starting Linear Probe Training...")
