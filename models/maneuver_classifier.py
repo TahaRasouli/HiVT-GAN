@@ -1,15 +1,16 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  # Needed for One-Hot Encoding
 import pytorch_lightning as pl
 from torchmetrics import Accuracy, F1Score
 
 
 class ManeuverClassifier(pl.LightningModule):
     """
-    Ego-centric maneuver classifier on top of a frozen HiVT / CVAE backbone.
+    Ego-centric maneuver classifier with Context Injection and Fine-Tuning.
 
-    Backbone output: [B, N, 128]
-    Ego pooling via batch.ego_index → [B, 128]
+    Input:  HiVT Embedding [128] + Map Turn Hint [3]
+    Output: Maneuver Class [7]
     """
 
     def __init__(
@@ -23,27 +24,29 @@ class ManeuverClassifier(pl.LightningModule):
         self.save_hyperparameters(ignore=["frozen_backbone"])
 
         # ----------------------------------------------------------
-        # 1. FROZEN BACKBONE
+        # 1. BACKBONE (Suggestion C: Unfrozen for Fine-Tuning)
         # ----------------------------------------------------------
         self.backbone = frozen_backbone
-        self.backbone.eval()
-        for p in self.backbone.parameters():
-            p.requires_grad = False
+        
+        # We REMOVE the "requires_grad = False" loop.
+        # The backbone is now trainable, but constrained by a low LR.
 
         # ----------------------------------------------------------
-        # 2. CLASSIFICATION HEAD
+        # 2. CLASSIFICATION HEAD (Suggestion B: Context Injection)
         # ----------------------------------------------------------
+        # Input Dimension: 128 (Trajectory) + 3 (Map Turn Direction) = 131
         self.head = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(128 + 3, 128), 
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.5),  # Suggestion A: High Regularization
             nn.Linear(128, num_classes),
         )
 
         # ----------------------------------------------------------
         # 3. LOSS + METRICS
         # ----------------------------------------------------------
-        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+        # Label Smoothing helps with overfitting
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
@@ -52,151 +55,74 @@ class ManeuverClassifier(pl.LightningModule):
         )
 
         self.class_names = [
-            "Straight",
-            "Left Turn",
-            "Right Turn",
-            "U-Turn",
-            "LC Left",
-            "LC Right",
-            "Stationary",
+            "Straight", "Left Turn", "Right Turn", "U-Turn",
+            "LC Left", "LC Right", "Stationary",
         ]
 
     # --------------------------------------------------------------
     # FORWARD
     # --------------------------------------------------------------
     def forward(self, batch):
-        self.backbone.eval()
-        with torch.no_grad():
-            out = self.backbone(batch)  # expected [1, total_nodes, D]
+        # We allow gradients to flow through the backbone now (Fine-Tuning)
+        out = self.backbone(batch)  # [1, total_nodes, 128]
 
-        # --------------------------------------------------
-        # Basic checks
-        # --------------------------------------------------
+        # Basic Checks
         if not torch.is_tensor(out):
             raise RuntimeError(f"Backbone returned non-tensor: {type(out)}")
 
-        if out.dim() != 3 or out.size(0) != 1:
-            raise RuntimeError(
-                f"Expected backbone output [1, total_nodes, D], got {tuple(out.shape)}"
-            )
-
         assert hasattr(batch, "ego_index"), "Batch missing ego_index"
+        ego_idx = batch.ego_index.long().to(out.device)
+        
+        # Extract Ego Embedding
+        ego_embeds = out[0, ego_idx, :]  # [Batch, 128]
 
-        ego_idx = batch.ego_index.long().to(out.device)  # GLOBAL indices
-        total_nodes = int(out.size(1))
+        # ----------------------------------------------------------
+        # SUGGESTION B: CONTEXT INJECTION (Map Hints)
+        # ----------------------------------------------------------
+        # We extract the 'turn_directions' map feature for the ego vehicle.
+        # Values: 0 (Straight), 1 (Left), 2 (Right)
+        if hasattr(batch, 'turn_directions'):
+            # Get raw indices
+            ego_turn_dirs = batch.turn_directions[ego_idx] # [Batch]
+            
+            # Safety Clamp (0-2) just to be sure
+            ego_turn_dirs = torch.clamp(ego_turn_dirs, 0, 2).long()
+            
+            # One-Hot Encode -> [Batch, 3] (e.g., [0, 1, 0] for Left)
+            map_hint = F.one_hot(ego_turn_dirs, num_classes=3).float()
+            
+            # Concatenate: [Batch, 128] + [Batch, 3] -> [Batch, 131]
+            input_vector = torch.cat([ego_embeds, map_hint], dim=1)
+        else:
+            # Fallback (Zeros) if map data missing
+            zeros = torch.zeros(ego_embeds.size(0), 3, device=ego_embeds.device)
+            input_vector = torch.cat([ego_embeds, zeros], dim=1)
 
-        # --------------------------------------------------
-        # Validate GLOBAL ego indices
-        # --------------------------------------------------
-        if ego_idx.min() < 0 or ego_idx.max() >= total_nodes:
-            raise RuntimeError(
-                f"Invalid GLOBAL ego_index. "
-                f"min={int(ego_idx.min())}, max={int(ego_idx.max())}, "
-                f"total_nodes={total_nodes}"
-            )
-
-        # --------------------------------------------------
-        # DEBUG (once)
-        # --------------------------------------------------
-        if self.global_step == 0:
-            print("backbone out shape:", tuple(out.shape))
-            print("total_nodes:", total_nodes)
-            print("num_graphs:", int(batch.num_graphs))
-            print("ego_index shape:", tuple(ego_idx.shape))
-            print("ego_index min/max:",
-                int(ego_idx.min()), int(ego_idx.max()))
-
-        # --------------------------------------------------
-        # Extract ego embeddings (GLOBAL indexing)
-        # --------------------------------------------------
-        ego_embeds = out[0, ego_idx, :]  # [num_graphs, D]
-
-        logits = self.head(ego_embeds)   # [num_graphs, num_classes]
+        # Pass combined vector to Head
+        logits = self.head(input_vector)
         return logits
 
-
-
-
     # --------------------------------------------------------------
-    # TRAINING STEP
-    # --------------------------------------------------------------
-    def training_step(self, batch, batch_idx):
-        targets = batch.maneuver_id.view(-1).long()
-        logits = self(batch)
-
-        loss = self.criterion(logits, targets)
-        preds = torch.argmax(logits, dim=1)
-
-        self.train_acc(preds, targets)
-
-        self.log(
-            "train_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            batch_size=targets.size(0),
-        )
-        self.log(
-            "train_acc",
-            self.train_acc,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            batch_size=targets.size(0),
-        )
-
-        return loss
-
-    # --------------------------------------------------------------
-    # VALIDATION STEP
-    # --------------------------------------------------------------
-    def validation_step(self, batch, batch_idx):
-        if batch_idx == 0:
-            print("ego_index shape:", batch.ego_index.shape)
-
-        logits = self(batch)
-        targets = batch.maneuver_id.view(-1)
-
-        loss = self.criterion(logits, targets)
-        preds = torch.argmax(logits, dim=1)
-
-        self.val_acc.update(preds, targets)
-        self.val_f1_per_class.update(preds, targets)
-
-        self.log(
-            "val_loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-            batch_size=targets.size(0),
-        )
-
-        return loss
-
-    # --------------------------------------------------------------
-    # VALIDATION EPOCH END
-    # --------------------------------------------------------------
-    def on_validation_epoch_end(self):
-        f1 = self.val_f1_per_class.compute()
-        for i, name in enumerate(self.class_names):
-            self.log(f"val_f1_{name}", f1[i], prog_bar=False)
-        self.val_f1_per_class.reset()
-        self.val_acc.reset()
-
-    # --------------------------------------------------------------
-    # OPTIMIZER
+    # OPTIMIZER (Suggestion C: Differential Learning Rates)
     # --------------------------------------------------------------
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.head.parameters(),
-            lr=self.hparams.learning_rate,
-        )
+        optimizer = torch.optim.Adam([
+            # Group 1: Backbone (Train very slowly to refine physics)
+            {
+                'params': self.backbone.parameters(), 
+                'lr': 1e-5 
+            },
+            # Group 2: Head (Train normally)
+            {
+                'params': self.head.parameters(), 
+                'lr': self.hparams.learning_rate
+            }
+        ])
+        
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=5
         )
+        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -204,3 +130,64 @@ class ManeuverClassifier(pl.LightningModule):
                 "monitor": "val_loss",
             },
         }
+
+    # --------------------------------------------------------------
+    # STANDARD TRAINING STEPS
+    # --------------------------------------------------------------
+    def training_step(self, batch, batch_idx):
+        targets = batch.maneuver_id.view(-1).long()
+        logits = self(batch)
+        loss = self.criterion(logits, targets)
+        preds = torch.argmax(logits, dim=1)
+
+        self.train_acc(preds, targets)
+        self.log("train_loss", loss, on_epoch=True, prog_bar=True, batch_size=targets.size(0))
+        self.log("train_acc", self.train_acc, on_epoch=True, prog_bar=True, batch_size=targets.size(0))
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        logits = self(batch)
+        targets = batch.maneuver_id.view(-1)
+        loss = self.criterion(logits, targets)
+        preds = torch.argmax(logits, dim=1)
+
+        self.val_acc.update(preds, targets)
+        self.val_f1_per_class.update(preds, targets)
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=targets.size(0))
+        return loss
+
+    def on_validation_epoch_end(self):
+            # 1. Compute the per-class metrics
+            f1_scores = self.val_f1_per_class.compute()
+            acc = self.val_acc.compute()
+
+            # 2. Compute Macro F1 (Average of all class F1s)
+            # This is critical for ModelCheckpoint to verify overall performance
+            macro_f1 = f1_scores.mean()
+
+            # 3. Log main metrics for the Trainer
+            self.log("val_f1_macro", macro_f1, prog_bar=True)
+            self.log("val_acc_epoch", acc, prog_bar=False)
+
+            # 4. Log per-class F1s (good for TensorBoard, hidden from progress bar)
+            for i, name in enumerate(self.class_names):
+                self.log(f"val_f1_{name}", f1_scores[i], prog_bar=False)
+
+            # 5. Print readable table to Terminal (Main process only)
+            if self.trainer.is_global_zero:
+                print(f"\n{'='*60}")
+                print(f"Epoch {self.current_epoch} Results | Macro F1: {macro_f1:.4f} | Acc: {acc:.2%}")
+                print(f"{'-'*60}")
+                print(f"{'Class':<15} | {'F1 Score':<10} | {'Status'}")
+                print(f"{'-'*60}")
+                
+                for i, name in enumerate(self.class_names):
+                    score = f1_scores[i].item()
+                    # Visual flag for poor performance
+                    status = "⚠️ LOW" if score < 0.5 else "✅ OK"
+                    print(f"{name:<15} | {score:.4f}     | {status}")
+                print(f"{'='*60}\n")
+
+            # 6. Reset metrics for the next epoch
+            self.val_f1_per_class.reset()
+            self.val_acc.reset()

@@ -9,10 +9,9 @@ from pytorch_lightning.strategies import DDPStrategy
 
 # Import modules
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
-from models.cvae import CVAE
+from models.hivt import HiVT  # Use HiVT class directly if standard
 from models.maneuver_classifier import ManeuverClassifier
 from datasets.nuscenes_dataset import NuScenesHiVTDataset
-
 
 # Optimization
 torch.set_float32_matmul_precision('medium')
@@ -73,13 +72,11 @@ def main():
     # Hyperparameters
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--max_epochs", type=int, default=20)
+    parser.add_argument("--max_epochs", type=int, default=40)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--pin_memory", type=bool, default=False)
     parser.add_argument("--persistent_workers", type=bool, default=False)
-
-
 
     args = parser.parse_args()
 
@@ -103,14 +100,13 @@ def main():
         persistent_workers=args.persistent_workers,
     )
 
-
     # ---------------------------------------------------------
     # 3. Load Backbone & Initialize Classifier
     # ---------------------------------------------------------
     print(f"[Info] Loading Frozen Backbone from: {args.ckpt_path}")
     
-    # Load CVAE (strict=False ignores extra GAN keys if present)
-    backbone = CVAE.load_from_checkpoint(args.ckpt_path)
+    # Load HiVT (Use strict=False to be safe)
+    backbone = HiVT.load_from_checkpoint(args.ckpt_path, strict=False)
     
     # Initialize our wrapping model
     model = ManeuverClassifier(
@@ -123,26 +119,33 @@ def main():
     # ---------------------------------------------------------
     # 4. Trainer
     # ---------------------------------------------------------
+    
+    # MONITOR F1 SCORE (Better for Imbalance)
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss",
-        mode="min",
-        filename="caption-model-{epoch:02d}-{val_loss:.2f}",
+        monitor="val_f1_macro",    # <--- CHANGED FROM val_loss
+        mode="max",                # Maximize F1
+        filename="caption-model-{epoch:02d}-{val_f1_macro:.2f}",
         save_top_k=2
     )
     
-    early_stop = EarlyStopping(monitor="val_loss", patience=5, mode="min")
+    early_stop = EarlyStopping(
+        monitor="val_f1_macro",    # <--- CHANGED FROM val_loss
+        patience=8, 
+        mode="max"
+    )
+
     use_gpu = torch.cuda.is_available() and args.devices > 0
-    
     strategy = DDPStrategy(find_unused_parameters=True) if use_gpu else "auto"
+    
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=args.devices,
         strategy=strategy,
         precision="16-mixed",  
-        # gradient_clip_val=0.5,
         max_epochs=args.max_epochs,
-        callbacks=[checkpoint_callback], # Critical to include this
+        callbacks=[checkpoint_callback, early_stop],
         log_every_n_steps=50,
+        check_val_every_n_epoch=1
     )
 
     print("[Info] Starting Linear Probe Training...")
