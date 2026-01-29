@@ -23,6 +23,7 @@ def calculate_class_weights(dataset):
     total = 0
     
     for i in tqdm(range(len(dataset)), desc="Computing Weights"):
+        try:
             data = dataset.get(i)
             # Handle tensor vs int
             if isinstance(data.maneuver_id, torch.Tensor):
