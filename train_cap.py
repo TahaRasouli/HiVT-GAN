@@ -17,18 +17,12 @@ from datasets.nuscenes_dataset import NuScenesHiVTDataset
 torch.set_float32_matmul_precision('medium')
 
 def calculate_class_weights(dataset):
-    """
-    Scans the dataset to compute inverse frequency weights.
-    Prevents the model from ignoring U-Turns and only predicting Straight.
-    """
     print(f"\n[Info] Scanning {len(dataset)} samples to calculate Class Weights...")
     
     counts = {i: 0 for i in range(7)}
     total = 0
     
-    # Iterate with progress bar
     for i in tqdm(range(len(dataset)), desc="Computing Weights"):
-        try:
             data = dataset.get(i)
             # Handle tensor vs int
             if isinstance(data.maneuver_id, torch.Tensor):
@@ -51,14 +45,19 @@ def calculate_class_weights(dataset):
     for i in range(n_classes):
         c = counts.get(i, 0)
         if c > 0:
-            weights.append(total / (n_classes * c))
+            # Standard Inverse: w = total / (n_classes * c)
+            # DAMPENED Inverse: w = sqrt(total / (n_classes * c))
+            raw_weight = total / (n_classes * c)
+            dampened_weight = raw_weight ** 0.5  # Square Root Smoothing
+            weights.append(dampened_weight)
         else:
-            # High penalty if class is missing/rare to encourage learning it later
-            weights.append(2.0) 
+            weights.append(1.5) 
     
-    # Convert to tensor
+    # Normalize weights so they sum to n_classes (optional, but good for stability)
     weight_tensor = torch.tensor(weights, dtype=torch.float32)
-    print(f"[Info] Final Calculated Weights: {weight_tensor}\n")
+    weight_tensor = weight_tensor / weight_tensor.mean() 
+    
+    print(f"[Info] Final Dampened Weights: {weight_tensor}\n")
     return weight_tensor
 
 def main():
