@@ -4,13 +4,85 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics import Accuracy, F1Score
 
-class ManeuverClassifier(pl.LightningModule):
-    """
-    Ego-centric maneuver classifier with Context Injection and Fine-Tuning.
-    
-    Fixed: Manually runs backbone encoders to extract embeddings, ignoring the trajectory decoder.
-    """
+# ------------------------------------------------------------------------------
+# 1. MAP ENCODER
+#    Learns a compact representation of categorical map features.
+# ------------------------------------------------------------------------------
+class MapEncoder(nn.Module):
+    def __init__(self, output_dim=32):
+        super().__init__()
+        # Tiny embedding tables for categorical inputs
+        # Turn Direction: 0=Straight, 1=Left, 2=Right
+        self.turn_embed = nn.Embedding(3, 8)       
+        
+        # Is Intersection: 0=No, 1=Yes
+        self.intersect_embed = nn.Embedding(2, 4)  
+        
+        # Traffic Control: 0=No, 1=Yes
+        self.control_embed = nn.Embedding(2, 4)    
+        
+        # Simple projection to mix the features into a single vector
+        # Input size: 8 (Turn) + 4 (Intersect) + 4 (Control) = 16
+        self.net = nn.Sequential(
+            nn.Linear(16, output_dim),
+            nn.ReLU(),
+            nn.LayerNorm(output_dim)
+        )
 
+    def forward(self, turn, intersect, control):
+        t = self.turn_embed(turn)
+        i = self.intersect_embed(intersect)
+        c = self.control_embed(control)
+        
+        # Concatenate features and project
+        x = torch.cat([t, i, c], dim=-1)
+        return self.net(x)
+
+
+# ------------------------------------------------------------------------------
+# 2. GATED FUSION MODULE
+#    Dynamically controls the flow of Map Information based on Trajectory context.
+# ------------------------------------------------------------------------------
+class GatedFusion(nn.Module):
+    def __init__(self, traj_dim=128, map_dim=32, out_dim=128):
+        super().__init__()
+        # Projects map to same size as trajectory for element-wise operations
+        self.map_proj = nn.Linear(map_dim, traj_dim)
+        
+        # The Gate: Looks at BOTH Traj and Map to decide importance
+        # Output is 1 value per channel (sigmoid -> 0.0 to 1.0)
+        self.gate_net = nn.Sequential(
+            nn.Linear(traj_dim + map_dim, traj_dim),
+            nn.Sigmoid()
+        )
+        
+        # Final processing layer after fusion
+        self.out_net = nn.Sequential(
+            nn.Linear(traj_dim, out_dim),
+            nn.ReLU(),
+            nn.LayerNorm(out_dim)
+        )
+
+    def forward(self, traj_embed, map_embed):
+        # 1. Project Map to Trajectory dimension [B, 128]
+        map_feat = self.map_proj(map_embed)
+        
+        # 2. Calculate Gate (Importance of Map context)
+        # We concatenate raw inputs to decide the gate
+        combined_raw = torch.cat([traj_embed, map_embed], dim=1)
+        gate = self.gate_net(combined_raw) # [B, 128] (Values 0.0 to 1.0)
+        
+        # 3. Apply Gate: Trajectory + (Gate * Map)
+        # If Gate is near 0, we ignore Map. If Gate is near 1, we use full Map.
+        fused = traj_embed + (gate * map_feat)
+        
+        return self.out_net(fused)
+
+
+# ------------------------------------------------------------------------------
+# 3. MAIN CLASSIFIER MODULE
+# ------------------------------------------------------------------------------
+class ManeuverClassifier(pl.LightningModule):
     def __init__(
         self,
         frozen_backbone,
@@ -21,20 +93,23 @@ class ManeuverClassifier(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["frozen_backbone"])
 
-        # 1. BACKBONE
+        # A. BACKBONE (Trajectory Encoder)
         self.backbone = frozen_backbone
-        # No freezing loop -> We allow fine-tuning
 
-        # 2. CLASSIFICATION HEAD
-        # Input: 128 (Trajectory) + 3 (Map Hint) = 131
+        # B. MAP ENCODER
+        self.map_encoder = MapEncoder(output_dim=32)
+
+        # C. FUSION MODULE (Gated)
+        self.fusion = GatedFusion(traj_dim=128, map_dim=32, out_dim=128)
+
+        # D. CLASSIFICATION HEAD
+        # Input: 128 (Fused Vector)
         self.head = nn.Sequential(
-            nn.Linear(128 + 3, 128), 
-            nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(0.5), # Regularization
             nn.Linear(128, num_classes),
         )
 
-        # 3. METRICS
+        # E. METRICS & LOSS
         self.criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
@@ -47,13 +122,9 @@ class ManeuverClassifier(pl.LightningModule):
 
     def forward(self, batch):
         # ----------------------------------------------------------
-        # A. BACKBONE BYPASS (The Fix)
+        # 1. TRAJECTORY ENCODING (Backbone Bypass)
         # ----------------------------------------------------------
-        # We cannot call self.backbone(batch) because it returns a tuple (y_hat, pi).
-        # We must manually run the encoder steps to get the embedding.
-        
-        # 1. Generate Rotation Matrix (Required by LocalEncoder)
-        # Check if backbone wants rotation (default to True)
+        # Prepare Rotation Matrix
         rotate = getattr(self.backbone.hparams, 'rotate', True)
         if rotate:
             rotate_mat = torch.empty(batch.num_nodes, 2, 2, device=self.device)
@@ -67,46 +138,50 @@ class ManeuverClassifier(pl.LightningModule):
         else:
             batch['rotate_mat'] = None
 
-        # 2. Run Encoders Manually
-        # This extracts the [Batch, Nodes, 128] embedding
+        # Run Backbone Encoders Manually
         local_embed = self.backbone.local_encoder(data=batch)
         out = self.backbone.global_interactor(data=batch, local_embed=local_embed)
-
-        # ----------------------------------------------------------
-        # B. EGO EXTRACTION
-        # ----------------------------------------------------------
-        assert hasattr(batch, "ego_index"), "Batch missing ego_index"
-        ego_idx = batch.ego_index.long()
         
-        # Check output shape
+        # Extract Ego Embedding [Batch, 128]
         if not torch.is_tensor(out):
              raise RuntimeError(f"Backbone encoders returned {type(out)} instead of Tensor")
-             
-        # Extract Ego: [Batch, 128]
-        ego_embeds = out[0, ego_idx, :]
+        ego_idx = batch.ego_index.long()
+        traj_embed = out[0, ego_idx, :] 
 
         # ----------------------------------------------------------
-        # C. CONTEXT INJECTION (Map Hints)
+        # 2. MAP ENCODING
         # ----------------------------------------------------------
-        if hasattr(batch, 'turn_directions'):
-            ego_turn_dirs = batch.turn_directions[ego_idx]
-            ego_turn_dirs = torch.clamp(ego_turn_dirs, 0, 2).long()
-            map_hint = F.one_hot(ego_turn_dirs, num_classes=3).float()
-            input_vector = torch.cat([ego_embeds, map_hint], dim=1)
-        else:
-            zeros = torch.zeros(ego_embeds.size(0), 3, device=self.device)
-            input_vector = torch.cat([ego_embeds, zeros], dim=1)
+        # Fetch features, defaulting to 0 if missing
+        turn = batch.turn_directions[ego_idx] if hasattr(batch, 'turn_directions') else torch.zeros_like(ego_idx)
+        intersect = batch.is_intersections[ego_idx] if hasattr(batch, 'is_intersections') else torch.zeros_like(ego_idx)
+        control = batch.traffic_controls[ego_idx] if hasattr(batch, 'traffic_controls') else torch.zeros_like(ego_idx)
+
+        # Clamp to valid ranges for embedding lookup
+        turn = torch.clamp(turn, 0, 2).long()
+        intersect = torch.clamp(intersect, 0, 1).long()
+        control = torch.clamp(control, 0, 1).long()
+
+        # Generate Map Embedding [Batch, 32]
+        map_embed = self.map_encoder(turn, intersect, control)
 
         # ----------------------------------------------------------
-        # D. CLASSIFICATION
+        # 3. GATED FUSION
         # ----------------------------------------------------------
-        logits = self.head(input_vector)
+        # Combine [128] + [32] -> [128]
+        fused_features = self.fusion(traj_embed, map_embed)
+
+        # ----------------------------------------------------------
+        # 4. CLASSIFICATION
+        # ----------------------------------------------------------
+        logits = self.head(fused_features)
         return logits
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam([
-            {'params': self.backbone.parameters(), 'lr': 1e-5}, # Slow backbone
-            {'params': self.head.parameters(), 'lr': self.hparams.learning_rate} # Fast head
+            {'params': self.backbone.parameters(), 'lr': 1e-5},    # Slow Backbone
+            {'params': self.map_encoder.parameters(), 'lr': 1e-3}, # Fast Map Encoder
+            {'params': self.fusion.parameters(), 'lr': 1e-3},      # Fast Fusion
+            {'params': self.head.parameters(), 'lr': 1e-3}         # Fast Head
         ])
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=5
