@@ -8,68 +8,68 @@ from torchmetrics import Accuracy, F1Score
 # 1. HEADING & GEOMETRY EXTRACTOR (NEW)
 #    Explicitly calculates geometry that CNNs/Transformers struggle to infer.
 # ------------------------------------------------------------------------------
-class HeadingExtractor(nn.Module):
-    def __init__(self, output_dim=16):
+class TemporalHeadingExtractor(nn.Module):
+    def __init__(self, output_dim=16, history_steps=20):
         super().__init__()
-        # We process the raw geometric stats into a feature vector
-        self.net = nn.Sequential(
-            nn.Linear(4, output_dim), # Input: [Total Turn, Max Rate, Avg Rate, Displacement]
+        
+        # 1. Feature Extraction per timestep
+        # Input features per step: [Yaw Rate, Velocity X, Velocity Y]
+        input_channels = 3 
+        
+        # 2. Temporal Encoder (1D CNN)
+        # Filters will learn patterns like "Lane Change S-Curve" or "U-Turn U-Curve"
+        self.conv_net = nn.Sequential(
+            nn.Conv1d(input_channels, 16, kernel_size=5, padding=2),
+            nn.BatchNorm1d(16),
             nn.ReLU(),
-            nn.LayerNorm(output_dim)
+            nn.Conv1d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.AdaptiveMaxPool1d(1) # Pool across time -> creates single vector
         )
+        
+        # 3. Final Projection (to match fusion size)
+        self.proj = nn.Linear(32 + 1, output_dim) # +1 for the U-Turn flag
 
     def forward(self, positions, padding_mask):
         """
-        positions: [Batch, Time, 2] (Global coordinates)
-        padding_mask: [Batch, Time] (True = padding)
+        positions: [Batch, Time, 2]
         """
-        # 1. Calculate Velocity Vectors
-        # shape: [B, T-1, 2]
+        # --- A. Pre-process Geometry (Time Series) ---
+        # 1. Velocity [Batch, T-1, 2]
         vel = positions[:, 1:] - positions[:, :-1]
         
-        # 2. Calculate Yaw (Heading) for each step
-        # atan2 gives angle in radians (-pi to pi)
+        # 2. Yaw Rate [Batch, T-2, 1]
         yaws = torch.atan2(vel[..., 1], vel[..., 0])
-        
-        # 3. Calculate Yaw Rate (Change in Heading)
-        # shape: [B, T-2]
         yaw_diff = yaws[:, 1:] - yaws[:, :-1]
-        
-        # 4. Handle Wraparound (e.g. 179 deg -> -179 deg is a small turn, not huge)
         yaw_diff = (yaw_diff + torch.pi) % (2 * torch.pi) - torch.pi
         
-        # 5. Filter Padding (Zero out invalid steps)
-        # We use the mask from the backbone data
-        valid_mask = ~padding_mask[:, 2:] # Align mask with yaw_diff size
-        yaw_diff = yaw_diff * valid_mask.float()
-
-        # 6. Extract Statistical Features
-        # A. Total Heading Change (Integral of curvature) - distinguishes Straight vs Turn
+        # Align Velocity to T-2 to match Yaw Rate shape
+        vel_aligned = vel[:, 1:] 
+        
+        # Stack features: [Batch, T-2, 3] (YawRate, VelX, VelY)
+        feats = torch.cat([yaw_diff.unsqueeze(-1), vel_aligned], dim=-1)
+        
+        # Mask out padding (set to 0)
+        valid_mask = ~padding_mask[:, 2:]
+        feats = feats * valid_mask.unsqueeze(-1).float()
+        
+        # --- B. Temporal Convolution ---
+        # Permute for CNN: [Batch, Channels, Time]
+        feats_permuted = feats.permute(0, 2, 1)
+        
+        # Extract Shape Features [Batch, 32]
+        temporal_embed = self.conv_net(feats_permuted).squeeze(-1)
+        
+        # --- C. The U-Turn Cheat (Keep this!) ---
         total_turn = yaw_diff.sum(dim=1, keepdim=True)
+        is_uturn = (total_turn.abs() > 2.8).float()
         
-        # B. Max Yaw Rate - distinguishes Sharp Turn vs Wide Curve
-        max_rate = yaw_diff.abs().max(dim=1, keepdim=True)[0]
+        # --- D. Final Concatenation ---
+        # Combine the learned temporal shape with the explicit U-Turn flag
+        out = torch.cat([temporal_embed, is_uturn], dim=1)
         
-        # C. Average Yaw Rate - General curviness
-        # Avoid division by zero
-        steps = valid_mask.sum(dim=1, keepdim=True).clamp(min=1)
-        avg_rate = yaw_diff.abs().sum(dim=1, keepdim=True) / steps
-        
-        # D. Displacement Angle (End Point vs Start Point)
-        # This captures the "Net" result of the maneuver
-        start_pos = positions[:, 0]
-        # Find last valid position
-        last_indices = valid_mask.long().sum(dim=1) 
-        # (Simplified gathering for last valid pos, usually just use last index for fixed horizon)
-        end_pos = positions[:, -1] 
-        disp_vec = end_pos - start_pos
-        net_heading = torch.atan2(disp_vec[:, 1], disp_vec[:, 0]).unsqueeze(1)
-
-        # Concat geometric features [Batch, 4]
-        feats = torch.cat([total_turn, max_rate, avg_rate, net_heading], dim=1)
-        
-        # Project to embedding size
-        return self.net(feats)
+        return self.proj(out)
 
 # ------------------------------------------------------------------------------
 # 2. MAP ENCODER (Unchanged)
