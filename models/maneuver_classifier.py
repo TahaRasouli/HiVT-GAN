@@ -157,7 +157,7 @@ class ManeuverClassifier(pl.LightningModule):
         )
 
         # C. LOSS & METRICS (UPDATED TO FOCAL LOSS)
-        self.criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+        self.criterion = FocalLoss(alpha=None, gamma=2.0)
         
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
