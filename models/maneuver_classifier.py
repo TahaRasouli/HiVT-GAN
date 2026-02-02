@@ -96,8 +96,10 @@ class TemporalHeadingExtractor(nn.Module):
         # --- C. The "Cheat Code" (Relaxed Threshold) ---
         total_turn = yaw_diff.sum(dim=1, keepdim=True)
         
-        # CHANGED: Threshold lowered to 2.5 rad (~143 degrees) to catch wider U-turns
-        is_uturn = (total_turn.abs() > 2.5).float()
+        # CHANGE THIS LINE: 2.5 -> 2.0
+        # 2.0 radians is approx 115 degrees. 
+        # This catches "incomplete" or "wide" U-turns that look like sharp Left Turns.
+        is_uturn = (total_turn.abs() > 2.0).float()
         
         # --- D. Final Concatenation ---
         out = torch.cat([temporal_embed, is_uturn], dim=1)
