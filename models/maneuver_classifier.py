@@ -14,8 +14,12 @@ class FocalLoss(nn.Module):
         super().__init__()
         self.gamma = gamma
         self.reduction = reduction
-        # Alpha acts as class weights
-        self.alpha = alpha
+        
+        # FIX: Register alpha as a buffer so it moves to GPU automatically
+        if alpha is not None:
+            self.register_buffer('alpha', alpha)
+        else:
+            self.alpha = None
 
     def forward(self, inputs, targets):
         # Calculate standard Cross Entropy first
@@ -26,8 +30,6 @@ class FocalLoss(nn.Module):
         pt = torch.exp(-ce_loss)
         
         # Apply Focal Term: (1 - pt)^gamma
-        # If pt is high (easy example), weight goes to 0.
-        # If pt is low (hard example), weight stays high.
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
         
         if self.reduction == 'mean':
@@ -36,7 +38,6 @@ class FocalLoss(nn.Module):
             return focal_loss.sum()
         else:
             return focal_loss
-
 
 # ------------------------------------------------------------------------------
 # 2. TEMPORAL HEADING EXTRACTOR (1D CNN)
