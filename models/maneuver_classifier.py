@@ -5,8 +5,42 @@ import pytorch_lightning as pl
 from torchmetrics import Accuracy, F1Score
 
 # ------------------------------------------------------------------------------
-# 1. TEMPORAL HEADING & GEOMETRY EXTRACTOR (1D CNN)
-#    Models the sequence of movements to distinguish Lane Changes from drifting.
+# 1. FOCAL LOSS
+#    Forces the model to focus on "Hard" examples (Lane Changes/U-Turns) 
+#    rather than being satisfied with getting the easy ones right.
+# ------------------------------------------------------------------------------
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        # Alpha acts as class weights
+        self.alpha = alpha
+
+    def forward(self, inputs, targets):
+        # Calculate standard Cross Entropy first
+        # reduction='none' so we can apply the focal weight per-sample
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
+        
+        # Calculate probability of the correct class (pt)
+        pt = torch.exp(-ce_loss)
+        
+        # Apply Focal Term: (1 - pt)^gamma
+        # If pt is high (easy example), weight goes to 0.
+        # If pt is low (hard example), weight stays high.
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+# ------------------------------------------------------------------------------
+# 2. TEMPORAL HEADING EXTRACTOR (1D CNN)
+#    Models the sequence of movements + Explicitly flags U-Turns.
 # ------------------------------------------------------------------------------
 class TemporalHeadingExtractor(nn.Module):
     def __init__(self, output_dim=16):
@@ -16,7 +50,6 @@ class TemporalHeadingExtractor(nn.Module):
         input_channels = 3 
         
         # Temporal Encoder (1D CNN)
-        # Filters will learn patterns like "Lane Change S-Curve"
         self.conv_net = nn.Sequential(
             nn.Conv1d(input_channels, 16, kernel_size=5, padding=2),
             nn.BatchNorm1d(16),
@@ -24,7 +57,7 @@ class TemporalHeadingExtractor(nn.Module):
             nn.Conv1d(16, 32, kernel_size=3, padding=1),
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.AdaptiveMaxPool1d(1) # Pool across time -> creates single vector [Batch, 32]
+            nn.AdaptiveMaxPool1d(1) # Pool across time -> [Batch, 32]
         )
         
         # Final Projection (32 features + 1 U-Turn flag -> output_dim)
@@ -39,47 +72,40 @@ class TemporalHeadingExtractor(nn.Module):
         positions: [Batch, Time, 2]
         """
         # --- A. Pre-process Geometry (Time Series) ---
-        # 1. Velocity [Batch, T-1, 2]
         vel = positions[:, 1:] - positions[:, :-1]
         
-        # 2. Yaw Rate [Batch, T-2, 1]
         yaws = torch.atan2(vel[..., 1], vel[..., 0])
         yaw_diff = yaws[:, 1:] - yaws[:, :-1]
         # Normalize angles to range (-pi, pi)
         yaw_diff = (yaw_diff + torch.pi) % (2 * torch.pi) - torch.pi
         
-        # Align Velocity to T-2 to match Yaw Rate shape
         vel_aligned = vel[:, 1:] 
         
-        # Stack features: [Batch, T-2, 3] (YawRate, VelX, VelY)
+        # Stack features: [Batch, T-2, 3]
         feats = torch.cat([yaw_diff.unsqueeze(-1), vel_aligned], dim=-1)
         
-        # Mask out padding (set to 0)
-        # padding_mask is [Batch, Time]. We need mask for T-2 steps.
+        # Mask out padding
         valid_mask = ~padding_mask[:, 2:]
         feats = feats * valid_mask.unsqueeze(-1).float()
         
         # --- B. Temporal Convolution ---
-        # Permute for CNN: [Batch, Channels, Time]
-        feats_permuted = feats.permute(0, 2, 1)
-        
-        # Extract Shape Features [Batch, 32]
+        feats_permuted = feats.permute(0, 2, 1) # [Batch, Channels, Time]
         temporal_embed = self.conv_net(feats_permuted).squeeze(-1)
         
-        # --- C. The U-Turn Cheat Code ---
-        # Explicitly check for total turning angle > 160 degrees (2.8 rad)
+        # --- C. The "Cheat Code" (Relaxed Threshold) ---
         total_turn = yaw_diff.sum(dim=1, keepdim=True)
-        is_uturn = (total_turn.abs() > 2.8).float()
+        
+        # CHANGED: Threshold lowered to 2.5 rad (~143 degrees) to catch wider U-turns
+        is_uturn = (total_turn.abs() > 2.5).float()
         
         # --- D. Final Concatenation ---
-        # Combine the learned temporal shape with the explicit U-Turn flag
         out = torch.cat([temporal_embed, is_uturn], dim=1)
         
         return self.proj(out)
 
 
 # ------------------------------------------------------------------------------
-# 2. MAP ENCODER (Unchanged)
+# 3. MAP ENCODER
 # ------------------------------------------------------------------------------
 class MapEncoder(nn.Module):
     def __init__(self, output_dim=32):
@@ -102,7 +128,7 @@ class MapEncoder(nn.Module):
 
 
 # ------------------------------------------------------------------------------
-# 3. MAIN CLASSIFIER (Direct Fusion)
+# 4. MAIN CLASSIFIER
 # ------------------------------------------------------------------------------
 class ManeuverClassifier(pl.LightningModule):
     def __init__(
@@ -118,8 +144,6 @@ class ManeuverClassifier(pl.LightningModule):
         # A. ENCODERS
         self.backbone = frozen_backbone
         self.map_encoder = MapEncoder(output_dim=32)
-        
-        # UPDATED: Use the new Temporal class
         self.geo_extractor = TemporalHeadingExtractor(output_dim=16)
 
         # B. CLASSIFICATION HEAD
@@ -127,12 +151,13 @@ class ManeuverClassifier(pl.LightningModule):
         self.head = nn.Sequential(
             nn.Linear(176, 128),
             nn.ReLU(),
-            nn.Dropout(0.5), # High dropout essential for fusion
+            nn.Dropout(0.5), 
             nn.Linear(128, num_classes),
         )
 
-        # C. METRICS
-        self.criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+        # C. LOSS & METRICS (UPDATED TO FOCAL LOSS)
+        self.criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+        
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_f1_per_class = F1Score(task="multiclass", num_classes=num_classes, average=None)
@@ -140,7 +165,7 @@ class ManeuverClassifier(pl.LightningModule):
         self.class_names = ["Straight", "Left Turn", "Right Turn", "U-Turn", "LC Left", "LC Right", "Stationary"]
 
     def forward(self, batch):
-        # 1. TRAJECTORY EMBEDDING (Backbone) -----------------------
+        # 1. TRAJECTORY EMBEDDING (Backbone)
         rotate = getattr(self.backbone.hparams, 'rotate', True)
         if rotate:
             rotate_mat = torch.empty(batch.num_nodes, 2, 2, device=self.device)
@@ -160,7 +185,7 @@ class ManeuverClassifier(pl.LightningModule):
         ego_idx = batch.ego_index.long()
         traj_embed = out[0, ego_idx, :] # [Batch, 128]
 
-        # 2. MAP EMBEDDING (Always Considered) ---------------------
+        # 2. MAP EMBEDDING
         turn = batch.turn_directions[ego_idx] if hasattr(batch, 'turn_directions') else torch.zeros_like(ego_idx)
         intersect = batch.is_intersections[ego_idx] if hasattr(batch, 'is_intersections') else torch.zeros_like(ego_idx)
         control = batch.traffic_controls[ego_idx] if hasattr(batch, 'traffic_controls') else torch.zeros_like(ego_idx)
@@ -171,15 +196,12 @@ class ManeuverClassifier(pl.LightningModule):
             torch.clamp(control, 0, 1).long()
         ) # [Batch, 32]
 
-        # 3. GEOMETRY EMBEDDING (Heading Changes) ------------------
-        # We need raw positions for the Ego agent
-        ego_pos = batch['positions'][ego_idx] # [Batch, Time, 2]
-        ego_mask = batch['padding_mask'][ego_idx] # [Batch, Time]
-        
+        # 3. GEOMETRY EMBEDDING
+        ego_pos = batch['positions'][ego_idx]
+        ego_mask = batch['padding_mask'][ego_idx]
         geo_embed = self.geo_extractor(ego_pos, ego_mask) # [Batch, 16]
 
-        # 4. DIRECT FUSION -----------------------------------------
-        # Concatenate everything
+        # 4. FUSION
         fused = torch.cat([traj_embed, map_embed, geo_embed], dim=1)
         
         return self.head(fused)
