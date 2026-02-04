@@ -9,7 +9,12 @@ from tqdm import tqdm
 import argparse
 
 # =========================
-# 1. LANGUAGE TEMPLATES (Variety)
+# 1. CONFIGURATION
+# =========================
+DEFAULT_OUTPUT_DIR = "/mount/studenten/projects/rasoulta/dataset/tmpl-captioned"
+
+# =========================
+# 2. LANGUAGE TEMPLATES
 # =========================
 TEMPLATES = {
     "Left Turn": [
@@ -90,7 +95,7 @@ LANE_TEMPLATES = {
 }
 
 # =========================
-# 2. GEOMETRIC & TOPOLOGICAL LOGIC (v6)
+# 3. ROBUST LOGIC (Topology + Geometry)
 # =========================
 def classify_maneuver(nusc_map, global_traj):
     """
@@ -116,7 +121,7 @@ def classify_maneuver(nusc_map, global_traj):
     # --- 2. Map Queries (The Source of Truth) ---
     def get_lane(p):
         try: 
-            # Search with a small radius (1m) to catch lanes if point is slightly off
+            # Search with a small radius (1m)
             layers = nusc_map.layers_on_point(p[0], p[1])
             if layers and 'lane' in layers:
                 return layers['lane']
@@ -136,17 +141,15 @@ def classify_maneuver(nusc_map, global_traj):
     if dist_total < 2.0:
         return "Stationary Stop", "stop_action"
 
-    # --- 4. TOPOLOGICAL CHECK (The "Curvature Proof" Method) ---
-    # If we have valid IDs for both start and end, TRUST THE MAP.
+    # --- 4. TOPOLOGICAL CHECK ---
     if l_start and l_end and l_start != l_end:
         
-        # A. Check Connectivity (Successors = Straight)
+        # A. Check Connectivity (Successors = Straight/Turn)
         outgoing = nusc_map.get_outgoing_lane_ids(l_start)
         incoming = nusc_map.get_incoming_lane_ids(l_end)
         
-        # If it's a direct successor sequence, it's NOT a lane change (even if ID changed)
         if l_end in outgoing or l_start in incoming:
-             # It's a longitudinal transition. Now check curvature for Turn vs Straight.
+             # Longitudinal transition
              if abs(delta_deg) > 45: 
                  return ("Left Turn" if delta_deg > 0 else "Right Turn"), "turn_action"
              elif abs(delta_deg) > 135:
@@ -155,7 +158,6 @@ def classify_maneuver(nusc_map, global_traj):
                  return "Straight Drive", "maintain"
 
         # B. Check Adjacency (Neighbors = Lane Change)
-        # This handles curved roads perfectly. If the map says "Lane B is left of Lane A", it's a Left LC.
         left_neighbors = nusc_map.get_left_lane_ids(l_start)
         right_neighbors = nusc_map.get_right_lane_ids(l_start)
         
@@ -164,9 +166,7 @@ def classify_maneuver(nusc_map, global_traj):
         if l_end in right_neighbors:
             return "Lane Change Right", "change_right"
             
-        # C. Recursive Neighbor Check (Handling Multi-segment Lane Changes)
-        # Sometimes you change lane AND move forward to the next segment simultaneously.
-        # Check if l_end is a successor of a neighbor.
+        # C. Recursive Neighbor Check
         for ln in left_neighbors:
             if l_end in nusc_map.get_outgoing_lane_ids(ln):
                 return "Lane Change Left", "change_left"
@@ -174,54 +174,29 @@ def classify_maneuver(nusc_map, global_traj):
             if l_end in nusc_map.get_outgoing_lane_ids(rn):
                 return "Lane Change Right", "change_right"
 
-    # --- 5. GEOMETRIC FALLBACK (For Intersections / Missing IDs) ---
-    # If we are here, either l_start==l_end, or IDs are missing/disconnected.
-    # We rely on trajectory shape.
-    
-    # A. Check U-Turn / Turns first
+    # --- 5. GEOMETRIC FALLBACK ---
     if abs(delta_deg) > 135: return "U-Turn", "turn_action"
     if delta_deg > 30:       return "Left Turn", "turn_action"
     if delta_deg < -30:      return "Right Turn", "turn_action"
     
-    # B. S-Curve Detection for "Implicit" Lane Changes
-    # If heading is roughly straight (<30 deg change), but we moved laterally.
-    
-    # Construct a "Chord" line from start to end
+    # S-Curve Detection (Implicit Lane Change)
     vec_chord = p_end - p_start
     len_chord = np.linalg.norm(vec_chord) + 1e-6
     unit_chord = vec_chord / len_chord
-    
-    # Normal to chord (Left)
     unit_normal = np.array([-unit_chord[1], unit_chord[0]])
-    
-    # Calculate deviation of the MID point from the Chord line
     vec_mid = p_mid - p_start
-    # Dot product with normal gives lateral distance from the straight line connecting start/end
     lat_deviation = np.dot(vec_mid, unit_normal)
     
-    # Thresholds:
-    # A generic lane change involves an "S" shape. 
-    # However, if start/end headings are aligned, lateral deviation implies a shift.
-    
-    # If we have NO lane IDs (Intersection), be conservative.
     if not l_start and not l_end:
-        # Only call LC if deviation is significant (e.g., > 2.5m) and headings align
+        # If intersection and huge deviation with same heading -> Lane Change
         if abs(lat_deviation) > 2.5 and abs(delta_deg) < 20:
             if lat_deviation > 0: return "Lane Change Left", "change_left"
             else:                 return "Lane Change Right", "change_right"
-            
-    # If we HAVE Lane IDs but they are the same (l_start == l_end)
-    # Check if the car is drifting out of the lane purely geometrically
-    elif l_start == l_end and l_start:
-        # Use map API to get lane width or orientation? Too slow.
-        # Use simple heuristic: If we deviated significantly but stayed in "Same ID",
-        # the map ID might be a long polygon.
-        pass # Stick to "Maintain" if ID didn't change, to avoid false positives.
 
     return "Straight Drive", "maintain"
 
 # =========================
-# 3. UTILS
+# 4. UTILS
 # =========================
 def ego_to_global(traj, origin, theta):
     traj = np.asarray(traj)
@@ -231,27 +206,30 @@ def ego_to_global(traj, origin, theta):
     return (R @ traj).T + np.array(origin)
 
 # =========================
-# 4. MAIN LOOP
+# 5. MAIN PROCESSING LOOP
 # =========================
-def process_dataset(input_dir, dataroot):
-    print(f"Scanning {input_dir}...")
+def process_dataset(input_dir, output_dir, dataroot):
+    print(f"Input:  {input_dir}")
+    print(f"Output: {output_dir}")
+    print(f"Scanning files...")
+    
     files = glob.glob(os.path.join(input_dir, "**", "*.pt"), recursive=True)
     print(f"Found {len(files)} files.")
 
-    # Sort files to potentially group by city implicitly if naming conventions allow
-    # (Optional, but good practice)
     files.sort()
-
     maps = {}
     stats = defaultdict(int)
 
-    for f_path in tqdm(files, desc="Patching"):
+    # Ensure output root exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    for f_path in tqdm(files, desc="Processing"):
         try:
-            # 1. Load
+            # 1. Load Data
             try: data = torch.load(f_path, weights_only=False)
             except: data = torch.load(f_path)
             
-            # 2. Get Attributes
+            # 2. Extract Attributes
             if isinstance(data, dict):
                 city = data.get('city')
                 traj = data.get('y')
@@ -268,7 +246,7 @@ def process_dataset(input_dir, dataroot):
 
             if city is None: continue
 
-            # 3. Load Map
+            # 3. Load Map (Lazy Loading)
             if city not in maps:
                 maps[city] = NuScenesMap(dataroot=dataroot, map_name=city)
             nusc_map = maps[city]
@@ -284,29 +262,26 @@ def process_dataset(input_dir, dataroot):
             origin = np.squeeze(origin)
             if origin.ndim > 1: origin = origin[0]
 
-            # 5. RUN GEOMETRIC LOGIC
+            # 5. CLASSIFY
             global_traj = ego_to_global(traj, origin, theta)
             cat, lane_key = classify_maneuver(nusc_map, global_traj)
 
-            # 6. PICK RANDOM TEMPLATES (This is the added variety)
+            # 6. GENERATE CAPTION
             man_text = random.choice(TEMPLATES[cat])
             lane_text = random.choice(LANE_TEMPLATES[lane_key])
-
-            # 7. Preserve VLM Scene Description
             scene_desc = old_caps.get('scene_description', "Driving in an urban environment.")
             if len(scene_desc) < 5: scene_desc = "Driving in an urban environment."
 
-            # 8. Construct Final Data
             full_caption = f"{man_text} {lane_text} {scene_desc}"
             
             new_caption_dict = {
                 "maneuver_type": man_text,
                 "lane_status": lane_text,
                 "scene_description": scene_desc,
-                "category": cat # Storing the raw class is useful for metrics
+                "category": cat
             }
 
-            # 9. Save
+            # 7. UPDATE DATA OBJECT
             if isinstance(data, dict):
                 data['caption_dict'] = new_caption_dict
                 data['maneuver_category'] = cat
@@ -316,13 +291,22 @@ def process_dataset(input_dir, dataroot):
                 data.maneuver_category = cat
                 data.scene_description = full_caption
 
-            torch.save(data, f_path)
+            # 8. CALCULATE NEW PATH (PRESERVE STRUCTURE)
+            rel_path = os.path.relpath(f_path, input_dir) # e.g., "boston/file.pt"
+            new_f_path = os.path.join(output_dir, rel_path) # e.g., "output/boston/file.pt"
+            
+            # Ensure subfolder exists
+            os.makedirs(os.path.dirname(new_f_path), exist_ok=True)
+
+            # 9. SAVE TO NEW LOCATION
+            torch.save(data, new_f_path)
             stats[cat] += 1
             
         except Exception as e:
+            # print(f"Error processing {f_path}: {e}")
             pass
 
-    print("\n=== PATCHING COMPLETE ===")
+    print("\n=== PROCESSING COMPLETE ===")
     print("New Distribution:")
     total = sum(stats.values())
     for k, v in stats.items():
@@ -330,8 +314,9 @@ def process_dataset(input_dir, dataroot):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", required=True, help="Folder containing .pt files")
+    parser.add_argument("--input_dir", required=True, help="Original dataset folder")
+    parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR, help="Destination for modified files")
     parser.add_argument("--dataroot", default="./", help="NuScenes root with /maps folder")
     args = parser.parse_args()
     
-    process_dataset(args.input_dir, args.dataroot)
+    process_dataset(args.input_dir, args.output_dir, args.dataroot)
