@@ -9,8 +9,7 @@ from argoverse.map_representation.map_api import ArgoverseMap
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
 
-# Assuming utils.py contains a basic Data wrapper or TemporalData class
-# If not, you can replace TemporalData with torch_geometric.data.Data
+# Fallback for TemporalData if not defined in a local utils.py
 try:
     from utils import TemporalData
 except ImportError:
@@ -20,25 +19,38 @@ class ArgoverseV1Dataset(Dataset):
     def __init__(self,
                  root: str,
                  split: str,
+                 output_dir: Optional[str] = None,
                  transform: Optional[Callable] = None,
                  local_radius: float = 50) -> None:
+        """
+        Args:
+            root: Path to the Argoverse dataset (contains 'train', 'val', etc.)
+            split: 'train', 'val', 'test', or 'sample'
+            output_dir: Where to save the processed .pt files. 
+                        Defaults to root/split/processed if None.
+        """
         self._split = split
         self._local_radius = local_radius
         
-        # Mapping splits to folder names in Argoverse v1.1
         split_map = {
             'sample': 'forecasting_sample',
             'train': 'train',
             'val': 'val',
             'test': 'test_obs'
         }
+        
         if split not in split_map:
             raise ValueError(f"{split} is not a valid split.")
         
         self._directory = split_map[split]
         self.root = root
         
-        # Check if raw directory exists
+        # Define output path
+        if output_dir:
+            self._processed_dir = output_dir
+        else:
+            self._processed_dir = os.path.join(self.root, self._directory, 'processed')
+
         if not os.path.exists(self.raw_dir):
             raise FileNotFoundError(f"Raw data not found at {self.raw_dir}")
 
@@ -51,7 +63,7 @@ class ArgoverseV1Dataset(Dataset):
 
     @property
     def processed_dir(self) -> str:
-        return os.path.join(self.root, self._directory, 'processed')
+        return self._processed_dir
 
     @property
     def raw_file_names(self) -> List[str]:
@@ -62,11 +74,11 @@ class ArgoverseV1Dataset(Dataset):
         return [os.path.splitext(f)[0] + '.pt' for f in self._raw_file_names]
 
     def process(self) -> None:
-        if not os.path.exists(self.processed_dir):
-            os.makedirs(self.processed_dir)
+        # Create output directory if it doesn't exist
+        os.makedirs(self.processed_dir, exist_ok=True)
             
         am = ArgoverseMap()
-        for raw_path in tqdm(self.raw_paths, desc=f"Processing {self._split}"):
+        for raw_path in tqdm(self.raw_paths, desc=f"Processing {self._split} to {self.processed_dir}"):
             kwargs = process_argoverse(self._split, raw_path, am, self._local_radius)
             data = TemporalData(**kwargs)
             
@@ -75,9 +87,10 @@ class ArgoverseV1Dataset(Dataset):
             torch.save(data, save_path)
 
     def len(self) -> int:
-        return len(self.processed_file_names)
+        return len(self._raw_file_names)
 
     def get(self, idx: int) -> Data:
+        # Load from the custom processed directory
         path = os.path.join(self.processed_dir, self.processed_file_names[idx])
         return torch.load(path)
 
@@ -224,3 +237,16 @@ def get_lane_features(am: ArgoverseMap,
     lane_actor_vectors = lane_actor_vectors[mask]
 
     return lane_vectors, is_intersections, turn_directions, traffic_controls, lane_actor_index, lane_actor_vectors
+    
+if __name__ == '__main__':
+    # Configuration
+    RAW_DATA_ROOT = './data/argoverse'
+    PROCESSED_OUTPUT = './my_custom_output/val_processed'
+    
+    dataset = ArgoverseV1Dataset(
+        root=RAW_DATA_ROOT, 
+        split='val', 
+        output_dir=PROCESSED_OUTPUT
+    )
+    
+    dataset.process()
