@@ -237,16 +237,112 @@ def get_lane_features(am: ArgoverseMap,
     lane_actor_vectors = lane_actor_vectors[mask]
 
     return lane_vectors, is_intersections, turn_directions, traffic_controls, lane_actor_index, lane_actor_vectors
+
+To make the script truly standalone and professional, we can use Python's argparse module. This allows you to trigger the preprocessing from the command line, which is ideal if you plan to run it on a server or as part of a bash pipeline.
+
+I have also added a "dry run" check to ensure the paths exist before the heavy processing begins.
+
+Updated argoverse_v1_dataset.py with CLI
+Python
+import os
+import argparse
+from itertools import permutations, product
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import torch
+from argoverse.map_representation.map_api import ArgoverseMap
+from torch_geometric.data import Data, Dataset
+from tqdm import tqdm
+
+try:
+    from utils import TemporalData
+except ImportError:
+    from torch_geometric.data import Data as TemporalData
+
+class ArgoverseV1Dataset(Dataset):
+    def __init__(self,
+                 root: str,
+                 split: str,
+                 output_dir: Optional[str] = None,
+                 transform: Optional[Callable] = None,
+                 local_radius: float = 50) -> None:
+        self._split = split
+        self._local_radius = local_radius
+        
+        split_map = {
+            'sample': 'forecasting_sample',
+            'train': 'train',
+            'val': 'val',
+            'test': 'test_obs'
+        }
+        
+        if split not in split_map:
+            raise ValueError(f"{split} is not a valid split.")
+        
+        self._directory = split_map[split]
+        self.root = root
+        self._processed_dir = output_dir if output_dir else os.path.join(self.root, self._directory, 'processed')
+
+        if not os.path.exists(self.raw_dir):
+            raise FileNotFoundError(f"Raw data not found at {self.raw_dir}")
+
+        self._raw_file_names = [f for f in os.listdir(self.raw_dir) if f.endswith('.csv')]
+        super(ArgoverseV1Dataset, self).__init__(root, transform=transform)
+
+    @property
+    def raw_dir(self) -> str:
+        return os.path.join(self.root, self._directory, 'data')
+
+    @property
+    def processed_dir(self) -> str:
+        return self._processed_dir
+
+    def process(self) -> None:
+        os.makedirs(self.processed_dir, exist_ok=True)
+        am = ArgoverseMap()
+        for raw_path in tqdm(self.raw_paths, desc=f"Processing {self._split}"):
+            kwargs = process_argoverse(self._split, raw_path, am, self._local_radius)
+            data = TemporalData(**kwargs)
+            save_path = os.path.join(self.processed_dir, f"{kwargs['seq_id']}.pt")
+            torch.save(data, save_path)
+
+    def len(self) -> int:
+        return len(self._raw_file_names)
+
+    def get(self, idx: int) -> Data:
+        path = os.path.join(self.processed_dir, f"{os.path.splitext(self._raw_file_names[idx])[0]}.pt")
+        return torch.load(path)
+
+# --- [Placeholder: Your process_argoverse and get_lane_features logic here] ---
+
+def main():
+    parser = argparse.ArgumentParser(description='Argoverse V1 Dataset Preprocessor')
+    parser.add_argument('--root', type=str, required=True, help='Path to Argoverse root directory')
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test', 'sample'], 
+                        help='Data split to process')
+    parser.add_argument('--output_dir', type=str, default=None, 
+                        help='Custom directory to save .pt files (default: root/split/processed)')
+    parser.add_argument('--radius', type=float, default=50.0, 
+                        help='Local radius for map feature extraction')
     
-if __name__ == '__main__':
-    # Configuration
-    RAW_DATA_ROOT = './data/argoverse'
-    PROCESSED_OUTPUT = './my_custom_output/val_processed'
+    args = parser.parse_args()
+
+    print(f"--- Starting Argoverse Processing ---")
+    print(f"Split:  {args.split}")
+    print(f"Root:   {args.root}")
+    print(f"Radius: {args.radius}")
     
     dataset = ArgoverseV1Dataset(
-        root=RAW_DATA_ROOT, 
-        split='val', 
-        output_dir=PROCESSED_OUTPUT
+        root=args.root,
+        split=args.split,
+        output_dir=args.output_dir,
+        local_radius=args.radius
     )
     
     dataset.process()
+    print(f"Successfully processed {len(dataset)} files to {dataset.processed_dir}")
+
+if __name__ == '__main__':
+    main()
