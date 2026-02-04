@@ -8,6 +8,8 @@ import torch
 from argoverse.map_representation.map_api import ArgoverseMap
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
+from argparse import ArgumentParser
+
 
 # Fallback for TemporalData if not defined in a local utils.py
 try:
