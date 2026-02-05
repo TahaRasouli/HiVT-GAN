@@ -118,15 +118,22 @@ def generate_ego_caption(data):
 
         # 6. Connectivity Logic
         successors = nmap.get_outgoing_lane_ids(start_lane)
-        adj = nmap.get_adjacency_list(start_lane, 'lane')
+        
+        # Manually check for left/right neighbors instead of get_adjacency_list
+        left_lanes = nmap.get_left_lanes(start_lane, 1) # Gets lanes to the left
+        right_lanes = nmap.get_right_lanes(start_lane, 1) # Gets lanes to the right
 
         if start_lane == end_lane or end_lane in successors:
             return random.choice(TEMPLATES['follow']), 'follow', total_disp, heading_change
-        elif end_lane in adj['left']:
+        
+        elif end_lane in left_lanes:
             return random.choice(TEMPLATES['lane_change_left']), 'lane_change_left', total_disp, heading_change
-        elif end_lane in adj['right']:
+            
+        elif end_lane in right_lanes:
             return random.choice(TEMPLATES['lane_change_right']), 'lane_change_right', total_disp, heading_change
+        
         else:
+            # Intersection Turn Logic remains the same
             if abs(heading_change) > 140:
                 m_type = 'u_turn'
             elif heading_change > 15: 
