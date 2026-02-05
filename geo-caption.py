@@ -1,322 +1,186 @@
-import torch
-import glob
 import os
-import random
+import torch
 import numpy as np
-from collections import defaultdict
-from nuscenes.map_expansion.map_api import NuScenesMap
+import random
 from tqdm import tqdm
-import argparse
+from nuscenes.map_expansion.map_api import NuScenesMap
+from collections import Counter
 
-# =========================
-# 1. CONFIGURATION
-# =========================
-DEFAULT_OUTPUT_DIR = "/mount/studenten/projects/rasoulta/dataset/tmpl-captioned"
+# -----------------------
+# CONFIGURATION
+# -----------------------
+IN_DIR = '/mount/studenten/projects/rasoulta/dataset/train_processed'
+OUT_DIR = '/mount/studenten/projects/rasoulta/dataset/train_with_captions'
+NUSCENES_ROOT = '/mount/arbeitsdaten/analysis/rasoulta/nuscenes/nuscenes_meta'
 
-# =========================
-# 2. LANGUAGE TEMPLATES
-# =========================
+os.makedirs(OUT_DIR, exist_ok=True)
+map_cache = {}
+stats = Counter()
+
+# -----------------------
+# TEMPLATE DEFINITIONS
+# -----------------------
 TEMPLATES = {
-    "Left Turn": [
-        "The ego vehicle executes a left turn.",
-        "The vehicle initiates a turn to the left.",
-        "The car turns left at the intersection.",
-        "A left turn maneuver is performed."
+    'follow': [
+        "The vehicle is maintaining its path within the current lane.",
+        "The ego vehicle continues driving straight along the lane.",
+        "The car is staying in its lane and advancing forward.",
+        "Following the established lane path consistently.",
+        "The vehicle remains centered and follows the road forward."
     ],
-    "Right Turn": [
-        "The ego vehicle executes a right turn.",
-        "The vehicle initiates a turn to the right.",
-        "The car turns right at the intersection.",
-        "A right turn maneuver is performed."
+    'lane_change_left': [
+        "The vehicle is performing a smooth lane change to the left.",
+        "The ego is merging into the adjacent lane on the left side.",
+        "Initiating a leftward maneuver to switch lanes.",
+        "The car shifts toward the left-hand lane.",
+        "Executing a lane change maneuver to the left."
     ],
-    "U-Turn": [
-        "The ego vehicle performs a U-turn.",
-        "The vehicle executes a complete U-turn.",
-        "The car reverses its direction via a U-turn.",
-        "A U-turn maneuver is executed."
+    'lane_change_right': [
+        "The vehicle is shifting into the right-hand lane.",
+        "Performing a lane change to the right to exit the current path.",
+        "The ego vehicle is merging right into the neighboring lane.",
+        "The car maneuvers toward the right side to switch lanes.",
+        "Initiating a rightward lane change."
     ],
-    "Lane Change Left": [
-        "The ego vehicle changes lanes to the left.",
-        "The vehicle merges into the left lane.",
-        "The car shifts to the lane on its left.",
-        "A lane change to the left is performed."
+    'turn_left': [
+        "The vehicle is executing a left turn at the intersection.",
+        "Making a left-hand turn to transition to the crossing street.",
+        "The car is veering left to follow the intersection's path.",
+        "Completing a leftward turn to change direction.",
+        "Performing a left turn maneuver at the junction."
     ],
-    "Lane Change Right": [
-        "The ego vehicle changes lanes to the right.",
-        "The vehicle merges into the right lane.",
-        "The car shifts to the lane on its right.",
-        "A lane change to the right is performed."
+    'turn_right': [
+        "The vehicle is performing a right turn at the junction.",
+        "Executing a right-hand turn into the intersecting lane.",
+        "The car is turning right to exit the current road segment.",
+        "Making a right turn to transition onto the cross-street.",
+        "Completing a rightward turn at the intersection."
     ],
-    "Straight Drive": [
-        "The ego vehicle drives straight.",
-        "The vehicle proceeds forward without turning.",
-        "The car maintains its course.",
-        "It drives straight ahead."
+    'u_turn': [
+        "The vehicle is performing a full U-turn to reverse direction.",
+        "Executing a 180-degree turn to head back the opposite way.",
+        "The ego is completing a U-turn maneuver.",
+        "Reversing direction via a controlled U-turn."
     ],
-    "Stationary Stop": [
-        "The ego vehicle remains stationary.",
-        "The vehicle is stopped.",
-        "The car holds its position.",
-        "It is waiting in place."
+    'stationary': [
+        "The vehicle remains stationary at its current position.",
+        "The ego is stopped and not currently in motion.",
+        "Maintaining a full stop within the lane.",
+        "The vehicle is idling at its current location.",
+        "Currently stationary and awaiting further movement."
+    ],
+    'off_map': [
+        "The vehicle is moving through an unmapped or off-road area.",
+        "The ego is navigating a region without clearly defined lane data.",
+        "Driving through a segment where map markings are unavailable."
     ]
 }
 
-LANE_TEMPLATES = {
-    "maintain": [
-        "It maintains its current lane.",
-        "The vehicle stays within the lane.",
-        "It follows the lane center.",
-        "No lane deviation occurs."
-    ],
-    "change_left": [
-        "It is changing lanes to the left.",
-        "A merge to the left is occurring.",
-        "It crosses into the left lane.",
-        "The lateral move targets the left lane."
-    ],
-    "change_right": [
-        "It is changing lanes to the right.",
-        "A merge to the right is occurring.",
-        "It crosses into the right lane.",
-        "The lateral move targets the right lane."
-    ],
-    "turn_action": [
-        "It turns onto a new path.",
-        "The vehicle enters the intersection.",
-        "It follows the turning lane.",
-        "The trajectory curves significantly."
-    ],
-    "stop_action": [
-        "It holds its position.",
-        "No movement is detected.",
-        "It waits at the current location.",
-        "The velocity is near zero."
-    ]
-}
+# -----------------------
+# HELPER FUNCTIONS
+# -----------------------
+def get_map(city_name):
+    if city_name not in map_cache:
+        map_cache[city_name] = NuScenesMap(NUSCENES_ROOT, city_name)
+    return map_cache[city_name]
 
-# =========================
-# 3. ROBUST LOGIC (Topology + Geometry)
-# =========================
-def classify_maneuver(nusc_map, global_traj):
-    """
-    Robust classification using Map Topology (Neighbors) + S-Curve Geometry.
-    """
-    p_start = global_traj[0]
-    p_mid   = global_traj[15] # Approx mid-point (1.5s)
-    p_end   = global_traj[-1]
 
-    # --- 1. Basic Geometry ---
-    v_start = global_traj[5] - global_traj[0]
-    v_end   = global_traj[-1] - global_traj[-6]
-    
-    # Heading Change (Delta Yaw)
-    angle_start = np.arctan2(v_start[1], v_start[0])
-    angle_end = np.arctan2(v_end[1], v_end[0])
-    delta_deg = np.degrees(angle_end - angle_start)
-    delta_deg = (delta_deg + 180) % 360 - 180
-    
-    # Displacement
-    dist_total = np.linalg.norm(p_end - p_start)
 
-    # --- 2. Map Queries (The Source of Truth) ---
-    def get_lane(p):
-        try: 
-            # Search with a small radius (1m)
-            layers = nusc_map.layers_on_point(p[0], p[1])
-            if layers and 'lane' in layers:
-                return layers['lane']
-            return ''
-        except: return ''
-
-    l_start = get_lane(p_start)
-    l_end   = get_lane(p_end)
-
-    # Lookahead for End Lane if missing (project forward 5m)
-    if not l_end:
-        v_last = global_traj[-1] - global_traj[-2]
-        p_proj = p_end + (v_last * 5.0)
-        l_end = get_lane(p_proj)
-
-    # --- 3. STATIONARY CHECK ---
-    if dist_total < 2.0:
-        return "Stationary Stop", "stop_action"
-
-    # --- 4. TOPOLOGICAL CHECK ---
-    if l_start and l_end and l_start != l_end:
+def generate_ego_caption(data):
+    try:
+        nmap = get_map(data.city)
+        ego_idx = data.agent_index
         
-        # A. Check Connectivity (Successors = Straight/Turn)
-        outgoing = nusc_map.get_outgoing_lane_ids(l_start)
-        incoming = nusc_map.get_incoming_lane_ids(l_end)
-        
-        if l_end in outgoing or l_start in incoming:
-             # Longitudinal transition
-             if abs(delta_deg) > 45: 
-                 return ("Left Turn" if delta_deg > 0 else "Right Turn"), "turn_action"
-             elif abs(delta_deg) > 135:
-                 return "U-Turn", "turn_action"
-             else:
-                 return "Straight Drive", "maintain"
+        # 1. Stationary Check (Displacement < 0.5m over 3 seconds)
+        # Using relative displacement stored in 'y'
+        future_traj = data.y[ego_idx].numpy() # [30, 2]
+        total_dist = np.linalg.norm(future_traj[-1])
+        if total_dist < 0.5:
+            return random.choice(TEMPLATES['stationary']), 'stationary'
 
-        # B. Check Adjacency (Neighbors = Lane Change)
-        left_neighbors = nusc_map.get_left_lane_ids(l_start)
-        right_neighbors = nusc_map.get_right_lane_ids(l_start)
+        # 2. Coordinate Prep
+        origin = data.origin.numpy().flatten()
+        theta = data.theta.item()
+        c, s = np.cos(theta), np.sin(theta)
+        rot_mat = np.array([[c, -s], [s, c]])
         
-        if l_end in left_neighbors:
-            return "Lane Change Left", "change_left"
-        if l_end in right_neighbors:
-            return "Lane Change Right", "change_right"
+        pos_current = data.positions[ego_idx, 19].numpy()
+        pos_end = data.positions[ego_idx, 49].numpy()
+        
+        global_current = (pos_current @ rot_mat.T) + origin
+        global_end = (pos_end @ rot_mat.T) + origin
+        
+        # 3. Heading Delta (Determine Left/Right)
+        # Displacement vector from t=19 to t=49
+        v_future = pos_end - pos_current
+        heading_change = np.degrees(np.arctan2(v_future[1], v_future[0]))
+        
+        # 4. Map Matching
+        start_lane = nmap.get_closest_lane(global_current[0], global_current[1], radius=3.0)
+        end_lane = nmap.get_closest_lane(global_end[0], global_end[1], radius=3.0)
+        
+        if not start_lane or not end_lane:
+            return random.choice(TEMPLATES['off_map']), 'off_map'
+
+        # 5. Semantic Logic Branching
+        successors = nmap.get_outgoing_lane_ids(start_lane)
+        adj = nmap.get_adjacency_list(start_lane, 'lane')
+
+        # Scenario A: Staying in Lane
+        if start_lane == end_lane or end_lane in successors:
+            return random.choice(TEMPLATES['follow']), 'follow'
+        
+        # Scenario B: Lane Changes (Neighbors)
+        elif end_lane in adj['left']:
+            return random.choice(TEMPLATES['lane_change_left']), 'lane_change_left'
+        elif end_lane in adj['right']:
+            return random.choice(TEMPLATES['lane_change_right']), 'lane_change_right'
             
-        # C. Recursive Neighbor Check
-        for ln in left_neighbors:
-            if l_end in nusc_map.get_outgoing_lane_ids(ln):
-                return "Lane Change Left", "change_left"
-        for rn in right_neighbors:
-            if l_end in nusc_map.get_outgoing_lane_ids(rn):
-                return "Lane Change Right", "change_right"
-
-    # --- 5. GEOMETRIC FALLBACK ---
-    if abs(delta_deg) > 135: return "U-Turn", "turn_action"
-    if delta_deg > 30:       return "Left Turn", "turn_action"
-    if delta_deg < -30:      return "Right Turn", "turn_action"
-    
-    # S-Curve Detection (Implicit Lane Change)
-    vec_chord = p_end - p_start
-    len_chord = np.linalg.norm(vec_chord) + 1e-6
-    unit_chord = vec_chord / len_chord
-    unit_normal = np.array([-unit_chord[1], unit_chord[0]])
-    vec_mid = p_mid - p_start
-    lat_deviation = np.dot(vec_mid, unit_normal)
-    
-    if not l_start and not l_end:
-        # If intersection and huge deviation with same heading -> Lane Change
-        if abs(lat_deviation) > 2.5 and abs(delta_deg) < 20:
-            if lat_deviation > 0: return "Lane Change Left", "change_left"
-            else:                 return "Lane Change Right", "change_right"
-
-    return "Straight Drive", "maintain"
-
-# =========================
-# 4. UTILS
-# =========================
-def ego_to_global(traj, origin, theta):
-    traj = np.asarray(traj)
-    if traj.shape[0] != 2: traj = traj.T 
-    c, s = np.cos(theta), np.sin(theta)
-    R = np.array([[c, -s], [s, c]])
-    return (R @ traj).T + np.array(origin)
-
-# =========================
-# 5. MAIN PROCESSING LOOP
-# =========================
-def process_dataset(input_dir, output_dir, dataroot):
-    print(f"Input:  {input_dir}")
-    print(f"Output: {output_dir}")
-    print(f"Scanning files...")
-    
-    files = glob.glob(os.path.join(input_dir, "**", "*.pt"), recursive=True)
-    print(f"Found {len(files)} files.")
-
-    files.sort()
-    maps = {}
-    stats = defaultdict(int)
-
-    # Ensure output root exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    for f_path in tqdm(files, desc="Processing"):
-        try:
-            # 1. Load Data
-            try: data = torch.load(f_path, weights_only=False)
-            except: data = torch.load(f_path)
-            
-            # 2. Extract Attributes
-            if isinstance(data, dict):
-                city = data.get('city')
-                traj = data.get('y')
-                origin = data.get('origin')
-                theta = data.get('theta')
-                old_caps = data.get('caption_dict', {})
+        # Scenario C: Turns (Significant heading change)
+        else:
+            if abs(heading_change) > 140:
+                return random.choice(TEMPLATES['u_turn']), 'u_turn'
+            elif heading_change > 15: # Positive is Left
+                return random.choice(TEMPLATES['turn_left']), 'turn_left'
+            elif heading_change < -15: # Negative is Right
+                return random.choice(TEMPLATES['turn_right']), 'turn_right'
             else:
-                city = getattr(data, 'city', None)
-                traj = getattr(data, 'y', None)
-                origin = getattr(data, 'origin', None)
-                theta = getattr(data, 'theta', None)
-                old_caps = getattr(data, 'caption_dict', {})
-                if not isinstance(old_caps, dict): old_caps = {}
-
-            if city is None: continue
-
-            # 3. Load Map (Lazy Loading)
-            if city not in maps:
-                maps[city] = NuScenesMap(dataroot=dataroot, map_name=city)
-            nusc_map = maps[city]
-
-            # 4. Fix Shapes
-            if hasattr(traj, 'cpu'): traj = traj.cpu().numpy()
-            if hasattr(origin, 'cpu'): origin = origin.cpu().numpy()
-            if hasattr(theta, 'item'): theta = theta.item()
-            elif hasattr(theta, 'numpy'): theta = theta.item()
-
-            traj = np.squeeze(traj)
-            if traj.ndim == 3: traj = traj[0] # Ego
-            origin = np.squeeze(origin)
-            if origin.ndim > 1: origin = origin[0]
-
-            # 5. CLASSIFY
-            global_traj = ego_to_global(traj, origin, theta)
-            cat, lane_key = classify_maneuver(nusc_map, global_traj)
-
-            # 6. GENERATE CAPTION
-            man_text = random.choice(TEMPLATES[cat])
-            lane_text = random.choice(LANE_TEMPLATES[lane_key])
-            scene_desc = old_caps.get('scene_description', "Driving in an urban environment.")
-            if len(scene_desc) < 5: scene_desc = "Driving in an urban environment."
-
-            full_caption = f"{man_text} {lane_text} {scene_desc}"
+                return random.choice(TEMPLATES['follow']), 'follow'
             
-            new_caption_dict = {
-                "maneuver_type": man_text,
-                "lane_status": lane_text,
-                "scene_description": scene_desc,
-                "category": cat
-            }
+    except Exception as e:
+        return "The vehicle is in motion.", 'error'
 
-            # 7. UPDATE DATA OBJECT
-            if isinstance(data, dict):
-                data['caption_dict'] = new_caption_dict
-                data['maneuver_category'] = cat
-                data['scene_description'] = full_caption
-            else:
-                data.caption_dict = new_caption_dict
-                data.maneuver_category = cat
-                data.scene_description = full_caption
+# -----------------------
+# EXECUTION
+# -----------------------
+pt_files = [f for f in os.listdir(IN_DIR) if f.endswith('.pt')]
 
-            # 8. CALCULATE NEW PATH (PRESERVE STRUCTURE)
-            rel_path = os.path.relpath(f_path, input_dir) # e.g., "boston/file.pt"
-            new_f_path = os.path.join(output_dir, rel_path) # e.g., "output/boston/file.pt"
-            
-            # Ensure subfolder exists
-            os.makedirs(os.path.dirname(new_f_path), exist_ok=True)
+print(f"Total files to process: {len(pt_files)}")
 
-            # 9. SAVE TO NEW LOCATION
-            torch.save(data, new_f_path)
-            stats[cat] += 1
-            
-        except Exception as e:
-            # print(f"Error processing {f_path}: {e}")
-            pass
-
-    print("\n=== PROCESSING COMPLETE ===")
-    print("New Distribution:")
-    total = sum(stats.values())
-    for k, v in stats.items():
-        print(f"{k:<20}: {v} ({v/total*100:.1f}%)")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", required=True, help="Original dataset folder")
-    parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR, help="Destination for modified files")
-    parser.add_argument("--dataroot", default="./", help="NuScenes root with /maps folder")
-    args = parser.parse_args()
+for i, filename in enumerate(tqdm(pt_files)):
+    # Load original TemporalData
+    file_path = os.path.join(IN_DIR, filename)
+    data = torch.load(file_path)
     
-    process_dataset(args.input_dir, args.output_dir, args.dataroot)
+    # Generate Label
+    caption_str, maneuver_type = generate_ego_caption(data)
+    
+    # Inject into object (dynamic assignment)
+    data.caption = caption_str
+    data.maneuver_type = maneuver_type
+    
+    # Save to new location
+    torch.save(data, os.path.join(OUT_DIR, filename))
+    
+    # Update Stats
+    stats[maneuver_type] += 1
+    
+    # Periodic Log
+    if (i + 1) % 5000 == 0:
+        print(f"\nProgress Update {i+1}: {stats}")
+
+# Final Summary
+print("\n--- Processing Complete ---")
+print(f"Destination: {OUT_DIR}")
+for k, v in stats.items():
+    print(f"{k}: {v} ({100*v/len(pt_files):.2f}%)")
