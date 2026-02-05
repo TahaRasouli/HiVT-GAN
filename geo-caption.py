@@ -46,33 +46,28 @@ TEMPLATES = {
         "The vehicle is executing a left turn at the intersection.",
         "Making a left-hand turn to transition to the crossing street.",
         "The car is veering left to follow the intersection's path.",
-        "Completing a leftward turn to change direction.",
-        "Performing a left turn maneuver at the junction."
+        "Completing a leftward turn to change direction."
     ],
     'turn_right': [
         "The vehicle is performing a right turn at the junction.",
         "Executing a right-hand turn into the intersecting lane.",
         "The car is turning right to exit the current road segment.",
-        "Making a right turn to transition onto the cross-street.",
-        "Completing a rightward turn at the intersection."
+        "Making a right turn to transition onto the cross-street."
     ],
     'u_turn': [
         "The vehicle is performing a full U-turn to reverse direction.",
         "Executing a 180-degree turn to head back the opposite way.",
-        "The ego is completing a U-turn maneuver.",
-        "Reversing direction via a controlled U-turn."
+        "The ego is completing a U-turn maneuver."
     ],
     'stationary': [
         "The vehicle remains stationary at its current position.",
         "The ego is stopped and not currently in motion.",
         "Maintaining a full stop within the lane.",
-        "The vehicle is idling at its current location.",
-        "Currently stationary and awaiting further movement."
+        "The vehicle is idling at its current location."
     ],
     'off_map': [
         "The vehicle is moving through an unmapped or off-road area.",
-        "The ego is navigating a region without clearly defined lane data.",
-        "Driving through a segment where map markings are unavailable."
+        "The ego is navigating a region without clearly defined lane data."
     ]
 }
 
@@ -86,79 +81,102 @@ def get_map(city_name):
 
 def generate_ego_caption(data):
     try:
-        # 1. Hardcoded index (based on your preprocessor saving ego at 0)
+        # 1. HiVT uses 0 as ego index
         ego_idx = 0 
         
-        # 2. Extract relative future from 'y'
-        # y is [N, 30, 2]. HiVT future is relative to origin (t=19)
+        # 2. Extract relative future (local frame)
+        # y is [N, 30, 2]. t=19 is the origin (0,0)
         future_traj = data.y[ego_idx].numpy() 
         final_rel_pos = future_traj[-1]
-        total_dist = np.linalg.norm(final_rel_pos)
+        total_disp = np.linalg.norm(final_rel_pos)
         
-        if total_dist < 0.7: # Slightly higher threshold for noise
-            return random.choice(TEMPLATES['stationary']), 'stationary'
+        if total_disp < 0.7:
+            return random.choice(TEMPLATES['stationary']), 'stationary', total_disp, 0.0
 
-        # 3. Global Transformation Logic
-        # We need the ego's position at t=19 (which is the origin (0,0) in local frame)
-        # and t=49 (which is the last point in 'y')
+        # 3. Global Transformation
         origin = data.origin.numpy().flatten()
-        theta = float(data.theta)
+        theta = data.theta.item() if torch.is_tensor(data.theta) else float(data.theta)
         
         c, s = np.cos(theta), np.sin(theta)
         rot_mat = np.array([[c, -s], [s, c]])
         
-        global_current = origin # At t=19, local pos is (0,0), so global is just origin
+        global_current = origin 
         global_end = (final_rel_pos @ rot_mat.T) + origin
         
-        # 4. Heading Change (Angle of the displacement vector)
+        # 4. Local Heading Change for classification
         heading_change = np.degrees(np.arctan2(final_rel_pos[1], final_rel_pos[0]))
         
-        # 5. Map Query
-        nmap = get_map(str(data.city))
-        start_lane = nmap.get_closest_lane(global_current[0], global_current[1], radius=3.0)
-        end_lane = nmap.get_closest_lane(global_end[0], global_end[1], radius=3.0)
+        # 5. Map Query with robust city extraction
+        city_name = str(data.city[0]) if isinstance(data.city, list) else str(data.city)
+        nmap = get_map(city_name)
+        
+        start_lane = nmap.get_closest_lane(global_current[0], global_current[1], radius=5.0)
+        end_lane = nmap.get_closest_lane(global_end[0], global_end[1], radius=5.0)
         
         if not start_lane or not end_lane:
-            return random.choice(TEMPLATES['off_map']), 'off_map'
+            return random.choice(TEMPLATES['off_map']), 'off_map', total_disp, heading_change
 
-        # 6. Successor/Neighbor Logic
+        # 6. Connectivity Logic
         successors = nmap.get_outgoing_lane_ids(start_lane)
         adj = nmap.get_adjacency_list(start_lane, 'lane')
 
         if start_lane == end_lane or end_lane in successors:
-            return random.choice(TEMPLATES['follow']), 'follow'
+            return random.choice(TEMPLATES['follow']), 'follow', total_disp, heading_change
         elif end_lane in adj['left']:
-            return random.choice(TEMPLATES['lane_change_left']), 'lane_change_left'
+            return random.choice(TEMPLATES['lane_change_left']), 'lane_change_left', total_disp, heading_change
         elif end_lane in adj['right']:
-            return random.choice(TEMPLATES['lane_change_right']), 'lane_change_right'
+            return random.choice(TEMPLATES['lane_change_right']), 'lane_change_right', total_disp, heading_change
         else:
             if abs(heading_change) > 140:
-                return random.choice(TEMPLATES['u_turn']), 'u_turn'
-            elif heading_change > 20: 
-                return random.choice(TEMPLATES['turn_left']), 'turn_left'
-            elif heading_change < -20: 
-                return random.choice(TEMPLATES['turn_right']), 'turn_right'
+                m_type = 'u_turn'
+            elif heading_change > 15: 
+                m_type = 'turn_left'
+            elif heading_change < -15: 
+                m_type = 'turn_right'
             else:
-                return random.choice(TEMPLATES['follow']), 'follow'
+                m_type = 'follow'
+            return random.choice(TEMPLATES[m_type]), m_type, total_disp, heading_change
             
     except Exception as e:
-        # For debugging, you can print(e) here once
-        return "The vehicle is in motion.", 'error'
+        # Diagnostic print for the first few errors
+        if stats['error'] < 5:
+            print(f"\n[DEBUG] Error processing file: {e}")
+        return "The vehicle is in motion.", 'error', 0.0, 0.0
 
 # -----------------------
-# EXECUTION
+# EXECUTION & INTEGRATED SANITY CHECK
 # -----------------------
-pt_files = [f for f in os.listdir(IN_DIR) if f.endswith('.pt')]
+pt_files = sorted([f for f in os.listdir(IN_DIR) if f.endswith('.pt')])
 
-for filename in tqdm(pt_files):
+print(f"Starting processing of {len(pt_files)} files...")
+
+for i, filename in enumerate(tqdm(pt_files)):
     data = torch.load(os.path.join(IN_DIR, filename))
-    caption_str, m_type = generate_ego_caption(data)
     
-    # Use .__setattr__ to be safe with TemporalData objects
+    caption_str, m_type, disp, angle = generate_ego_caption(data)
+    
+    # Save attributes
     data.caption = caption_str
     data.maneuver_type = m_type
     
     torch.save(data, os.path.join(OUT_DIR, filename))
     stats[m_type] += 1
 
-print(f"\nFinished! Final Stats: {stats}")
+    # SANITY CHECK: Every 50 files, print a report of the current file
+    if (i + 1) % 50 == 0:
+        print(f"\n--- Sanity Check (File {i+1}) ---")
+        print(f"File: {filename}")
+        print(f"Maneuver: {m_type} | Caption: {caption_str}")
+        print(f"Metrics: Disp: {disp:.2f}m | Local Angle: {angle:.2f}°")
+        
+        # Geometric Logic Verification
+        if m_type == 'turn_left' and angle < 5:
+            print("   [!] WARNING: Classified Left Turn but local angle is low.")
+        elif m_type == 'stationary' and disp > 1.0:
+            print("   [!] WARNING: Classified Stationary but vehicle moved.")
+        print("-" * 40)
+
+# Final Summary
+print("\n--- Final Processing Stats ---")
+for k, v in stats.items():
+    print(f"{k:<18}: {v} ({100*v/len(pt_files):.2f}%)")
