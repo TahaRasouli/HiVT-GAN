@@ -17,49 +17,15 @@ os.makedirs(OUT_DIR, exist_ok=True)
 map_cache = {}
 stats = Counter()
 
-# -----------------------
-# TEMPLATES (Consistent with previous request)
-# -----------------------
 TEMPLATES = {
-    'follow': [
-        "The vehicle is maintaining its path within the current lane.",
-        "The ego vehicle continues driving straight along the lane.",
-        "The car is staying in its lane and advancing forward.",
-        "Following the established lane path consistently."
-    ],
-    'lane_change_left': [
-        "The vehicle is performing a smooth lane change to the left.",
-        "The ego is merging into the adjacent lane on the left side.",
-        "Initiating a leftward maneuver to switch lanes."
-    ],
-    'lane_change_right': [
-        "The vehicle is shifting into the right-hand lane.",
-        "Performing a lane change to the right to exit the current path.",
-        "The ego vehicle is merging right into the neighboring lane."
-    ],
-    'turn_left': [
-        "The vehicle is executing a left turn at the intersection.",
-        "Making a left-hand turn to transition to the crossing street.",
-        "The car is veering left to follow the intersection's path."
-    ],
-    'turn_right': [
-        "The vehicle is performing a right turn at the junction.",
-        "Executing a right-hand turn into the intersecting lane.",
-        "The car is turning right to exit the current road segment."
-    ],
-    'u_turn': [
-        "The vehicle is performing a full U-turn to reverse direction.",
-        "Executing a 180-degree turn to head back the opposite way."
-    ],
-    'stationary': [
-        "The vehicle remains stationary at its current position.",
-        "The ego is stopped and not currently in motion.",
-        "The vehicle is idling at its current location."
-    ],
-    'off_map': [
-        "The vehicle is moving through an unmapped area.",
-        "The ego is navigating a region without clearly defined lane data."
-    ]
+    'follow': ["The vehicle is maintaining its path within the current lane.", "The ego vehicle continues driving straight along the lane."],
+    'lane_change_left': ["The vehicle is performing a smooth lane change to the left.", "The ego is merging into the adjacent lane on the left side."],
+    'lane_change_right': ["The vehicle is shifting into the right-hand lane.", "The ego vehicle is merging right into the neighboring lane."],
+    'turn_left': ["The vehicle is executing a left turn at the intersection.", "Making a left-hand turn to transition to the crossing street."],
+    'turn_right': ["The vehicle is performing a right turn at the junction.", "Executing a right-hand turn into the intersecting lane."],
+    'u_turn': ["The vehicle is performing a full U-turn to reverse direction.", "Executing a 180-degree turn to head back the opposite way."],
+    'stationary': ["The vehicle remains stationary at its current position.", "The ego is stopped and not currently in motion."],
+    'off_map': ["The vehicle is moving through an unmapped area.", "The ego is navigating a region without clearly defined lane data."]
 }
 
 def get_map(city_name):
@@ -76,7 +42,8 @@ def generate_ego_caption(data):
         final_rel_pos = future_traj[-1]
         total_disp = np.linalg.norm(final_rel_pos)
         
-        if total_dist < 0.7:
+        # FIXED: Variable name used to be total_dist
+        if total_disp < 0.7:
             return random.choice(TEMPLATES['stationary']), 'stationary', total_disp, 0.0
 
         # 2. Global Conversion
@@ -88,10 +55,10 @@ def generate_ego_caption(data):
         global_curr = origin 
         global_end = (final_rel_pos @ rot_mat.T) + origin
         
-        # 3. Local Heading Delta (Positive = Left, Negative = Right)
+        # 3. Local Heading Delta
         heading_change = np.degrees(np.arctan2(final_rel_pos[1], final_rel_pos[0]))
         
-        # 4. Map Matching
+        # 4. Map Query
         city_name = str(data.city[0]) if isinstance(data.city, list) else str(data.city)
         nmap = get_map(city_name)
         
@@ -101,20 +68,15 @@ def generate_ego_caption(data):
         if not start_lane or not end_lane:
             return random.choice(TEMPLATES['off_map']), 'off_map', total_disp, heading_change
 
-        # 5. Semantic Logic (Replacement for get_left_lanes)
+        # 5. Successor Check (Safe API method)
         successors = nmap.get_outgoing_lane_ids(start_lane)
 
-        # If it's the same lane or a successor, it's a 'follow'
         if start_lane == end_lane or end_lane in successors:
             m_type = 'follow'
         else:
-            # We determine the maneuver based on the heading change
-            # This is exactly what the working script did conceptually
             if abs(heading_change) > 140:
                 m_type = 'u_turn'
             elif heading_change > 15:
-                # If it's a small lateral shift, call it a lane change
-                # If it's a large angle, call it a turn
                 m_type = 'lane_change_left' if heading_change < 35 else 'turn_left'
             elif heading_change < -15:
                 m_type = 'lane_change_right' if heading_change > -35 else 'turn_right'
@@ -124,6 +86,9 @@ def generate_ego_caption(data):
         return random.choice(TEMPLATES[m_type]), m_type, total_disp, heading_change
             
     except Exception as e:
+        # Diagnostic print to see if it's something other than the typo
+        if stats['error'] < 1:
+            print(f"\n[DEBUG] Actual error: {e}")
         return "The vehicle is in motion.", 'error', 0.0, 0.0
 
 # -----------------------
