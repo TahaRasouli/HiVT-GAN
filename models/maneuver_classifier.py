@@ -50,10 +50,12 @@ class ManeuverClassifier(pl.LightningModule):
         return self.head(ego_embeddings)
 
     def _remap_labels(self, y):
-        # Maps original IDs [0, 1, 2, 4, 5, 6] -> [0, 1, 2, 3, 4, 5]
+        # We only have 6 valid classes now
         mapping = {0: 0, 1: 1, 2: 2, 4: 3, 5: 4, 6: 5}
-        # Use a list comprehension and move back to device
-        remapped = torch.tensor([mapping[val.item()] for val in y], device=y.device)
+        
+        # Use .get() with a default of 0 to prevent KeyError, 
+        # but the dataset filter should have already removed bad IDs.
+        remapped = torch.tensor([mapping.get(val.item(), 0) for val in y], device=y.device)
         return remapped
 
     def training_step(self, data, batch_idx):

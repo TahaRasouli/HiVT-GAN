@@ -67,29 +67,19 @@ class NuScenesHiVTDataModule(LightningDataModule):
     #  THIS IS THE CRITICAL SECTION WE MODIFIED
     # --------------------------------------------------
     def train_dataloader(self):
-        # 1. SCAN DATASET FOR WEIGHTS
-        # We assume the dataset is already loaded in memory or allows fast iteration
-        print(f"[Info] Scanning {len(self.train_dataset)} samples to calculate Sampling Weights...")
-        
+        print(f"[Info] Calculating Sampling Weights for capped dataset...")
         sample_weights = []
         for data in self.train_dataset:
-            # Handle both Tensor and Int types safely
-            if hasattr(data.maneuver_id, 'item'):
-                label = int(data.maneuver_id.item())
-            else:
-                label = int(data.maneuver_id)
+            label = int(data.maneuver_id.item())
             
-            # --- WEIGHT ASSIGNMENT LOGIC ---
-            if label == 3:       # U-TURN (The rarest class)
-                weight = 100.0   # Massive weight to force it into batches
-            elif label in [1, 2, 4, 5]: # TURNS & LANE CHANGES
-                weight = 10.0    # Moderate weight
-            else:                # STRAIGHT (0) & STATIONARY (6)
-                weight = 1.0     # Low weight (they are abundant)
+            # Weighted logic for the 6 active classes
+            if label in [1, 2, 4, 5]: # Turns and Lane Changes
+                weight = 10.0
+            else: # Straight (0) and Stationary (6)
+                weight = 1.0
             
             sample_weights.append(weight)
 
-        # 2. CREATE SAMPLER
         sampler = WeightedRandomSampler(
             weights=sample_weights,
             num_samples=len(self.train_dataset),

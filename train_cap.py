@@ -11,33 +11,18 @@ from models.cvae import CVAE
 from models.maneuver_classifier import ManeuverClassifier
 
 def calculate_6class_weights(dataset):
-    print("[Info] Calculating inverse-frequency weights for 6 classes (excluding U-Turns)...")
     counts = Counter()
+    mapping = {0:0, 1:1, 2:2, 4:3, 5:4, 6:5}
+    
     for i in range(len(dataset)):
-        data = dataset.get(i)
-        m_id = int(data.maneuver_id.item())
-        if m_id == 3:  # Skip U-Turns (ID 3)
-            continue
-        counts[m_id] += 1
-
-    total = sum(counts.values())
-    weights = torch.zeros(6)  # 6 classes: 0,1,2,4,5,6
-    for cls in range(7):
-        if cls == 3:
-            continue
-        weights[cls - (1 if cls > 3 else 0)] = total / (6 * counts[cls]) if counts[cls] > 0 else 1.0
-    return weights
-    counts = Counter()
-    for i in range(len(dataset)):
-        # Quick access to label without full sanitization if possible
-        data = dataset.get(i)
-        counts[int(data.maneuver_id.item())] += 1
+        m_id = int(dataset.get(i).maneuver_id.item())
+        if m_id in mapping:
+            counts[mapping[m_id]] += 1
     
     total = sum(counts.values())
-    weights = torch.zeros(7)
-    for cls in range(7):
-        # Inverse frequency: total / (num_classes * count_per_class)
-        weights[cls] = total / (7 * counts[cls]) if counts[cls] > 0 else 1.0
+    weights = torch.zeros(6)
+    for new_idx in range(6):
+        weights[new_idx] = total / (6 * counts[new_idx]) if counts[new_idx] > 0 else 1.0
     return weights
 
 def main():
