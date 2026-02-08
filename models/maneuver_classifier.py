@@ -25,23 +25,31 @@ class ManeuverClassifier(pl.LightningModule):
         self.class_names = ["Straight", "Left", "Right", "LCL", "LCR", "Stat"]
 
     def forward(self, data):
-        # 1. On-the-fly Rotation Matrix
+
         rotate_mat = torch.empty(data.num_nodes, 2, 2, device=self.device)
-        sin, cos = torch.sin(data['rotate_angles']), torch.cos(data['rotate_angles'])
-        rotate_mat[:, 0, 0] = cos; rotate_mat[:, 0, 1] = -sin
-        rotate_mat[:, 1, 0] = sin; rotate_mat[:, 1, 1] = cos
-        data['rotate_mat'] = rotate_mat
-        
-        # 2. Backbone Forward
+        sin, cos = torch.sin(data.rotate_angles), torch.cos(data.rotate_angles)
+        rotate_mat[:, 0, 0] = cos
+        rotate_mat[:, 0, 1] = -sin
+        rotate_mat[:, 1, 0] = sin
+        rotate_mat[:, 1, 1] = cos
+        data.rotate_mat = rotate_mat
+
         local_embed = self.encoder(data=data)
         global_embed = self.interactor(data=data, local_embed=local_embed)
-        
-        # 3. Vectorized Ego Extraction
-        # Egos are the first node of each graph in the batch
-        indices = torch.cat([torch.tensor([0], device=self.device), 
-                             torch.where(data.batch[1:] != data.batch[:-1])[0] + 1])
-        
-        return self.head(global_embed[indices])
+
+        print("global_embed:", global_embed.shape)
+        print("num_nodes:", data.num_nodes)
+        print("batch size:", data.num_graphs)
+        print("max index:", indices.max())
+
+        # SAFE ego selection
+        if hasattr(data, "is_ego"):
+            ego_embed = global_embed[data.is_ego.bool()]
+        else:
+            raise RuntimeError("Dataset must provide ego mask")
+
+        return self.head(ego_embed)
+
 
     def _remap(self, y):
         mapping = torch.full_like(y, -1)
@@ -85,6 +93,8 @@ class ManeuverClassifier(pl.LightningModule):
         print("y shape:", y.shape)
         print("y unique:", torch.unique(y))
         self.val_f1.update(logits, y)
+        print(data)
+        print(data.keys)
         return F.cross_entropy(logits, y, weight=self.loss_weights)
 
     def on_validation_epoch_end(self):
