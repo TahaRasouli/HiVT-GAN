@@ -56,16 +56,23 @@ def main():
     
     args = parser.parse_args()
 
-    # 1. Load Data with caps
+    # 1. Initialize Dataset & Calculate Weights
+    # This will trigger the filtering progress bar we added to nuscenes_dataset.py
     train_dataset = NuScenesHiVTDataset(root=args.root, split='train')
-    print(f"Dataset initialized with {len(train_dataset)} capped samples.")
-
-    # 2. Re-calculate weights for 6 classes
-    # (Use the calculate_class_weights logic but ensure it skips ID 3)
     class_weights = calculate_6class_weights(train_dataset)
+    
+    # 2. Setup DataModule
+    datamodule = NuScenesHiVTDataModule(
+        root=args.root,
+        train_batch_size=args.batch_size,
+        val_batch_size=args.batch_size,
+        num_workers=8
+    )
 
-    # 3. Initialize Model
-    backbone = CVAE.load_from_checkpoint(args.ckpt_path)
+    # 3. Load Frozen Backbone & Model
+    print(f"[Info] Loading Frozen Backbone: {args.ckpt_path}")
+    backbone = CVAE.load_from_checkpoint(args.ckpt_path, strict=False)
+    
     model = ManeuverClassifier(
         frozen_backbone=backbone,
         num_classes=6,
@@ -73,13 +80,32 @@ def main():
         class_weights=class_weights
     )
 
-    # 4. Run Trainer
+    # 4. Define Callbacks (Fixes the NameError)
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_f1_macro",
+        mode="max",
+        filename="maneuver-classifier-{epoch:02d}-{val_f1_macro:.2f}",
+        save_top_k=2
+    )
+    
+    early_stop = EarlyStopping(
+        monitor="val_f1_macro", 
+        patience=10, 
+        mode="max"
+    )
+
+    # 5. Trainer
     trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
         accelerator="gpu",
         devices=args.devices,
-        callbacks=[checkpoint_callback, early_stop]
+        strategy="auto",
+        precision="16-mixed",
+        max_epochs=args.max_epochs,
+        callbacks=[checkpoint_callback, early_stop],
+        log_every_n_steps=10
     )
+
+    print("[Info] Starting Maneuver Classification Training...")
     trainer.fit(model, datamodule)
 
 if __name__ == "__main__":
