@@ -53,6 +53,10 @@ class NuScenesHiVTDataModule(LightningDataModule):
     def train_dataloader(self):
         sample_weights = []
         for data in self.train_dataset:
+            print(data.maneuver_id.shape)
+            print(data.batch.shape)
+            print(data.num_graphs)
+            print(data.num_nodes)
             label = int(data.maneuver_id.item())
             # Weights for active classes (0,1,2,4,5,6) - ignoring 3 and -1
             weight = 10.0 if label in [1, 2, 4, 5] else 1.0
