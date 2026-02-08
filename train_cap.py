@@ -25,7 +25,12 @@ def calculate_6class_weights(dataset):
     total = sum(counts.values())
     weights = torch.zeros(6)
     for idx in range(6):
-        weights[idx] = total / (6 * counts[idx]) if counts[idx] > 0 else 1.0
+        # Inverse frequency calculation
+        raw_weight = total / (6 * counts[idx]) if counts[idx] > 0 else 1.0
+        # CAP the weight at 20.0 to prevent gradient explosions
+        weights[idx] = min(raw_weight, 20.0)
+        
+    print(f"[Info] Remapped & Capped Weights: {weights}")
     return weights
 
 def main():
