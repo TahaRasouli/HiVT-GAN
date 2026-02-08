@@ -37,12 +37,17 @@ class ManeuverClassifier(pl.LightningModule):
         local_embed = self.encoder(data=data)
         global_embed = self.interactor(data=data, local_embed=local_embed)
 
-        print("global_embed:", global_embed.shape)
+        # ---- correct ego selection ----
+        batch = data.batch
+        ego_indices = torch.cat([
+            torch.tensor([0], device=batch.device),
+            torch.where(batch[1:] != batch[:-1])[0] + 1
+        ])
 
-        ego_mask = data.is_ego.bool()
-        ego_embed = global_embed[0][ego_mask]
+        ego_embed = global_embed[0, ego_indices, :]
 
         return self.head(ego_embed)
+
 
 
 
@@ -65,12 +70,14 @@ class ManeuverClassifier(pl.LightningModule):
 
     def training_step(self, data, batch_idx):
         logits = self(data)
-        indices = torch.cat([
-            torch.tensor([0], device=self.device),
-            torch.where(data.batch[1:] != data.batch[:-1])[0] + 1
+        batch = data.batch
+        ego_indices = torch.cat([
+            torch.tensor([0], device=batch.device),
+            torch.where(batch[1:] != batch[:-1])[0] + 1
         ])
 
-        y = self._remap(data.maneuver_id[indices])
+        y = self._remap(data.maneuver_id[ego_indices])
+
 
         loss = F.cross_entropy(logits, y, weight=self.loss_weights)
         self.log("train_loss", loss, prog_bar=True, batch_size=data.num_graphs)
@@ -78,12 +85,14 @@ class ManeuverClassifier(pl.LightningModule):
 
     def validation_step(self, data, batch_idx):
         logits = self(data)
-        indices = torch.cat([
-            torch.tensor([0], device=self.device),
-            torch.where(data.batch[1:] != data.batch[:-1])[0] + 1
+        batch = data.batch
+        ego_indices = torch.cat([
+            torch.tensor([0], device=batch.device),
+            torch.where(batch[1:] != batch[:-1])[0] + 1
         ])
 
-        y = self._remap(data.maneuver_id[indices])
+        y = self._remap(data.maneuver_id[ego_indices])
+
         print("logits shape:", logits.shape)
         print("y shape:", y.shape)
         print("y unique:", torch.unique(y))
