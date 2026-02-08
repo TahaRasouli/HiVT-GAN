@@ -7,7 +7,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from collections import Counter
 
 from datasets.nuscenes_dataset import NuScenesHiVTDataset
-from datasets.nuscenes_datamodule import NuScenesHiVTDataModule
+from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.trajectory_generator import CVAE 
 from models.maneuver_classifier import ManeuverClassifier
 
