@@ -99,6 +99,8 @@ class ManeuverClassifier(pl.LightningModule):
         self.val_f1.update(logits, y)
         print(data)
         print(data.keys)
+        assert logits.shape[0] == data.num_graphs
+        assert y.shape[0] == data.num_graphs
         return F.cross_entropy(logits, y, weight=self.loss_weights)
 
     def on_validation_epoch_end(self):
