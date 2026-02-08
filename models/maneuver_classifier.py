@@ -44,12 +44,22 @@ class ManeuverClassifier(pl.LightningModule):
         return self.head(global_embed[indices])
 
     def _remap(self, y):
-        # Maps [0,1,2,4,5,6] -> [0,1,2,3,4,5]
-        mapping = {0:0, 1:1, 2:2, 4:3, 5:4, 6:5}
-        new_y = torch.zeros_like(y)
-        for old, new in mapping.items():
-            new_y[y == old] = new
-        return new_y
+            """
+            Efficiently remaps non-contiguous labels to [0, 5].
+            0:Straight, 1:Left, 2:Right, 4:LCL, 5:LCR, 6:Stat
+            """
+            # Create a copy to avoid in-place modification of the original data
+            new_y = torch.zeros_like(y)
+            
+            # Vectorized remapping (No .item() or list comps - safe for CUDA)
+            new_y = torch.where(y == 1, torch.tensor(1, device=y.device), new_y) # Left
+            new_y = torch.where(y == 2, torch.tensor(2, device=y.device), new_y) # Right
+            new_y = torch.where(y == 4, torch.tensor(3, device=y.device), new_y) # LCL -> 3
+            new_y = torch.where(y == 5, torch.tensor(4, device=y.device), new_y) # LCR -> 4
+            new_y = torch.where(y == 6, torch.tensor(5, device=y.device), new_y) # Stat -> 5
+            # y=0 stays new_y=0 (Straight)
+            
+            return new_y
 
     def training_step(self, data, batch_idx):
         logits = self(data)
