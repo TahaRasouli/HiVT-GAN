@@ -11,18 +11,17 @@ from models.cvae import CVAE
 from models.maneuver_classifier import ManeuverClassifier
 
 def calculate_6class_weights(dataset):
+    from collections import Counter
     counts = Counter()
     mapping = {0:0, 1:1, 2:2, 4:3, 5:4, 6:5}
-    
     for i in range(len(dataset)):
         m_id = int(dataset.get(i).maneuver_id.item())
-        if m_id in mapping:
-            counts[mapping[m_id]] += 1
+        counts[mapping[m_id]] += 1
     
     total = sum(counts.values())
     weights = torch.zeros(6)
-    for new_idx in range(6):
-        weights[new_idx] = total / (6 * counts[new_idx]) if counts[new_idx] > 0 else 1.0
+    for idx in range(6):
+        weights[idx] = total / (6 * counts[idx]) if counts[idx] > 0 else 1.0
     return weights
 
 def main():
