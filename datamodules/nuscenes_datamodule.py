@@ -1,64 +1,85 @@
-import os
+from typing import Callable, Optional
 import torch
-from torch_geometric.data import Dataset, Batch
-from utils import TemporalData
-from tqdm import tqdm
-from typing import Optional, List, Dict, Callable
+from pytorch_lightning import LightningDataModule
+from torch_geometric.loader import DataLoader
+from torch.utils.data import WeightedRandomSampler
 
-class NuScenesHiVTDataModule(Dataset):
-    def __init__(self, root: str, split: str = "train", transform=None, max_samples: Optional[int] = None):
-        self.split = split
+from datasets.nuscenes_dataset import NuScenesHiVTDataset
+
+class NuScenesHiVTDataModule(LightningDataModule):
+    def __init__(
+        self,
+        root: str,
+        train_batch_size: int = 32,
+        val_batch_size: int = 32,
+        shuffle: bool = True,
+        num_workers: int = 8,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+        train_transform: Optional[Callable] = None,
+        val_transform: Optional[Callable] = None,
+        max_train_samples: Optional[int] = None,
+        max_val_samples: Optional[int] = None,
+    ) -> None:
+        super().__init__()
         self.root = root
-        self.transform = transform
-        self._processed_dir = os.path.join(self.root, f"{split}_processed")
+        self.train_batch_size = train_batch_size
+        self.val_batch_size = val_batch_size
+        self.shuffle = shuffle
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.persistent_workers = persistent_workers
+        self.train_transform = train_transform
+        self.val_transform = val_transform
+        self.max_train_samples = max_train_samples
+        self.max_val_samples = max_val_samples
 
-        # 1. File Listing
-        all_files = sorted(f for f in os.listdir(self._processed_dir) if f.endswith(".pt"))
+    def setup(self, stage: Optional[str] = None) -> None:
+        if stage in (None, "fit"):
+            self.train_dataset = NuScenesHiVTDataset(
+                root=self.root,
+                split="train",
+                transform=self.train_transform,
+                max_samples=self.max_train_samples,
+            )
+        if stage in (None, "fit", "validate"):
+            self.val_dataset = NuScenesHiVTDataset(
+                root=self.root,
+                split="val",
+                transform=self.val_transform,
+                max_samples=self.max_val_samples,
+            )
 
-        # 2. Strict Filtering (Applied to BOTH splits)
-        print(f"[Dataset] Filtering {split} set (Removing U-Turns/Off-Map)...")
-        
-        # Training caps: 0=Straight, 6=Stationary
-        caps = {0: 500, 6: 300} if split == "train" else {}
-        counters = {0: 0, 6: 0}
-        filtered_files = []
+    def train_dataloader(self):
+        sample_weights = []
+        for data in self.train_dataset:
+            label = int(data.maneuver_id.item())
+            # Weights for active classes (0,1,2,4,5,6) - ignoring 3 and -1
+            weight = 10.0 if label in [1, 2, 4, 5] else 1.0
+            sample_weights.append(weight)
 
-        for f in tqdm(all_files, desc=f"Scanning {split}"):
-            data = torch.load(os.path.join(self._processed_dir, f))
-            m_id = self._get_maneuver_id(data)
-            
-            # Exclude U-Turns (3) and Off-Map (-1)
-            if m_id == 3 or m_id == -1:
-                continue
-            
-            # Apply caps for training
-            if m_id in caps:
-                if counters[m_id] < caps[m_id]:
-                    filtered_files.append(f)
-                    counters[m_id] += 1
-            else:
-                filtered_files.append(f)
-        
-        self._processed_file_names = filtered_files
-        super().__init__(root, transform=transform)
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(self.train_dataset),
+            replacement=True
+        )
 
-    def _get_maneuver_id(self, data) -> int:
-        mapping = {"follow": 0, "turn_left": 1, "turn_right": 2, "u_turn": 3, 
-                   "lane_change_left": 4, "lane_change_right": 5, "stationary": 6, "off_map": -1}
-        label = getattr(data, 'maneuver_type', "follow")
-        return mapping.get(label, 0)
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.train_batch_size,
+            sampler=sampler,
+            shuffle=False, # Sampler handles the "shuffle"
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+        )
 
-    @property
-    def processed_dir(self) -> str: return self._processed_dir
-    @property
-    def processed_file_names(self) -> List[str]: return self._processed_file_names
-
-    def _sanitize(self, data: TemporalData) -> TemporalData:
-        data.ego_index = torch.tensor([0], dtype=torch.long)
-        data.maneuver_id = torch.tensor([self._get_maneuver_id(data)], dtype=torch.long)
-        # Add basic shape fixes here if needed
-        return data
-
-    def len(self) -> int: return len(self._processed_file_names)
-    def get(self, idx: int) -> TemporalData:
-        return self._sanitize(torch.load(os.path.join(self.processed_dir, self._processed_file_names[idx])))
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.val_batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers
+        )
