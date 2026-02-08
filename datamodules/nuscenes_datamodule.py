@@ -3,6 +3,7 @@ import torch
 from torch_geometric.data import Dataset, Batch
 from utils import TemporalData
 from tqdm import tqdm
+from typing import Optional, List, Dict, Callable
 
 class NuScenesHiVTDataset(Dataset):
     def __init__(self, root: str, split: str = "train", transform=None, max_samples: Optional[int] = None):
