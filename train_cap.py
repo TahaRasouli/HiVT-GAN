@@ -6,12 +6,27 @@ from pytorch_lightning.strategies import DDPStrategy
 from collections import Counter
 
 from datasets.nuscenes_dataset import NuScenesHiVTDataset
-from datasets.nuscenes_datamodule import NuScenesHiVTDataModule
+from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.trajectory_generator import CVAE # Or HiVT
 from models.maneuver_classifier import ManeuverClassifier
 
-def calculate_class_weights(dataset):
-    print("[Info] Calculating inverse-frequency weights...")
+def calculate_6class_weights(dataset):
+    print("[Info] Calculating inverse-frequency weights for 6 classes (excluding U-Turns)...")
+    counts = Counter()
+    for i in range(len(dataset)):
+        data = dataset.get(i)
+        m_id = int(data.maneuver_id.item())
+        if m_id == 3:  # Skip U-Turns (ID 3)
+            continue
+        counts[m_id] += 1
+
+    total = sum(counts.values())
+    weights = torch.zeros(6)  # 6 classes: 0,1,2,4,5,6
+    for cls in range(7):
+        if cls == 3:
+            continue
+        weights[cls - (1 if cls > 3 else 0)] = total / (6 * counts[cls]) if counts[cls] > 0 else 1.0
+    return weights
     counts = Counter()
     for i in range(len(dataset)):
         # Quick access to label without full sanitization if possible
