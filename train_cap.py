@@ -35,7 +35,7 @@ def main():
     parser.add_argument("--root", type=str, required=True)
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--max_epochs", type=int, default=40)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=8)
@@ -93,8 +93,8 @@ def main():
         devices=args.devices,
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback, early_stop],
-        logger=TensorBoardLogger("logs", name="maneuver_final"),
-        precision="16-mixed"
+        gradient_clip_val=0.5, # <--- Add this to stop exploding gradients
+        precision="32"         # <--- Use full precision for stability
     )
 
     trainer.fit(model, datamodule)
