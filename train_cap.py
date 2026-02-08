@@ -11,6 +11,8 @@ from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
 from models.cvae import CVAE
 from models.maneuver_classifier import ManeuverClassifier
 
+torch.set_float32_matmul_precision('high')
+
 def calculate_6class_weights(dataset):
     print("[Info] Calculating weights for 6-class setup...")
     counts = Counter()

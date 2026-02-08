@@ -49,14 +49,11 @@ class NuScenesHiVTDataModule(LightningDataModule):
                 transform=self.val_transform,
                 max_samples=self.max_val_samples,
             )
-
+            
     def train_dataloader(self):
         sample_weights = []
         for data in self.train_dataset:
-            print(data.maneuver_id.shape)
-            print(data.batch.shape)
-            print(data.num_graphs)
-            print(data.num_nodes)
+            # Only inspect maneuver_id
             label = int(data.maneuver_id.item())
             # Weights for active classes (0,1,2,4,5,6) - ignoring 3 and -1
             weight = 10.0 if label in [1, 2, 4, 5] else 1.0
@@ -72,10 +69,11 @@ class NuScenesHiVTDataModule(LightningDataModule):
             self.train_dataset,
             batch_size=self.train_batch_size,
             sampler=sampler,
-            shuffle=False, # Sampler handles the "shuffle"
+            shuffle=False,  # Sampler handles shuffle
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
+            collate_fn=self.collate_fn if hasattr(self, 'collate_fn') else None
         )
 
     def val_dataloader(self):
