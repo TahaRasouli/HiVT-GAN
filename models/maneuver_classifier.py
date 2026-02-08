@@ -28,27 +28,22 @@ class ManeuverClassifier(pl.LightningModule):
 
         rotate_mat = torch.empty(data.num_nodes, 2, 2, device=self.device)
         sin, cos = torch.sin(data.rotate_angles), torch.cos(data.rotate_angles)
-        rotate_mat[:, 0, 0] = cos
-        rotate_mat[:, 0, 1] = -sin
-        rotate_mat[:, 1, 0] = sin
-        rotate_mat[:, 1, 1] = cos
+        rotate_mat[:,0,0] = cos
+        rotate_mat[:,0,1] = -sin
+        rotate_mat[:,1,0] = sin
+        rotate_mat[:,1,1] = cos
         data.rotate_mat = rotate_mat
 
         local_embed = self.encoder(data=data)
         global_embed = self.interactor(data=data, local_embed=local_embed)
 
         print("global_embed:", global_embed.shape)
-        print("num_nodes:", data.num_nodes)
-        print("batch size:", data.num_graphs)
-        print("max index:", indices.max())
 
-        # SAFE ego selection
-        if hasattr(data, "is_ego"):
-            ego_embed = global_embed[data.is_ego.bool()]
-        else:
-            raise RuntimeError("Dataset must provide ego mask")
+        ego_mask = data.is_ego.bool()
+        ego_embed = global_embed[0][ego_mask]
 
         return self.head(ego_embed)
+
 
 
     def _remap(self, y):
