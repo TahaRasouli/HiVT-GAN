@@ -1,154 +1,70 @@
-import os
-from argparse import ArgumentParser
 import torch
-import numpy as np
-from tqdm import tqdm
 import pytorch_lightning as pl
+from argparse import ArgumentParser
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.strategies import DDPStrategy
+from collections import Counter
 
-# Import modules
-from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
-from models.hivt import HiVT  # Use HiVT class directly if standard
-from models.maneuver_classifier import ManeuverClassifier
 from datasets.nuscenes_dataset import NuScenesHiVTDataset
-
-# Optimization
-torch.set_float32_matmul_precision('medium')
+from datasets.nuscenes_datamodule import NuScenesHiVTDataModule
+from models.trajectory_generator import CVAE # Or HiVT
+from models.maneuver_classifier import ManeuverClassifier
 
 def calculate_class_weights(dataset):
-    print(f"\n[Info] Scanning {len(dataset)} samples to calculate Class Weights...")
+    print("[Info] Calculating inverse-frequency weights...")
+    counts = Counter()
+    for i in range(len(dataset)):
+        # Quick access to label without full sanitization if possible
+        data = dataset.get(i)
+        counts[int(data.maneuver_id.item())] += 1
     
-    counts = {i: 0 for i in range(7)}
-    total = 0
-    
-    for i in tqdm(range(len(dataset)), desc="Computing Weights"):
-        try:
-            data = dataset.get(i)
-            # Handle tensor vs int
-            if isinstance(data.maneuver_id, torch.Tensor):
-                mid = data.maneuver_id.item()
-            else:
-                mid = int(data.maneuver_id)
-            
-            if 0 <= mid < 7:
-                counts[mid] += 1
-                total += 1
-        except Exception as e:
-            # Skip corrupted samples if any
-            continue
-
-    print(f"[Info] Class Counts: {counts}")
-
-    # Formula: W_c = N_total / (N_classes * Count_c)
-    weights = []
-    n_classes = 7
-    for i in range(n_classes):
-        c = counts.get(i, 0)
-        if c > 0:
-            # Standard Inverse: w = total / (n_classes * c)
-            # DAMPENED Inverse: w = sqrt(total / (n_classes * c))
-            raw_weight = total / (n_classes * c)
-            dampened_weight = raw_weight ** 0.5  # Square Root Smoothing
-            weights.append(dampened_weight)
-        else:
-            weights.append(1.5) 
-    
-    # Normalize weights so they sum to n_classes (optional, but good for stability)
-    weight_tensor = torch.tensor(weights, dtype=torch.float32)
-    weight_tensor = weight_tensor / weight_tensor.mean() 
-    
-    print(f"[Info] Final Dampened Weights: {weight_tensor}\n")
-    return weight_tensor
+    total = sum(counts.values())
+    weights = torch.zeros(7)
+    for cls in range(7):
+        # Inverse frequency: total / (num_classes * count_per_class)
+        weights[cls] = total / (7 * counts[cls]) if counts[cls] > 0 else 1.0
+    return weights
 
 def main():
     pl.seed_everything(2024)
     parser = ArgumentParser()
 
     # Paths
-    parser.add_argument("--root", type=str, required=True, help="Path to processed data folder")
-    parser.add_argument("--ckpt_path", type=str, required=True, help="Path to frozen HiVT/CVAE .ckpt file")
+    parser.add_argument("--root", type=str, required=True)
+    parser.add_argument("--ckpt_path", type=str, required=True)
     
     # Hyperparameters
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--max_epochs", type=int, default=40)
     parser.add_argument("--devices", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--pin_memory", type=bool, default=False)
-    parser.add_argument("--persistent_workers", type=bool, default=False)
-
+    
     args = parser.parse_args()
 
-    # ---------------------------------------------------------
-    # 1. Calculate Weights (Handling Imbalance)
-    # ---------------------------------------------------------
-    # We load the dataset directly first to scan statistics
+    # 1. Load Data with caps
     train_dataset = NuScenesHiVTDataset(root=args.root, split='train')
-    class_weights = calculate_class_weights(train_dataset)
-    
-    # ---------------------------------------------------------
-    # 2. Setup DataModule
-    # ---------------------------------------------------------
-    datamodule = NuScenesHiVTDataModule(
-        root=args.root,
-        train_batch_size=args.batch_size,
-        val_batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
-        persistent_workers=args.persistent_workers,
-    )
+    print(f"Dataset initialized with {len(train_dataset)} capped samples.")
 
-    # ---------------------------------------------------------
-    # 3. Load Backbone & Initialize Classifier
-    # ---------------------------------------------------------
-    print(f"[Info] Loading Frozen Backbone from: {args.ckpt_path}")
-    
-    # Load HiVT (Use strict=False to be safe)
-    backbone = HiVT.load_from_checkpoint(args.ckpt_path, strict=False)
-    
-    # Initialize our wrapping model
+    # 2. Re-calculate weights for 6 classes
+    # (Use the calculate_class_weights logic but ensure it skips ID 3)
+    class_weights = calculate_6class_weights(train_dataset)
+
+    # 3. Initialize Model
+    backbone = CVAE.load_from_checkpoint(args.ckpt_path)
     model = ManeuverClassifier(
         frozen_backbone=backbone,
-        num_classes=7,
-        learning_rate=args.lr,
+        num_classes=6,
+        lr=args.lr,
         class_weights=class_weights
     )
 
-    # ---------------------------------------------------------
-    # 4. Trainer
-    # ---------------------------------------------------------
-    
-    # MONITOR F1 SCORE (Better for Imbalance)
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_f1_macro",    # <--- CHANGED FROM val_loss
-        mode="max",                # Maximize F1
-        filename="caption-model-{epoch:02d}-{val_f1_macro:.2f}",
-        save_top_k=2
-    )
-    
-    early_stop = EarlyStopping(
-        monitor="val_f1_macro",    # <--- CHANGED FROM val_loss
-        patience=8, 
-        mode="max"
-    )
-
-    use_gpu = torch.cuda.is_available() and args.devices > 0
-    strategy = DDPStrategy(find_unused_parameters=True) if use_gpu else "auto"
-    
+    # 4. Run Trainer
     trainer = pl.Trainer(
+        max_epochs=args.max_epochs,
         accelerator="gpu",
         devices=args.devices,
-        strategy=strategy,
-        precision="16-mixed",  
-        max_epochs=args.max_epochs,
-        callbacks=[checkpoint_callback, early_stop],
-        log_every_n_steps=50,
-        check_val_every_n_epoch=1
+        callbacks=[checkpoint_callback, early_stop]
     )
-
-    print("[Info] Starting Linear Probe Training...")
     trainer.fit(model, datamodule)
 
 if __name__ == "__main__":
