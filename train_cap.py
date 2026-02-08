@@ -98,8 +98,9 @@ def main():
         devices=args.devices,
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback, early_stop],
-        gradient_clip_val=0.5, # <--- Add this to stop exploding gradients
-        precision="32"         # <--- Use full precision for stability
+        gradient_clip_val=0.5, 
+        precision="32",
+        gradient_clip_val=0.5,        
     )
 
     trainer.fit(model, datamodule)
