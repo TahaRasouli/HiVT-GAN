@@ -100,7 +100,6 @@ def main():
         callbacks=[checkpoint_callback, early_stop],
         gradient_clip_val=0.5, 
         precision="32",
-        gradient_clip_val=0.5,        
     )
 
     trainer.fit(model, datamodule)
