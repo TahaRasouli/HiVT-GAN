@@ -44,33 +44,46 @@ class ManeuverClassifier(pl.LightningModule):
         return self.head(global_embed[indices])
 
     def _remap(self, y):
-            """
-            Efficiently remaps non-contiguous labels to [0, 5].
-            0:Straight, 1:Left, 2:Right, 4:LCL, 5:LCR, 6:Stat
-            """
-            # Create a copy to avoid in-place modification of the original data
-            new_y = torch.zeros_like(y)
-            
-            # Vectorized remapping (No .item() or list comps - safe for CUDA)
-            new_y = torch.where(y == 1, torch.tensor(1, device=y.device), new_y) # Left
-            new_y = torch.where(y == 2, torch.tensor(2, device=y.device), new_y) # Right
-            new_y = torch.where(y == 4, torch.tensor(3, device=y.device), new_y) # LCL -> 3
-            new_y = torch.where(y == 5, torch.tensor(4, device=y.device), new_y) # LCR -> 4
-            new_y = torch.where(y == 6, torch.tensor(5, device=y.device), new_y) # Stat -> 5
-            # y=0 stays new_y=0 (Straight)
-            
-            return new_y
+        mapping = torch.full_like(y, -1)
+
+        mapping[y == 0] = 0
+        mapping[y == 1] = 1
+        mapping[y == 2] = 2
+        mapping[y == 4] = 3
+        mapping[y == 5] = 4
+        mapping[y == 6] = 5
+
+        if (mapping < 0).any():
+            bad = torch.unique(y[mapping < 0])
+            raise RuntimeError(f"Invalid maneuver labels found: {bad}")
+
+        return mapping
+
 
     def training_step(self, data, batch_idx):
         logits = self(data)
-        y = self._remap(data.maneuver_id.view(-1))
+        indices = torch.cat([
+            torch.tensor([0], device=self.device),
+            torch.where(data.batch[1:] != data.batch[:-1])[0] + 1
+        ])
+
+        y = self._remap(data.maneuver_id[indices])
+
         loss = F.cross_entropy(logits, y, weight=self.loss_weights)
         self.log("train_loss", loss, prog_bar=True, batch_size=data.num_graphs)
         return loss
 
     def validation_step(self, data, batch_idx):
         logits = self(data)
-        y = self._remap(data.maneuver_id.view(-1))
+        indices = torch.cat([
+            torch.tensor([0], device=self.device),
+            torch.where(data.batch[1:] != data.batch[:-1])[0] + 1
+        ])
+
+        y = self._remap(data.maneuver_id[indices])
+        print("logits shape:", logits.shape)
+        print("y shape:", y.shape)
+        print("y unique:", torch.unique(y))
         self.val_f1.update(logits, y)
         return F.cross_entropy(logits, y, weight=self.loss_weights)
 
