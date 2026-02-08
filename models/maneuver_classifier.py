@@ -21,7 +21,8 @@ class ManeuverClassifier(pl.LightningModule):
         )
 
         self.register_buffer("loss_weights", class_weights)
-        self.val_f1 = MulticlassF1Score(num_classes=num_classes, average='macro')
+        self.val_f1_macro = MulticlassF1Score(num_classes=num_classes, average='macro')
+        self.val_f1_per_class = MulticlassF1Score(num_classes=num_classes, average=None)  # per-class F1
         self.class_names = ["Straight", "Left", "Right", "LCL", "LCR", "Stat"]
 
     def forward(self, data):
@@ -87,23 +88,25 @@ class ManeuverClassifier(pl.LightningModule):
 
         y = self._remap(data.maneuver_id)
 
-        print("maneuver_id shape:", data.maneuver_id.shape)
-        print("num_nodes:", data.num_nodes)
-        print("num_graphs:", data.num_graphs)
-
-        self.val_f1.update(logits, y)
-        print(data)
-        print(data.keys)
-        assert logits.shape[0] == data.num_graphs
-        assert y.shape[0] == data.num_graphs
+        # Update metrics
+        self.val_f1_macro.update(logits, y)
+        self.val_f1_per_class.update(logits, y)
         return F.cross_entropy(logits, y, weight=self.loss_weights)
 
     def on_validation_epoch_end(self):
-        f1 = self.val_f1.compute()
-        if self.trainer.is_global_zero:
-            print(f"\nEpoch {self.current_epoch} | Macro F1: {f1:.4f}")
-        self.log("val_f1_macro", f1, prog_bar=True)
-        self.val_f1.reset()
+        # Macro F1
+        macro_f1 = self.val_f1_macro.compute()
+        self.log("val_f1_macro", macro_f1, prog_bar=True)
+
+        # Per-class F1
+        per_class_f1 = self.val_f1_per_class.compute()  # returns tensor of shape [num_classes]
+        for i, cls_name in enumerate(self.class_names):
+            print(f"Class '{cls_name}' F1: {per_class_f1[i]:.4f}")
+            self.log(f"val_f1_{cls_name}", per_class_f1[i], prog_bar=False)
+
+        # Reset metrics
+        self.val_f1_macro.reset()
+        self.val_f1_per_class.reset()
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
