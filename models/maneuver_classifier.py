@@ -70,18 +70,12 @@ class ManeuverClassifier(pl.LightningModule):
 
     def training_step(self, data, batch_idx):
         logits = self(data)
-        batch = data.batch
-        ego_indices = torch.cat([
-            torch.tensor([0], device=batch.device),
-            torch.where(batch[1:] != batch[:-1])[0] + 1
-        ])
-
-        y = self._remap(data.maneuver_id[ego_indices])
-
+        y = self._remap(data.maneuver_id)
 
         loss = F.cross_entropy(logits, y, weight=self.loss_weights)
         self.log("train_loss", loss, prog_bar=True, batch_size=data.num_graphs)
         return loss
+
 
     def validation_step(self, data, batch_idx):
         logits = self(data)
@@ -91,11 +85,12 @@ class ManeuverClassifier(pl.LightningModule):
             torch.where(batch[1:] != batch[:-1])[0] + 1
         ])
 
-        y = self._remap(data.maneuver_id[ego_indices])
+        y = self._remap(data.maneuver_id)
 
-        print("logits shape:", logits.shape)
-        print("y shape:", y.shape)
-        print("y unique:", torch.unique(y))
+        print("maneuver_id shape:", data.maneuver_id.shape)
+        print("num_nodes:", data.num_nodes)
+        print("num_graphs:", data.num_graphs)
+
         self.val_f1.update(logits, y)
         print(data)
         print(data.keys)
