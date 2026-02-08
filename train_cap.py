@@ -8,7 +8,7 @@ from collections import Counter
 
 from datasets.nuscenes_dataset import NuScenesHiVTDataset
 from datamodules.nuscenes_datamodule import NuScenesHiVTDataModule
-from models.trajectory_generator import CVAE 
+from models.cvae import CVAE
 from models.maneuver_classifier import ManeuverClassifier
 
 def calculate_6class_weights(dataset):
