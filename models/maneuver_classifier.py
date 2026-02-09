@@ -7,9 +7,9 @@ from sklearn.metrics import f1_score
 class ManeuverClassifier(pl.LightningModule):
     def __init__(self, encoder, embed_dim=128, num_classes=6, lr=5e-4, loss_weights=None):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['encoder'])  # <<--- IGNORE encoder
 
-        self.encoder = encoder  # CVAE backbone
+        self.encoder = encoder
         self.lr = lr
         self.num_classes = num_classes
 
