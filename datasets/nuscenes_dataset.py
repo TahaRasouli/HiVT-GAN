@@ -8,10 +8,20 @@ from tqdm import tqdm
 
 class NuScenesHiVTDataset(Dataset):
 
-    # -----------------------------
-    # DEFINE TRAIN CLASSES HERE
-    # -----------------------------
     TRAIN_CLASSES = [0, 1, 2, 4, 5, 6]
+
+    STR_TO_INT = {
+        "follow": 0,
+        "turn_left": 1,
+        "turn_right": 2,
+        "u_turn": 3,
+        "lane_change_left": 4,
+        "lane_change_right": 5,
+        "stationary": 6,
+        "off_map": -1,
+    }
+
+    LABEL_MAP = {old: new for new, old in enumerate(TRAIN_CLASSES)}
 
     def __init__(
         self,
@@ -21,122 +31,82 @@ class NuScenesHiVTDataset(Dataset):
         max_samples: Optional[int] = None,
         val_ratio: float = 0.1,
     ):
-        self.split = split
         self.root = root
+        self.split = split
         self.transform = transform
         self.val_ratio = val_ratio
 
-        self.label_map = {old: new for new, old in enumerate(self.TRAIN_CLASSES)}
+        all_files = sorted(f for f in os.listdir(root) if f.endswith(".pt"))
 
-        self._directory = f"{split}_processed"
+        # ---------- REAL TRAIN / VAL SPLIT ----------
+        split_index = int(len(all_files) * (1 - val_ratio))
 
-        standard_path = os.path.join(self.root, self._directory)
-
-        if os.path.isdir(standard_path):
-            self._processed_dir = standard_path
-            self.is_flat = False
+        if split == "train":
+            all_files = all_files[:split_index]
         else:
-            self._processed_dir = self.root
-            self.is_flat = True
+            all_files = all_files[split_index:]
 
-        all_files = sorted(
-            f for f in os.listdir(self._processed_dir) if f.endswith(".pt")
-        )
-
-        self._processed_file_names = self._filter_files(all_files)
-
-        if max_samples is not None:
-            self._processed_file_names = self._processed_file_names[:max_samples]
-
-        super().__init__(root, transform=transform)
-
-    # -----------------------------
-    # FILTERING (RUNS ONLY ONCE)
-    # -----------------------------
-    def _filter_files(self, all_files):
-
-        print(f"[Dataset] Filtering {self.split} data...")
+        # ---------- FILTER ----------
+        print(f"[Dataset] Filtering {split} data...")
 
         limits = {0: 500, 6: 300}
         counters = {0: 0, 6: 0}
-
         filtered = []
 
         for f in tqdm(all_files, desc="Filtering Samples"):
-
-            data = torch.load(os.path.join(self._processed_dir, f))
+            data = torch.load(os.path.join(root, f))
 
             m_id = self._get_maneuver_id(data)
 
-            # ALWAYS remove invalid classes
+            # remove invalid labels everywhere
             if m_id not in self.TRAIN_CLASSES:
                 continue
 
-            # ONLY cap training split
-            if self.split == "train" and m_id in limits:
+            # cap ONLY train
+            if split == "train" and m_id in limits:
                 if counters[m_id] >= limits[m_id]:
                     continue
                 counters[m_id] += 1
 
             filtered.append(f)
 
-        print(f"[Dataset] Filter complete. Final {self.split} set: {len(filtered)}")
-        return filtered
+        print(f"[Dataset] Filter complete. Final {split} set: {len(filtered)}")
 
+        self.files = filtered
 
-    # -----------------------------
-    # LABEL EXTRACTION
-    # -----------------------------
+        if max_samples is not None:
+            self.files = self.files[:max_samples]
+
+        super().__init__(root, transform=transform)
+
+    # ------------------------------------------------
+
     def _get_maneuver_id(self, data):
-
-        mapping = {
-            "follow": 0,
-            "turn_left": 1,
-            "turn_right": 2,
-            "u_turn": 3,
-            "lane_change_left": 4,
-            "lane_change_right": 5,
-            "stationary": 6,
-            "off_map": -1
-        }
-
         label = getattr(data, "maneuver_type", "follow")
-        return mapping.get(label, 0)
+        return self.STR_TO_INT.get(label, -1)
 
-    # -----------------------------
-    # SANITIZE + REMAP LABEL
-    # -----------------------------
     def _sanitize(self, data: TemporalData):
 
-        m_id = self._get_maneuver_id(data)
+        old_id = self._get_maneuver_id(data)
 
-        if m_id not in self.label_map:
-            raise RuntimeError(f"Invalid maneuver id {m_id}")
+        # safe remap
+        new_id = self.LABEL_MAP[old_id]
 
-        data.maneuver_id = torch.tensor(
-            [self.label_map[m_id]], dtype=torch.long
-        )
-
+        data.maneuver_id = torch.tensor([new_id], dtype=torch.long)
         data.ego_index = torch.tensor([0], dtype=torch.long)
 
         return data
 
-    # -----------------------------
-    # REQUIRED METHODS
-    # -----------------------------
+    # ------------------------------------------------
+
     def len(self):
-        return len(self._processed_file_names)
+        return len(self.files)
 
     def get(self, idx):
-
-        path = os.path.join(
-            self._processed_dir,
-            self._processed_file_names[idx]
-        )
-
+        path = os.path.join(self.root, self.files[idx])
         data = torch.load(path)
         return self._sanitize(data)
 
     @staticmethod
-    def collate_fn(batch: List[TemporalData]):
+    def collate_fn(batch):
         return Batch.from_data_list(batch)
