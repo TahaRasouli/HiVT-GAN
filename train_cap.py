@@ -81,8 +81,9 @@ def main():
         persistent_workers=args.persistent_workers
     )
 
-    datamodule.setup("fit")  # ensures datasets are created
-    train_dataset = datamodule.train_dataset
+    datamodule.setup("fit")  # now train_dataset and val_dataset exist
+
+    train_dataset = datamodule.train_dataset  # use for class weights calculation
     class_weights = calculate_6class_weights(train_dataset)
 
     # -------------------------
