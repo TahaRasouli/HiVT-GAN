@@ -83,54 +83,58 @@ class ManeuverClassifier(pl.LightningModule):
     def forward(self, batch):
 
         # --------------------------------------------------
-        # 1. Scene embedding
+        # 1. Scene encoding
         # --------------------------------------------------
-        scene_embed = self.encoder(batch)
+        node_features = self.encoder(batch)   # [1, N_total, D]
 
-        if scene_embed.dim() == 3:
-            scene_embed = scene_embed.squeeze(1)
+        node_features = node_features.squeeze(0)  # [N_total, D]
 
-        B = scene_embed.size(0)
+        batch_index = batch.batch
 
         # --------------------------------------------------
-        # 2. Generate trajectory candidates
+        # 2. Select ego nodes
         # --------------------------------------------------
-        context_expanded = scene_embed.repeat_interleave(self.K, dim=0)
+        ego_indices = torch.cat([
+            torch.tensor([0], device=batch_index.device),
+            torch.where(batch_index[1:] != batch_index[:-1])[0] + 1
+        ])
+
+        ego_embed = node_features[ego_indices]   # [B, D]
+
+        B = ego_embed.size(0)
+
+        # --------------------------------------------------
+        # 3. Generate trajectory candidates
+        # --------------------------------------------------
+        context_expanded = ego_embed.repeat_interleave(self.K, dim=0)
 
         traj_flat, _ = self.encoder.decoder(context_expanded, y_gt=None)
 
         # TRUE SHAPE:
-        # traj_flat = [B*K, T, 2]
+        # [B*K, T, 2]
 
-        traj = traj_flat.view(
-            B,
-            self.K,
-            self.future_steps,
-            2
-        )   # [B,K,T,2]
+        traj = traj_flat.view(B, self.K, self.future_steps, 2)
 
         # --------------------------------------------------
-        # 3. Encode trajectory
+        # 4. Encode trajectory
         # --------------------------------------------------
-        traj_feat = traj.reshape(B, self.K, -1)   # [B,K,T*2]
+        traj_feat = traj.reshape(B, self.K, -1)
 
-        traj_embed = self.traj_encoder(traj_feat)   # [B,K,D]
-
-        # --------------------------------------------------
-        # 4. Fuse scene + trajectory
-        # --------------------------------------------------
-        scene_expand = scene_embed.unsqueeze(1).repeat(1, self.K, 1)
-
-        fusion = torch.cat([scene_expand, traj_embed], dim=-1)   # [B,K,2D]
+        traj_embed = self.traj_encoder(traj_feat)
 
         # --------------------------------------------------
-        # 5. Classification
+        # 5. Fuse
         # --------------------------------------------------
-        logits_per_candidate = self.classifier(fusion)   # [B,K,C]
+        scene_expand = ego_embed.unsqueeze(1).repeat(1, self.K, 1)
 
-        logits = logits_per_candidate.mean(dim=1)   # [B,C]
+        fusion = torch.cat([scene_expand, traj_embed], dim=-1)
+
+        logits_per_candidate = self.classifier(fusion)
+
+        logits = logits_per_candidate.mean(dim=1)
 
         return logits
+
 
 
 
