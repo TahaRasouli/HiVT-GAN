@@ -41,8 +41,12 @@ class ManeuverClassifier(pl.LightningModule):
 
     def forward(self, batch):
         node_features = self.encoder(batch)
+        print("node_features shape:", node_features.shape)
+        print("batch.batch shape:", getattr(batch, 'batch', None))
         graph_features = global_mean_pool(node_features, batch.batch)
+        print("graph_features shape:", graph_features.shape)
         logits = self.classifier(graph_features)
+        print("logits shape:", logits.shape)
         return logits
 
     def training_step(self, batch, batch_idx):
