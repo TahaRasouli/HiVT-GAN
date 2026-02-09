@@ -40,13 +40,13 @@ class ManeuverClassifier(pl.LightningModule):
         self.lr = lr
 
     def forward(self, batch):
-        node_features = self.encoder(batch)
-        print("node_features shape:", node_features.shape)
-        print("batch.batch shape:", getattr(batch, 'batch', None))
-        graph_features = global_mean_pool(node_features, batch.batch)
-        print("graph_features shape:", graph_features.shape)
-        logits = self.classifier(graph_features)
-        print("logits shape:", logits.shape)
+        # node_features should be [total_nodes_in_batch, feature_dim]
+        node_features = self.encoder(batch)  # remove any extra batch dim inside encoder
+        # ensure node_features is 2D
+        if node_features.dim() == 3:
+            node_features = node_features.view(-1, node_features.size(-1))  # flatten first two dims
+        graph_features = global_mean_pool(node_features, batch.batch)  # now shape [batch_size, embed_dim]
+        logits = self.classifier(graph_features)  # [batch_size, num_classes]
         return logits
 
     def training_step(self, batch, batch_idx):
