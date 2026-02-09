@@ -55,43 +55,34 @@ class NuScenesHiVTDataset(Dataset):
     # -----------------------------
     def _filter_files(self, all_files):
 
-        if self.split == "train":
+        print(f"[Dataset] Filtering {self.split} data...")
 
-            print("[Dataset] Filtering training data...")
+        limits = {0: 500, 6: 300}
+        counters = {0: 0, 6: 0}
 
-            limits = {0: 500, 6: 300}
-            counters = {0: 0, 6: 0}
+        filtered = []
 
-            filtered = []
+        for f in tqdm(all_files, desc="Filtering Samples"):
 
-            for f in tqdm(all_files, desc="Filtering Samples"):
+            data = torch.load(os.path.join(self._processed_dir, f))
 
-                data = torch.load(os.path.join(self._processed_dir, f))
+            m_id = self._get_maneuver_id(data)
 
-                m_id = self._get_maneuver_id(data)
+            # ALWAYS remove invalid classes
+            if m_id not in self.TRAIN_CLASSES:
+                continue
 
-                if m_id not in self.TRAIN_CLASSES:
+            # ONLY cap training split
+            if self.split == "train" and m_id in limits:
+                if counters[m_id] >= limits[m_id]:
                     continue
+                counters[m_id] += 1
 
-                if m_id in limits:
-                    if counters[m_id] >= limits[m_id]:
-                        continue
-                    counters[m_id] += 1
+            filtered.append(f)
 
-                filtered.append(f)
+        print(f"[Dataset] Filter complete. Final {self.split} set: {len(filtered)}")
+        return filtered
 
-            print(f"[Dataset] Filter complete. Final training set: {len(filtered)}")
-            return filtered
-
-        else:
-
-            if self.is_flat:
-                num_total = len(all_files)
-                num_val = int(num_total * self.val_ratio)
-                num_train = num_total - num_val
-                return all_files[num_train:]
-            else:
-                return all_files
 
     # -----------------------------
     # LABEL EXTRACTION
