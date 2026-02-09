@@ -1,83 +1,131 @@
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
 
-from torchmetrics.functional.classification import multiclass_f1_score
+from torchmetrics.classification import MulticlassF1Score
 
 
 class ManeuverClassifier(pl.LightningModule):
 
-    def __init__(self, frozen_backbone, num_classes=6, lr=1e-3, class_weights=None):
+    def __init__(
+        self,
+        frozen_backbone,
+        num_classes=6,
+        lr=5e-4,
+        class_weights=None,
+        num_traj_candidates=6,
+        future_steps=30,
+    ):
         super().__init__()
 
-        # DO NOT save backbone modules inside hyperparams
-        self.save_hyperparameters(ignore=["frozen_backbone"])
+        # ------------------------------------------------
+        # Backbone (CVAE encoder + decoder)
+        # ------------------------------------------------
+        self.encoder = frozen_backbone
 
+        # Freeze backbone
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+
+        self.encoder.eval()
+
+        # ------------------------------------------------
+        # Settings
+        # ------------------------------------------------
+        self.num_classes = num_classes
         self.lr = lr
+        self.K = num_traj_candidates
+        self.future_steps = future_steps
 
-        # ----- Backbone -----
-        self.encoder = frozen_backbone  # CVAE model
+        embed_dim = self.encoder.hparams.embed_dim
 
-        # ----- Classification head -----
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 64),
+        # ------------------------------------------------
+        # Trajectory encoder
+        # ------------------------------------------------
+        self.traj_encoder = nn.Sequential(
+            nn.Linear(future_steps * 2, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_classes),
+            nn.Linear(128, embed_dim)
         )
 
-        # ----- Loss -----
-        if class_weights is not None:
-            self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
-        else:
-            self.loss_fn = nn.CrossEntropyLoss()
+        # ------------------------------------------------
+        # Classification head
+        # ------------------------------------------------
+        self.classifier = nn.Sequential(
+            nn.Linear(embed_dim * 2, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
 
-        # ----- Metrics storage -----
-        self.val_preds = []
-        self.val_targets = []
+        # ------------------------------------------------
+        # Loss
+        # ------------------------------------------------
+        self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
-        self.class_names = [
-            "Straight",
-            "Left",
-            "Right",
-            "LCL",
-            "LCR",
-            "Stat",
-        ]
+        # ------------------------------------------------
+        # Metrics
+        # ------------------------------------------------
+        self.val_f1_macro = MulticlassF1Score(
+            num_classes=num_classes,
+            average="macro"
+        )
 
-    # ---------------------------------------------------------
+        self.val_f1_per_class = MulticlassF1Score(
+            num_classes=num_classes,
+            average=None
+        )
+
+    # ------------------------------------------------
     # Forward
-    # ---------------------------------------------------------
+    # ------------------------------------------------
 
     def forward(self, batch):
 
-        # backbone returns [1, num_nodes, embed_dim]
-        node_features = self.encoder(batch)
+        # ---------------------------------------------
+        # Scene embedding (map + actors encoded)
+        # ---------------------------------------------
+        scene_embed = self.encoder(batch)   # expected [B,1,D]
+        scene_embed = scene_embed.squeeze(1)  # [B,D]
 
-        # remove mode dimension
-        node_features = node_features.squeeze(0)   # [num_nodes, 128]
+        B = scene_embed.size(0)
 
-        # aggregate node features → graph features
-        graph_features = torch.zeros(
-            batch.num_graphs,
-            node_features.size(-1),
-            device=node_features.device,
-        )
+        # ---------------------------------------------
+        # Generate trajectory candidates using CVAE decoder
+        # ---------------------------------------------
+        context_expanded = scene_embed.repeat_interleave(self.K, dim=0)
 
-        graph_features = graph_features.index_add(
-            0,
-            batch.batch,
-            node_features,
-        )
+        traj_flat, _ = self.encoder.decoder(context_expanded, y_gt=None)
 
-        logits = self.classifier(graph_features)
+        traj = traj_flat.reshape(B, self.K, self.future_steps, 2)
+
+        # ---------------------------------------------
+        # Encode trajectory
+        # ---------------------------------------------
+        traj_feat = traj.reshape(B, self.K, -1)   # [B,K,T*2]
+
+        traj_embed = self.traj_encoder(traj_feat)  # [B,K,D]
+
+        # ---------------------------------------------
+        # Fuse scene + trajectory
+        # ---------------------------------------------
+        scene_expand = scene_embed.unsqueeze(1).repeat(1, self.K, 1)
+
+        fusion = torch.cat([scene_expand, traj_embed], dim=-1)  # [B,K,2D]
+
+        # ---------------------------------------------
+        # Classification
+        # ---------------------------------------------
+        logits_per_candidate = self.classifier(fusion)  # [B,K,C]
+
+        # Average over candidates
+        logits = logits_per_candidate.mean(dim=1)  # [B,C]
 
         return logits
 
-    # ---------------------------------------------------------
+    # ------------------------------------------------
     # Training
-    # ---------------------------------------------------------
+    # ------------------------------------------------
 
     def training_step(self, batch, batch_idx):
 
@@ -87,18 +135,13 @@ class ManeuverClassifier(pl.LightningModule):
 
         loss = self.loss_fn(logits, targets)
 
-        self.log(
-            "train_loss",
-            loss,
-            prog_bar=True,
-            batch_size=batch.num_graphs,
-        )
+        self.log("train_loss", loss, prog_bar=True)
 
         return loss
 
-    # ---------------------------------------------------------
+    # ------------------------------------------------
     # Validation
-    # ---------------------------------------------------------
+    # ------------------------------------------------
 
     def validation_step(self, batch, batch_idx):
 
@@ -106,52 +149,33 @@ class ManeuverClassifier(pl.LightningModule):
 
         targets = batch.maneuver_id.view(-1)
 
-        preds = torch.argmax(logits, dim=-1)
+        preds = torch.argmax(logits, dim=1)
 
-        # store for epoch metrics
-        self.val_preds.append(preds.detach().cpu())
-        self.val_targets.append(targets.detach().cpu())
+        self.val_f1_macro.update(preds, targets)
+        self.val_f1_per_class.update(preds, targets)
 
-    # ---------------------------------------------------------
-    # Per-class F1 after epoch
-    # ---------------------------------------------------------
+    # ------------------------------------------------
+    # Epoch end
+    # ------------------------------------------------
 
-    @torch.no_grad()
     def on_validation_epoch_end(self):
 
-        if len(self.val_preds) == 0:
-            return
+        f1_macro = self.val_f1_macro.compute()
+        f1_per_class = self.val_f1_per_class.compute()
 
-        preds = torch.cat(self.val_preds, dim=0)
-        targets = torch.cat(self.val_targets, dim=0)
+        self.log("val_f1_macro", f1_macro, prog_bar=True)
 
-        per_class_f1 = multiclass_f1_score(
-            preds,
-            targets,
-            num_classes=6,
-            average=None,
-        )
+        if self.global_rank == 0:
+            print("\n==== Per-class F1 ====")
+            for i, f in enumerate(f1_per_class):
+                print(f"Class {i}: {f.item():.4f}")
 
-        macro_f1 = per_class_f1.mean()
+        self.val_f1_macro.reset()
+        self.val_f1_per_class.reset()
 
-        print("\n========== Validation F1 ==========")
-
-        for i, f1 in enumerate(per_class_f1):
-            print(f"{self.class_names[i]:<10} F1: {f1.item():.4f}")
-
-        print(f"Macro F1: {macro_f1.item():.4f}")
-        print("===================================")
-
-        self.log("val_f1_macro", macro_f1, prog_bar=True)
-
-        # reset storage
-        self.val_preds.clear()
-        self.val_targets.clear()
-
-    # ---------------------------------------------------------
+    # ------------------------------------------------
     # Optimizer
-    # ---------------------------------------------------------
+    # ------------------------------------------------
 
     def configure_optimizers(self):
-
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
