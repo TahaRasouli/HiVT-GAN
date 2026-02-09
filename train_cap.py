@@ -78,12 +78,12 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
-        persistent_workers=args.persistent_workers,
-        train_transform=None,
-        val_transform=None,
-        max_train_samples=None,
-        max_val_samples=None
+        persistent_workers=args.persistent_workers
     )
+
+    datamodule.setup("fit")  # ensures datasets are created
+    train_dataset = datamodule.train_dataset
+    class_weights = calculate_6class_weights(train_dataset)
 
     # -------------------------
     # Backbone load (UNCHANGED)
