@@ -97,7 +97,16 @@ class ManeuverClassifier(pl.LightningModule):
 
         traj_flat, _ = self.encoder.decoder(context_expanded, y_gt=None)
 
-        traj = traj_flat.reshape(B, self.K, self.future_steps, 2)
+        # decoder output likely [B*K, N, T, 2]
+
+        traj_all = traj_flat
+
+        # reshape first
+        traj_all = traj_all.reshape(B, self.K, traj_all.shape[1], self.future_steps, 2)
+
+        # select ego agent (index 0)
+        traj = traj_all[:, :, 0]   # [B,K,T,2]
+
 
         # ---------------------------------------------
         # Encode trajectory
