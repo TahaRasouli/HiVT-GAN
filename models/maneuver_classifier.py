@@ -82,55 +82,68 @@ class ManeuverClassifier(pl.LightningModule):
 
     def forward(self, batch):
 
-        # ---------------------------------------------
-        # Scene embedding (map + actors encoded)
-        # ---------------------------------------------
-        scene_embed = self.encoder(batch)   # expected [B,1,D]
-        scene_embed = scene_embed.squeeze(1)  # [B,D]
+        # --------------------------------------------------
+        # 1. Scene embedding (map + actors encoded)
+        # --------------------------------------------------
+        scene_embed = self.encoder(batch)     # [B,1,D] or [B,D]
+        
+        if scene_embed.dim() == 3:
+            scene_embed = scene_embed.squeeze(1)
 
         B = scene_embed.size(0)
 
-        # ---------------------------------------------
-        # Generate trajectory candidates using CVAE decoder
-        # ---------------------------------------------
+        # --------------------------------------------------
+        # 2. Generate trajectory candidates (CVAE decoder)
+        # --------------------------------------------------
         context_expanded = scene_embed.repeat_interleave(self.K, dim=0)
 
         traj_flat, _ = self.encoder.decoder(context_expanded, y_gt=None)
 
-        # decoder output likely [B*K, N, T, 2]
+        # EXPECTED SHAPE:
+        # traj_flat = [B*K, N*T*2]   (flattened)
 
-        traj_all = traj_flat
+        BK = traj_flat.shape[0]
+        total_dim = traj_flat.shape[1]
 
-        # reshape first
-        traj_all = traj_all.reshape(B, self.K, traj_all.shape[1], self.future_steps, 2)
+        # compute number of agents automatically
+        N = total_dim // (self.future_steps * 2)
 
-        # select ego agent (index 0)
-        traj = traj_all[:, :, 0]   # [B,K,T,2]
+        # reshape safely
+        traj_all = traj_flat.view(
+            B,
+            self.K,
+            N,
+            self.future_steps,
+            2
+        )
 
+        # select ego trajectory (ego index = 0)
+        traj = traj_all[:, :, 0]    # [B,K,T,2]
 
-        # ---------------------------------------------
-        # Encode trajectory
-        # ---------------------------------------------
+        # --------------------------------------------------
+        # 3. Encode trajectory
+        # --------------------------------------------------
         traj_feat = traj.reshape(B, self.K, -1)   # [B,K,T*2]
 
-        traj_embed = self.traj_encoder(traj_feat)  # [B,K,D]
+        traj_embed = self.traj_encoder(traj_feat)   # [B,K,D]
 
-        # ---------------------------------------------
-        # Fuse scene + trajectory
-        # ---------------------------------------------
+        # --------------------------------------------------
+        # 4. Fuse scene + trajectory
+        # --------------------------------------------------
         scene_expand = scene_embed.unsqueeze(1).repeat(1, self.K, 1)
 
-        fusion = torch.cat([scene_expand, traj_embed], dim=-1)  # [B,K,2D]
+        fusion = torch.cat([scene_expand, traj_embed], dim=-1)   # [B,K,2D]
 
-        # ---------------------------------------------
-        # Classification
-        # ---------------------------------------------
-        logits_per_candidate = self.classifier(fusion)  # [B,K,C]
+        # --------------------------------------------------
+        # 5. Classification
+        # --------------------------------------------------
+        logits_per_candidate = self.classifier(fusion)   # [B,K,C]
 
-        # Average over candidates
-        logits = logits_per_candidate.mean(dim=1)  # [B,C]
+        # average across candidates
+        logits = logits_per_candidate.mean(dim=1)   # [B,C]
 
         return logits
+
 
     # ------------------------------------------------
     # Training
