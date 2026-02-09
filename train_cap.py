@@ -13,9 +13,9 @@ from models.maneuver_classifier import ManeuverClassifier
 
 torch.set_float32_matmul_precision('high')
 
-# -------------------------------------------------
-# class weights (UNCHANGED)
-# -------------------------------------------------
+# --------------------------------------------------
+# Utility: Calculate 6-class weights
+# --------------------------------------------------
 def calculate_6class_weights(dataset):
     print("[Info] Calculating weights for 6-class setup...")
     counts = Counter()
@@ -28,7 +28,6 @@ def calculate_6class_weights(dataset):
 
     total = sum(counts.values())
     weights = torch.zeros(6)
-
     for idx in range(6):
         raw_weight = total / (6 * counts[idx]) if counts[idx] > 0 else 1.0
         weights[idx] = min(raw_weight, 20.0)
@@ -36,14 +35,11 @@ def calculate_6class_weights(dataset):
     print(f"[Info] Remapped & Capped Weights: {weights}")
     return weights
 
-
-# -------------------------------------------------
-# main
-# -------------------------------------------------
+# --------------------------------------------------
+# Main Training Script
+# --------------------------------------------------
 def main():
-
     pl.seed_everything(2024)
-
     parser = ArgumentParser()
 
     parser.add_argument("--root", type=str, required=True)
@@ -58,19 +54,9 @@ def main():
 
     args = parser.parse_args()
 
-    # -------------------------
-    # Dataset (UNCHANGED)
-    # -------------------------
-    train_dataset = NuScenesHiVTDataset(
-        root=args.root,
-        split='train'
-    )
-
-    class_weights = calculate_6class_weights(train_dataset)
-
-    # -------------------------
-    # DataModule (UNCHANGED)
-    # -------------------------
+    # -----------------------------
+    # 1. DataModule (filtered once)
+    # -----------------------------
     datamodule = NuScenesHiVTDataModule(
         root=args.root,
         train_batch_size=args.batch_size,
@@ -78,53 +64,48 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
-        persistent_workers=args.persistent_workers
+        persistent_workers=args.persistent_workers,
+        train_transform=None,
+        val_transform=None
     )
+    datamodule.setup("fit")
 
-    datamodule.setup("fit")  # now train_dataset and val_dataset exist
+    # -----------------------------
+    # 2. Compute class weights
+    # -----------------------------
+    class_weights = calculate_6class_weights(datamodule.train_dataset)
 
-    train_dataset = datamodule.train_dataset  # use for class weights calculation
-    class_weights = calculate_6class_weights(train_dataset)
-
-    # -------------------------
-    # Backbone load (UNCHANGED)
-    # -------------------------
+    # -----------------------------
+    # 3. Load Backbone + Classifier
+    # -----------------------------
     print(f"[Info] Loading Backbone: {args.ckpt_path}")
-    backbone = CVAE.load_from_checkpoint(
-        args.ckpt_path,
-        strict=False
-    )
-
-    # -------------------------
-    # Model (MINIMAL CHANGE HERE)
-    # -------------------------
+    backbone = CVAE.load_from_checkpoint(args.ckpt_path, strict=False)
     model = ManeuverClassifier(
-        encoder=backbone,              # ← name change
-        embed_dim=128,                 # ← match your backbone output dim if different
+        frozen_backbone=backbone,
         num_classes=6,
         lr=args.lr,
-        loss_weights=class_weights     # ← name change
+        class_weights=class_weights
     )
 
-    # -------------------------
-    # Callbacks (UNCHANGED)
-    # -------------------------
+    # -----------------------------
+    # 4. Callbacks
+    # -----------------------------
     checkpoint_callback = ModelCheckpoint(
         monitor="val_f1_macro",
         mode="max",
         filename="maneuver-{epoch:02d}-{val_f1_macro:.2f}",
         save_top_k=2
     )
-
+    
     early_stop = EarlyStopping(
-        monitor="val_f1_macro",
-        patience=10,
+        monitor="val_f1_macro", 
+        patience=10, 
         mode="max"
     )
 
-    # -------------------------
-    # Trainer (UNCHANGED)
-    # -------------------------
+    # -----------------------------
+    # 5. Trainer
+    # -----------------------------
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=args.devices,
@@ -132,13 +113,13 @@ def main():
         callbacks=[checkpoint_callback, early_stop],
         gradient_clip_val=0.5,
         precision="32",
+        num_sanity_val_steps=0,  # Disable extra val filtering
     )
 
-    # -------------------------
-    # Fit
-    # -------------------------
+    # -----------------------------
+    # 6. Fit Model
+    # -----------------------------
     trainer.fit(model, datamodule)
-
 
 if __name__ == "__main__":
     main()
