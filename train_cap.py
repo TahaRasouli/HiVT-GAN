@@ -61,7 +61,7 @@ def main():
         root=args.root,
         train_batch_size=args.batch_size,
         val_batch_size=args.batch_size,
-        shuffle=True,
+        # shuffle=True,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
