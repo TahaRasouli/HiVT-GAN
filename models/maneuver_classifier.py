@@ -2,110 +2,108 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from sklearn.metrics import f1_score
+from torchmetrics.classification import F1Score
+from torch_geometric.nn import global_mean_pool
 
 class ManeuverClassifier(pl.LightningModule):
     def __init__(self, frozen_backbone, num_classes=6, lr=5e-4, class_weights=None):
         super().__init__()
         self.save_hyperparameters(ignore=['frozen_backbone'])
 
-        # Frozen CVAE backbone
+        # 1. Encoder (frozen)
         self.encoder = frozen_backbone
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-        # Simple classifier head
+        # 2. Classifier head
+        embed_dim = self.encoder.hparams.embed_dim  # Must match CVAE output embedding
         self.classifier = nn.Sequential(
-            nn.Linear(self.encoder.hparams.embed_dim, 64),
+            nn.Linear(embed_dim, 64),
             nn.ReLU(),
             nn.Linear(64, num_classes)
         )
 
-        # Loss with class weights
+        # 3. Loss function
         if class_weights is not None:
             self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
         else:
             self.loss_fn = nn.CrossEntropyLoss()
 
-        # Storage for validation
-        self.val_preds = []
-        self.val_labels = []
+        # 4. Metrics
+        self.train_f1 = F1Score(num_classes=num_classes, average='macro')
+        self.val_f1 = F1Score(num_classes=num_classes, average='macro')
 
-    # -----------------------------
-    # Forward
-    # -----------------------------
-    def forward(self, data):
-        with torch.no_grad():
-            features = self.encoder(data)  # [B, embed_dim]
-        if features.dim() > 2:
-            features = features.reshape(features.size(0), -1)
-        logits = self.classifier(features)
+        # For per-class F1
+        self.val_preds = []
+        self.val_targets = []
+
+        self.lr = lr
+
+    def forward(self, batch):
+        # Encode graph nodes
+        node_features = self.encoder(batch)  # [num_nodes, embed_dim]
+
+        # Pool node features per graph
+        graph_features = global_mean_pool(node_features, batch.batch)  # [num_graphs, embed_dim]
+
+        # Pass through classifier
+        logits = self.classifier(graph_features)  # [num_graphs, num_classes]
         return logits
 
-    # -----------------------------
-    # Training Step
-    # -----------------------------
     def training_step(self, batch, batch_idx):
         logits = self(batch)
-        labels = batch.maneuver_id.view(-1)
-        loss = self.loss_fn(logits, labels)
+        targets = batch.maneuver_id.view(-1)
+        loss = self.loss_fn(logits, targets)
+
+        # Track training F1
+        preds = torch.argmax(logits, dim=-1)
+        self.train_f1.update(preds, targets)
         self.log("train_loss", loss, prog_bar=True, batch_size=batch.num_graphs)
         return loss
 
-    # -----------------------------
-    # Validation Step
-    # -----------------------------
+    def training_epoch_end(self, outputs):
+        f1 = self.train_f1.compute()
+        self.log("train_f1_macro", f1, prog_bar=True)
+        self.train_f1.reset()
+
     def validation_step(self, batch, batch_idx):
         logits = self(batch)
-        labels = batch.maneuver_id.view(-1)
+        targets = batch.maneuver_id.view(-1)
+        loss = self.loss_fn(logits, targets)
 
-        loss = self.loss_fn(logits, labels)
-
-        # Store predictions and labels per sample (batch), not per node
-        preds = torch.argmax(logits, dim=1)
-
-        # IMPORTANT: detach and move to CPU
-        self.val_preds.append(preds.detach().cpu())
-        self.val_labels.append(labels.detach().cpu())
+        preds = torch.argmax(logits, dim=-1)
+        self.val_preds.append(preds)
+        self.val_targets.append(targets)
 
         self.log("val_loss", loss, prog_bar=True, batch_size=batch.num_graphs)
         return loss
 
-
-    # -----------------------------
-    # F1 per class at epoch end
-    # -----------------------------
     def on_validation_epoch_end(self):
-        if not self.val_preds:
-            return
+        # Concatenate all predictions and targets
+        preds = torch.cat(self.val_preds, dim=0)
+        targets = torch.cat(self.val_targets, dim=0)
 
-        # Concatenate along batch dimension
-        try:
-            preds = torch.cat(self.val_preds, dim=0)
-            labels = torch.cat(self.val_labels, dim=0)
-        except RuntimeError:
-            # fallback: flatten each tensor to 1D
-            preds = torch.cat([p.view(-1) for p in self.val_preds], dim=0)
-            labels = torch.cat([l.view(-1) for l in self.val_labels], dim=0)
+        # Compute per-class F1
+        per_class_f1 = []
+        for cls in range(self.hparams.num_classes):
+            cls_mask = targets == cls
+            if cls_mask.sum() == 0:
+                f1 = torch.tensor(0.0, device=self.device)
+            else:
+                cls_preds = preds[cls_mask]
+                cls_targets = targets[cls_mask]
+                f1 = F1Score(num_classes=1, average='macro')(cls_preds, cls_targets)
+            per_class_f1.append(f1.item())
 
-        from sklearn.metrics import f1_score
+        macro_f1 = torch.tensor(per_class_f1).mean().item()
+        print(f"\nEpoch {self.current_epoch} | val_macro_f1: {macro_f1:.4f} | per-class F1: {per_class_f1}")
 
-        f1_per_class = f1_score(labels, preds, average=None, zero_division=0)
-        f1_macro = f1_score(labels, preds, average='macro', zero_division=0)
-
-        for idx, f1c in enumerate(f1_per_class):
-            self.log(f"val_f1_class{idx}", f1c, prog_bar=True)
-        self.log("val_f1_macro", f1_macro, prog_bar=True)
-
-        # Clear for next epoch
+        # Reset lists for next epoch
         self.val_preds.clear()
-        self.val_labels.clear()
+        self.val_targets.clear()
 
-        print(f"\nEpoch {self.current_epoch:03d} | val_f1_macro: {f1_macro:.4f} | per-class: {f1_per_class}")
+        # Log for Trainer
+        self.log("val_f1_macro", macro_f1, prog_bar=True)
 
-
-    # -----------------------------
-    # Optimizer
-    # -----------------------------
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=1e-4)
