@@ -54,11 +54,6 @@ class ManeuverClassifier(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True, batch_size=batch.num_graphs)
         return loss
 
-    def training_epoch_end(self, outputs):
-        f1 = self.train_f1.compute()
-        self.log("train_f1_macro", f1, prog_bar=True)
-        self.train_f1.reset()
-
     def validation_step(self, batch, batch_idx):
         logits = self(batch)
         targets = batch.maneuver_id.view(-1)
