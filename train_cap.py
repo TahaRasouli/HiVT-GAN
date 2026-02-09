@@ -13,28 +13,37 @@ from models.maneuver_classifier import ManeuverClassifier
 
 torch.set_float32_matmul_precision('high')
 
+# -------------------------------------------------
+# class weights (UNCHANGED)
+# -------------------------------------------------
 def calculate_6class_weights(dataset):
     print("[Info] Calculating weights for 6-class setup...")
     counts = Counter()
     mapping = {0:0, 1:1, 2:2, 4:3, 5:4, 6:5}
+
     for i in range(len(dataset)):
         m_id = int(dataset.get(i).maneuver_id.item())
         if m_id in mapping:
             counts[mapping[m_id]] += 1
-    
+
     total = sum(counts.values())
     weights = torch.zeros(6)
+
     for idx in range(6):
-        # Inverse frequency calculation
         raw_weight = total / (6 * counts[idx]) if counts[idx] > 0 else 1.0
-        # CAP the weight at 20.0 to prevent gradient explosions
         weights[idx] = min(raw_weight, 20.0)
-        
+
     print(f"[Info] Remapped & Capped Weights: {weights}")
     return weights
 
+
+# -------------------------------------------------
+# main
+# -------------------------------------------------
 def main():
+
     pl.seed_everything(2024)
+
     parser = ArgumentParser()
 
     parser.add_argument("--root", type=str, required=True)
@@ -49,11 +58,19 @@ def main():
 
     args = parser.parse_args()
 
-    # 1. Dataset
-    train_dataset = NuScenesHiVTDataset(root=args.root, split='train')
+    # -------------------------
+    # Dataset (UNCHANGED)
+    # -------------------------
+    train_dataset = NuScenesHiVTDataset(
+        root=args.root,
+        split='train'
+    )
+
     class_weights = calculate_6class_weights(train_dataset)
-    
-    # 2. DataModule - Explicitly passing ALL parameters
+
+    # -------------------------
+    # DataModule (UNCHANGED)
+    # -------------------------
     datamodule = NuScenesHiVTDataModule(
         root=args.root,
         train_batch_size=args.batch_size,
@@ -68,41 +85,59 @@ def main():
         max_val_samples=None
     )
 
-    # 3. Model Setup
+    # -------------------------
+    # Backbone load (UNCHANGED)
+    # -------------------------
     print(f"[Info] Loading Backbone: {args.ckpt_path}")
-    backbone = CVAE.load_from_checkpoint(args.ckpt_path, strict=False)
-    model = ManeuverClassifier(
-        frozen_backbone=backbone,
-        num_classes=6,
-        lr=args.lr,
-        class_weights=class_weights
+    backbone = CVAE.load_from_checkpoint(
+        args.ckpt_path,
+        strict=False
     )
 
-    # 4. Callbacks
+    # -------------------------
+    # Model (MINIMAL CHANGE HERE)
+    # -------------------------
+    model = ManeuverClassifier(
+        encoder=backbone,              # ← name change
+        embed_dim=128,                 # ← match your backbone output dim if different
+        num_classes=6,
+        lr=args.lr,
+        loss_weights=class_weights     # ← name change
+    )
+
+    # -------------------------
+    # Callbacks (UNCHANGED)
+    # -------------------------
     checkpoint_callback = ModelCheckpoint(
         monitor="val_f1_macro",
         mode="max",
         filename="maneuver-{epoch:02d}-{val_f1_macro:.2f}",
         save_top_k=2
     )
-    
+
     early_stop = EarlyStopping(
-        monitor="val_f1_macro", 
-        patience=10, 
+        monitor="val_f1_macro",
+        patience=10,
         mode="max"
     )
 
-    # 5. Trainer
+    # -------------------------
+    # Trainer (UNCHANGED)
+    # -------------------------
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=args.devices,
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_callback, early_stop],
-        gradient_clip_val=0.5, 
+        gradient_clip_val=0.5,
         precision="32",
     )
 
+    # -------------------------
+    # Fit
+    # -------------------------
     trainer.fit(model, datamodule)
+
 
 if __name__ == "__main__":
     main()
