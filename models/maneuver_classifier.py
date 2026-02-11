@@ -162,26 +162,32 @@ class ManeuverClassifier(pl.LightningModule):
         # 1. Scene encoding from frozen backbone
         # --------------------------------------------------
 
-        node_features = self.encoder(batch)  # [1, N_total, D]
+        node_features = self.encoder(batch)   # [1, N_total, D]
         node_features = node_features.squeeze(0)
 
         batch_index = batch.batch
 
-        # Ego index extraction
+        # --------------------------------------------------
+        # Ego indices (first node of each graph)
+        # --------------------------------------------------
+
         ego_indices = torch.cat([
             torch.tensor([0], device=batch_index.device),
             torch.where(batch_index[1:] != batch_index[:-1])[0] + 1
         ])
 
-        ego_embed = node_features[ego_indices]  # [B,D]
+        ego_embed = node_features[ego_indices]   # [B,D]
 
         # --------------------------------------------------
-        # 2. Trajectory encoding (GROUND TRUTH)
+        # 2. Extract EGO trajectory ONLY
         # --------------------------------------------------
 
-        traj = batch.y[:, :, :]   # ego already index 0 in your data
+        traj_all = batch.y     # [N_total, T, 2]
 
-        traj = traj[:, :, :]  # [B,T,2]
+        traj = traj_all[ego_indices]   # 🔥 THIS FIXES YOUR ERROR
+
+        # shape now:
+        # [B, T, 2]
 
         traj_embed = self.traj_encoder(traj)
 
@@ -192,7 +198,7 @@ class ManeuverClassifier(pl.LightningModule):
         map_embed = self.map_encoder(batch, ego_embed)
 
         # --------------------------------------------------
-        # 4. Balanced fusion
+        # 4. Fusion
         # --------------------------------------------------
 
         fusion = torch.cat(
@@ -202,12 +208,7 @@ class ManeuverClassifier(pl.LightningModule):
 
         fusion = self.fusion_proj(fusion)
 
-        # residual stabilisation (critical)
-        fusion = fusion + ego_embed
-
-        # --------------------------------------------------
-        # 5. Classification
-        # --------------------------------------------------
+        fusion = fusion + ego_embed   # residual stabilisation
 
         logits = self.classifier(fusion)
 
