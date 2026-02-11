@@ -117,10 +117,18 @@ class ManeuverClassifier(pl.LightningModule):
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim * 3, 128),
+            nn.LayerNorm(embed_dim * 3),
+
+            nn.Linear(embed_dim * 3, 256),
             nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(256, 128),
+            nn.ReLU(),
+
             nn.Linear(128, num_classes)
         )
+
 
         # -----------------------------------------
         # Loss
@@ -189,7 +197,7 @@ class ManeuverClassifier(pl.LightningModule):
             dim=-1
         )  # [B,3D]
 
-        logits = self.classifier(fusion)
+        logits = self.classifier(fusion) / 1.5 # preventing the overconfident predictions!
 
         return logits
 
