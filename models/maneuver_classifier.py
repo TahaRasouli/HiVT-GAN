@@ -38,6 +38,7 @@ class TrajectoryEncoder(nn.Module):
 # Ego-Centric Map Encoder
 # =========================================================
 
+
 class EgoCentricMapEncoder(nn.Module):
 
     def __init__(self, embed_dim=128):
@@ -57,28 +58,42 @@ class EgoCentricMapEncoder(nn.Module):
 
     def forward(self, batch, ego_embed):
 
-        # lane_vectors: [total_lanes, 2]
-        lane_vecs = batch.lane_vectors
+        lane_vecs = batch.lane_vectors   # [L_total,2]
+        lane_embed = self.lane_mlp(lane_vecs)   # [L_total,D]
 
-        lane_embed = self.lane_mlp(lane_vecs)   # [L, D]
-
-        batch_index = batch.batch
-
-        unique_batches = torch.unique(batch_index)
+        B = ego_embed.shape[0]
 
         outputs = []
 
-        start_lane = 0
+        # --------------------------------
+        # Split lanes PER GRAPH
+        # --------------------------------
 
-        for i, b in enumerate(unique_batches):
+        # IMPORTANT:
+        # lane_actor_index maps lanes to actors
+        # row0 = lane index
+        # row1 = actor index
 
-            num_nodes = (batch_index == b).sum()
+        lane_actor_index = batch.lane_actor_index
+
+        for i in range(B):
 
             ego = ego_embed[i].unsqueeze(0).unsqueeze(0)   # [1,1,D]
 
-            # NOTE:
-            # Simplified — assumes global lanes (works with your current structure)
-            lanes = lane_embed.unsqueeze(0)  # [1,L,D]
+            # get actor indices belonging to graph i
+            actor_mask = (batch.batch == i)
+            actor_ids = torch.where(actor_mask)[0]
+
+            # select lanes connected to these actors
+            lane_mask = torch.isin(lane_actor_index[1], actor_ids)
+
+            if lane_mask.sum() == 0:
+                outputs.append(torch.zeros_like(ego.squeeze(0)))
+                continue
+
+            lane_ids = lane_actor_index[0][lane_mask].unique()
+
+            lanes = lane_embed[lane_ids].unsqueeze(0)   # [1,L_i,D]
 
             attn_out, _ = self.attn(ego, lanes, lanes)
 
@@ -184,10 +199,9 @@ class ManeuverClassifier(pl.LightningModule):
         # 5. Fusion
         # ---------------------------------------------
 
-        fusion = torch.cat(
-            [ego_embed, traj_embed, map_embed],
-            dim=-1
-        )   # [B,3D]
+        fusion = torch.cat([...], dim=-1)
+        fusion = F.layer_norm(fusion, fusion.shape[-1:])
+
 
         logits = self.classifier(fusion)
 
@@ -206,6 +220,13 @@ class ManeuverClassifier(pl.LightningModule):
         loss = self.loss_fn(logits, targets)
 
         self.log("train_loss", loss, prog_bar=True)
+
+        preds = torch.argmax(logits, dim=1)
+
+        if batch_idx == 0:
+            print("targets:", targets[:20])
+            print("preds:", preds[:20])
+
 
         return loss
 
