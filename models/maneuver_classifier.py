@@ -2,20 +2,19 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 
-from torchmetrics.classification import MulticlassF1Score
+from torchmetrics.classification import MulticlassPrecision
 
 
-# =========================================================
-# Trajectory Encoder
-# =========================================================
+# =====================================================
+# TRAJECTORY ENCODER
+# =====================================================
 
 class TrajectoryEncoder(nn.Module):
-    """
-    Encodes ego trajectory [B, T, 2] -> [B, D]
-    """
 
     def __init__(self, future_steps=30, embed_dim=128):
         super().__init__()
+
+        self.future_steps = future_steps
 
         self.net = nn.Sequential(
             nn.Linear(future_steps * 2, 128),
@@ -24,20 +23,21 @@ class TrajectoryEncoder(nn.Module):
         )
 
     def forward(self, traj):
-
-        # traj shape: [B, T, 2]
+        """
+        traj shape:
+            [B, T, 2]
+        """
 
         B = traj.size(0)
 
-        traj_flat = traj.reshape(B, -1)   # [B, T*2]
+        traj_flat = traj.reshape(B, self.future_steps * 2)
 
         return self.net(traj_flat)
 
 
-# =========================================================
-# Ego-Centric Map Encoder
-# =========================================================
-
+# =====================================================
+# ADVANCED EGO-CENTRIC MAP ENCODER
+# =====================================================
 
 class EgoCentricMapEncoder(nn.Module):
 
@@ -58,53 +58,32 @@ class EgoCentricMapEncoder(nn.Module):
 
     def forward(self, batch, ego_embed):
 
-        lane_vecs = batch.lane_vectors   # [L_total,2]
-        lane_embed = self.lane_mlp(lane_vecs)   # [L_total,D]
+        # lane_vectors shape:
+        # [L_total, 2]
 
-        B = ego_embed.shape[0]
+        lane_vecs = batch.lane_vectors
 
-        outputs = []
+        lane_embed = self.lane_mlp(lane_vecs)  # [L,D]
 
-        # --------------------------------
-        # Split lanes PER GRAPH
-        # --------------------------------
+        B = ego_embed.size(0)
 
-        # IMPORTANT:
-        # lane_actor_index maps lanes to actors
-        # row0 = lane index
-        # row1 = actor index
+        # simplified global lane attention
+        lanes = lane_embed.unsqueeze(0).repeat(B, 1, 1)  # [B,L,D]
 
-        lane_actor_index = batch.lane_actor_index
+        ego_query = ego_embed.unsqueeze(1)  # [B,1,D]
 
-        for i in range(B):
+        attn_out, _ = self.attn(
+            ego_query,
+            lanes,
+            lanes
+        )
 
-            ego = ego_embed[i].unsqueeze(0).unsqueeze(0)   # [1,1,D]
-
-            # get actor indices belonging to graph i
-            actor_mask = (batch.batch == i)
-            actor_ids = torch.where(actor_mask)[0]
-
-            # select lanes connected to these actors
-            lane_mask = torch.isin(lane_actor_index[1], actor_ids)
-
-            if lane_mask.sum() == 0:
-                outputs.append(torch.zeros_like(ego.squeeze(0)))
-                continue
-
-            lane_ids = lane_actor_index[0][lane_mask].unique()
-
-            lanes = lane_embed[lane_ids].unsqueeze(0)   # [1,L_i,D]
-
-            attn_out, _ = self.attn(ego, lanes, lanes)
-
-            outputs.append(attn_out.squeeze(0))
-
-        return torch.cat(outputs, dim=0)   # [B,D]
+        return attn_out.squeeze(1)  # [B,D]
 
 
-# =========================================================
-# Maneuver Classifier
-# =========================================================
+# =====================================================
+# MANEUVER CLASSIFIER
+# =====================================================
 
 class ManeuverClassifier(pl.LightningModule):
 
@@ -114,8 +93,7 @@ class ManeuverClassifier(pl.LightningModule):
         num_classes=6,
         lr=5e-4,
         class_weights=None,
-        id_to_class=None,
-        future_steps=30
+        future_steps=30,
     ):
         super().__init__()
 
@@ -129,35 +107,50 @@ class ManeuverClassifier(pl.LightningModule):
 
         self.lr = lr
         self.future_steps = future_steps
+        self.num_classes = num_classes
 
         embed_dim = self.encoder.hparams.embed_dim
 
-        # Components
-        self.traj_encoder = TrajectoryEncoder(future_steps, embed_dim)
+        # ------------------------------------------------
+        # Modules
+        # ------------------------------------------------
 
-        self.map_encoder = EgoCentricMapEncoder(embed_dim)
+        self.traj_encoder = TrajectoryEncoder(
+            future_steps=future_steps,
+            embed_dim=embed_dim
+        )
+
+        self.map_encoder = EgoCentricMapEncoder(
+            embed_dim=embed_dim
+        )
+
+        # Balanced fusion (fix follow collapse)
+        self.fusion_proj = nn.Sequential(
+            nn.LayerNorm(embed_dim * 3),
+            nn.Linear(embed_dim * 3, embed_dim),
+            nn.ReLU()
+        )
 
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim * 3, 128),
+            nn.Linear(embed_dim, 128),
             nn.ReLU(),
             nn.Linear(128, num_classes)
         )
 
+        # ------------------------------------------------
         # Loss
+        # ------------------------------------------------
+
         self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
-        # Metrics
-        self.val_f1_macro = MulticlassF1Score(
+        # ------------------------------------------------
+        # Metric: PRECISION ONLY (as requested)
+        # ------------------------------------------------
+
+        self.val_precision = MulticlassPrecision(
             num_classes=num_classes,
             average="macro"
         )
-
-        self.val_f1_per_class = MulticlassF1Score(
-            num_classes=num_classes,
-            average=None
-        )
-
-        self.id_to_class = id_to_class
 
     # =====================================================
     # FORWARD
@@ -168,48 +161,60 @@ class ManeuverClassifier(pl.LightningModule):
         # --------------------------------------------------
         # 1. Scene encoding from frozen backbone
         # --------------------------------------------------
-        node_features = self.encoder(batch)     # [F, N_total, D]
+
+        node_features = self.encoder(batch)  # [1, N_total, D]
         node_features = node_features.squeeze(0)
 
         batch_index = batch.batch
 
-        # --------------------------------------------------
-        # 2. Extract ego embeddings
-        # --------------------------------------------------
+        # Ego index extraction
         ego_indices = torch.cat([
             torch.tensor([0], device=batch_index.device),
             torch.where(batch_index[1:] != batch_index[:-1])[0] + 1
         ])
 
-        ego_embed = node_features[ego_indices]   # [B,D]
+        ego_embed = node_features[ego_indices]  # [B,D]
 
         # --------------------------------------------------
-        # 3. Ground-truth trajectory (ego only)
+        # 2. Trajectory encoding (GROUND TRUTH)
         # --------------------------------------------------
-        ego_traj = batch.y[ego_indices]          # [B,30,2]
 
-        traj_embed = self.traj_encoder(ego_traj)  # [B,D]
+        traj = batch.y[:, :, :]   # ego already index 0 in your data
 
-        # --------------------------------------------------
-        # 4. Ego-centric map encoding
-        # --------------------------------------------------
-        map_embed = self.map_encoder(batch, ego_embed)  # [B,D]
+        traj = traj[:, :, :]  # [B,T,2]
+
+        traj_embed = self.traj_encoder(traj)
 
         # --------------------------------------------------
-        # 5. Fusion
+        # 3. Map encoding
         # --------------------------------------------------
+
+        map_embed = self.map_encoder(batch, ego_embed)
+
+        # --------------------------------------------------
+        # 4. Balanced fusion
+        # --------------------------------------------------
+
         fusion = torch.cat(
             [ego_embed, traj_embed, map_embed],
             dim=-1
-        )   # [B, 3D]
+        )
+
+        fusion = self.fusion_proj(fusion)
+
+        # residual stabilisation (critical)
+        fusion = fusion + ego_embed
+
+        # --------------------------------------------------
+        # 5. Classification
+        # --------------------------------------------------
 
         logits = self.classifier(fusion)
 
         return logits
 
-
     # =====================================================
-    # TRAIN
+    # TRAINING
     # =====================================================
 
     def training_step(self, batch, batch_idx):
@@ -221,13 +226,6 @@ class ManeuverClassifier(pl.LightningModule):
         loss = self.loss_fn(logits, targets)
 
         self.log("train_loss", loss, prog_bar=True)
-
-        preds = torch.argmax(logits, dim=1)
-
-        if batch_idx == 0:
-            print("targets:", targets[:20])
-            print("preds:", preds[:20])
-
 
         return loss
 
@@ -243,37 +241,22 @@ class ManeuverClassifier(pl.LightningModule):
 
         preds = torch.argmax(logits, dim=1)
 
-        self.val_f1_macro.update(preds, targets)
-        self.val_f1_per_class.update(preds, targets)
+        self.val_precision.update(preds, targets)
 
     def on_validation_epoch_end(self):
 
-        f1_macro = self.val_f1_macro.compute()
-        f1_per_class = self.val_f1_per_class.compute()
+        precision = self.val_precision.compute()
 
-        self.log("val_f1_macro", f1_macro, prog_bar=True)
+        self.log("val_precision", precision, prog_bar=True)
 
         if self.global_rank == 0:
-            print("\n==== Per-class F1 ====")
-            for i, f in enumerate(f1_per_class):
+            print(f"\nPrecision (macro): {precision:.4f}")
 
-                name = (
-                    self.id_to_class[i]
-                    if self.id_to_class is not None else i
-                )
-
-                print(f"{name}: {f.item():.4f}")
-
-        self.val_f1_macro.reset()
-        self.val_f1_per_class.reset()
+        self.val_precision.reset()
 
     # =====================================================
     # OPTIMIZER
     # =====================================================
 
     def configure_optimizers(self):
-
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=self.lr
-        )
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
