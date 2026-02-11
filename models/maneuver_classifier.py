@@ -165,47 +165,48 @@ class ManeuverClassifier(pl.LightningModule):
 
     def forward(self, batch):
 
-        # ---------------------------------------------
-        # 1. Scene encoding via frozen backbone
-        # ---------------------------------------------
+        # --------------------------------------------------
+        # 1. Scene encoding from frozen backbone
+        # --------------------------------------------------
+        node_features = self.encoder(batch)     # [F, N_total, D]
+        node_features = node_features.squeeze(0)
 
-        node_features = self.encoder(batch)   # [F, N_total, D]
+        batch_index = batch.batch
 
-        node_features = node_features[0]      # use single mode
-
-        # ---------------------------------------------
+        # --------------------------------------------------
         # 2. Extract ego embeddings
-        # ---------------------------------------------
+        # --------------------------------------------------
+        ego_indices = torch.cat([
+            torch.tensor([0], device=batch_index.device),
+            torch.where(batch_index[1:] != batch_index[:-1])[0] + 1
+        ])
 
-        ego_indices = batch.ego_index.view(-1)
+        ego_embed = node_features[ego_indices]   # [B,D]
 
-        ego_embed = node_features[ego_indices]   # [B, D]
+        # --------------------------------------------------
+        # 3. Ground-truth trajectory (ego only)
+        # --------------------------------------------------
+        ego_traj = batch.y[ego_indices]          # [B,30,2]
 
-        # ---------------------------------------------
-        # 3. Ground-truth trajectory encoding
-        # ---------------------------------------------
+        traj_embed = self.traj_encoder(ego_traj)  # [B,D]
 
-        traj = batch.y[ego_indices]   # [B, T, 2]
-
-        traj_embed = self.traj_encoder(traj)   # [B,D]
-
-        # ---------------------------------------------
+        # --------------------------------------------------
         # 4. Ego-centric map encoding
-        # ---------------------------------------------
+        # --------------------------------------------------
+        map_embed = self.map_encoder(batch, ego_embed)  # [B,D]
 
-        map_embed = self.map_encoder(batch, ego_embed)   # [B,D]
-
-        # ---------------------------------------------
+        # --------------------------------------------------
         # 5. Fusion
-        # ---------------------------------------------
-
-        fusion = torch.cat([...], dim=-1)
-        fusion = F.layer_norm(fusion, fusion.shape[-1:])
-
+        # --------------------------------------------------
+        fusion = torch.cat(
+            [ego_embed, traj_embed, map_embed],
+            dim=-1
+        )   # [B, 3D]
 
         logits = self.classifier(fusion)
 
         return logits
+
 
     # =====================================================
     # TRAIN
