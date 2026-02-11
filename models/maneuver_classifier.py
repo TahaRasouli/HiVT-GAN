@@ -197,7 +197,7 @@ class ManeuverClassifier(pl.LightningModule):
             dim=-1
         )  # [B,3D]
 
-        logits = self.classifier(fusion) / 1.5 # preventing the overconfident predictions!
+        logits = self.classifier(fusion) 
 
         return logits
 
