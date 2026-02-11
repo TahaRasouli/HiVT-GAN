@@ -1,16 +1,17 @@
-import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import pytorch_lightning as pl
+
 from torchmetrics.classification import MulticlassF1Score
 
 
-# =========================================================
-# 1. TRAJECTORY ENCODER
-# =========================================================
+# =====================================================
+# Trajectory Encoder
+# =====================================================
 
 class TrajectoryEncoder(nn.Module):
 
-    def __init__(self, future_steps, embed_dim):
+    def __init__(self, future_steps=30, embed_dim=128):
         super().__init__()
 
         self.net = nn.Sequential(
@@ -21,26 +22,74 @@ class TrajectoryEncoder(nn.Module):
 
     def forward(self, traj):
         # traj: [B,T,2]
-        traj_flat = traj.reshape(traj.shape[0], -1)
+        B = traj.size(0)
+        traj_flat = traj.reshape(B, -1)
         return self.net(traj_flat)
 
 
-# =========================================================
-# 2. ADVANCED EGO-CENTRIC MAP ENCODER
-# =========================================================
+# =====================================================
+# Ego-Centric Map Encoder (token output)
+# =====================================================
 
 class EgoCentricMapEncoder(nn.Module):
 
-    def __init__(self, embed_dim=128, radius=40.0, num_heads=4):
+    def __init__(self, embed_dim=128):
         super().__init__()
 
-        self.radius = radius
-
-        self.lane_embed = nn.Sequential(
+        self.mlp = nn.Sequential(
             nn.Linear(2, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim)
         )
+
+    def forward(self, batch, ego_embed):
+
+        lane_vectors = batch.lane_vectors  # [total_lanes,2]
+
+        batch_index = batch.batch
+
+        ego_indices = torch.cat([
+            torch.tensor([0], device=batch_index.device),
+            torch.where(batch_index[1:] != batch_index[:-1])[0] + 1
+        ])
+
+        ego_positions = batch.positions[ego_indices, -1]
+
+        lane_counts = batch.ptr_lane if hasattr(batch, "ptr_lane") else None
+
+        # fallback (assume single scene batch)
+        if lane_counts is None:
+            lane_feat = self.mlp(lane_vectors)
+            return lane_feat.unsqueeze(0)
+
+        lane_feat = self.mlp(lane_vectors)
+
+        B = ego_positions.size(0)
+
+        outputs = []
+
+        start = 0
+        for i in range(B):
+
+            end = lane_counts[i+1]
+
+            lanes_i = lane_feat[start:end]
+
+            outputs.append(lanes_i)
+
+            start = end
+
+        return torch.stack(outputs)
+
+
+# =====================================================
+# Cross Attention Fusion
+# =====================================================
+
+class ManeuverFusion(nn.Module):
+
+    def __init__(self, embed_dim=128, num_heads=4):
+        super().__init__()
 
         self.cross_attn = nn.MultiheadAttention(
             embed_dim,
@@ -48,56 +97,22 @@ class EgoCentricMapEncoder(nn.Module):
             batch_first=True
         )
 
-    def forward(self, batch, ego_embed):
+    def forward(self, traj_embed, lane_tokens):
 
-        device = ego_embed.device
-        lane_vectors = batch.lane_vectors.to(device)
+        query = traj_embed.unsqueeze(1)
 
-        B = ego_embed.size(0)
-        batch_index = batch.batch
+        fused, _ = self.cross_attn(
+            query,
+            lane_tokens,
+            lane_tokens
+        )
 
-        # ego indices
-        ego_indices = torch.cat([
-            torch.tensor([0], device=device),
-            torch.where(batch_index[1:] != batch_index[:-1])[0] + 1
-        ])
-
-        ego_positions = batch.positions[ego_indices, -1]
-
-        outputs = []
-
-        for b in range(B):
-
-            ego_pos = ego_positions[b]
-
-            rel_lane = lane_vectors - ego_pos
-            dist = torch.norm(rel_lane, dim=-1)
-
-            mask = dist < self.radius
-            local_lanes = rel_lane[mask]
-
-            if local_lanes.shape[0] == 0:
-                outputs.append(torch.zeros_like(ego_embed[b]))
-                continue
-
-            lane_feat = self.lane_embed(local_lanes).unsqueeze(0)
-
-            ego_query = ego_embed[b].unsqueeze(0).unsqueeze(0)
-
-            attn_out, _ = self.cross_attn(
-                ego_query,
-                lane_feat,
-                lane_feat
-            )
-
-            outputs.append(attn_out.squeeze(0).squeeze(0))
-
-        return torch.stack(outputs)
+        return fused.squeeze(1)
 
 
-# =========================================================
-# 3. MANEUVER CLASSIFIER
-# =========================================================
+# =====================================================
+# Maneuver Classifier
+# =====================================================
 
 class ManeuverClassifier(pl.LightningModule):
 
@@ -106,15 +121,9 @@ class ManeuverClassifier(pl.LightningModule):
         frozen_backbone,
         num_classes=6,
         lr=5e-4,
-        class_weights=None,
-        future_steps=30,
-        id_to_class=None
+        class_weights=None
     ):
         super().__init__()
-
-        # ------------------------------------------------
-        # Backbone
-        # ------------------------------------------------
 
         self.encoder = frozen_backbone
 
@@ -125,31 +134,19 @@ class ManeuverClassifier(pl.LightningModule):
 
         embed_dim = self.encoder.hparams.embed_dim
 
-        # ------------------------------------------------
-        # Modules
-        # ------------------------------------------------
+        self.traj_encoder = TrajectoryEncoder(embed_dim=embed_dim)
 
-        self.traj_encoder = TrajectoryEncoder(
-            future_steps,
-            embed_dim
-        )
+        self.map_encoder = EgoCentricMapEncoder(embed_dim=embed_dim)
 
-        self.map_encoder = EgoCentricMapEncoder(embed_dim)
+        self.fusion = ManeuverFusion(embed_dim=embed_dim)
 
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim * 3, 128),
+            nn.Linear(embed_dim * 2, 128),
             nn.ReLU(),
             nn.Linear(128, num_classes)
         )
 
         self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
-
-        self.lr = lr
-        self.id_to_class = id_to_class
-
-        # ------------------------------------------------
-        # Metrics
-        # ------------------------------------------------
 
         self.val_f1_macro = MulticlassF1Score(
             num_classes=num_classes,
@@ -161,14 +158,16 @@ class ManeuverClassifier(pl.LightningModule):
             average=None
         )
 
-    # =========================================================
-    # FORWARD
-    # =========================================================
+        self.lr = lr
+
+    # =====================================================
+    # Forward
+    # =====================================================
 
     def forward(self, batch):
 
-        # Scene encoding (HiVT backbone)
-        node_features = self.encoder(batch).squeeze(0)
+        node_features = self.encoder(batch)   # [1,N,D]
+        node_features = node_features.squeeze(0)
 
         batch_index = batch.batch
 
@@ -179,31 +178,40 @@ class ManeuverClassifier(pl.LightningModule):
 
         ego_embed = node_features[ego_indices]
 
-        # Trajectory encoding
-        traj = batch.y[ego_indices]
+        # -------------------------------------------------
+        # Ground truth trajectory
+        # -------------------------------------------------
+
+        traj = batch.y[:, 0]   # ego trajectory
+
         traj_embed = self.traj_encoder(traj)
 
-        # Map encoding
-        map_embed = self.map_encoder(batch, ego_embed)
+        # -------------------------------------------------
+        # Ego-centric map encoding
+        # -------------------------------------------------
 
-        # Fusion
-        fusion = torch.cat([
-            ego_embed,
-            map_embed,
-            traj_embed
-        ], dim=-1)
+        lane_tokens = self.map_encoder(batch, ego_embed)
+
+        # -------------------------------------------------
+        # Cross attention fusion
+        # -------------------------------------------------
+
+        fused_motion = self.fusion(traj_embed, lane_tokens)
+
+        fusion = torch.cat([ego_embed, fused_motion], dim=-1)
 
         logits = self.classifier(fusion)
 
         return logits
 
-    # =========================================================
-    # TRAINING
-    # =========================================================
+    # =====================================================
+    # Training
+    # =====================================================
 
     def training_step(self, batch, batch_idx):
 
         logits = self(batch)
+
         targets = batch.maneuver_id.view(-1)
 
         loss = self.loss_fn(logits, targets)
@@ -212,9 +220,9 @@ class ManeuverClassifier(pl.LightningModule):
 
         return loss
 
-    # =========================================================
-    # VALIDATION
-    # =========================================================
+    # =====================================================
+    # Validation
+    # =====================================================
 
     def validation_step(self, batch, batch_idx):
 
@@ -239,18 +247,14 @@ class ManeuverClassifier(pl.LightningModule):
             print("\n==== Per-class F1 ====")
 
             for i, f in enumerate(f1_per_class):
-
-                name = (
-                    self.id_to_class[i]
-                    if self.id_to_class is not None
-                    else str(i)
-                )
-
-                print(f"{name}: {f.item():.4f}")
+                print(f"{i}: {f.item():.4f}")
 
         self.val_f1_macro.reset()
         self.val_f1_per_class.reset()
 
-    def configure_optimizers(self):
+    # =====================================================
+    # Optimizer
+    # =====================================================
 
+    def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
