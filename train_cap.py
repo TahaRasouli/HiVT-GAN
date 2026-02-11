@@ -27,7 +27,15 @@ def calculate_6class_weights(dataset):
             counts[mapping[m_id]] += 1
 
     total = sum(counts.values())
-    weights = torch.zeros(6)
+    weights = torch.tensor([
+        1.0,   # follow MUST be 1
+        1.2,
+        1.2,
+        3.0,
+        3.0,
+        1.1
+    ])
+
     for idx in range(6):
         raw_weight = total / (6 * counts[idx]) if counts[idx] > 0 else 1.0
         weights[idx] = min(raw_weight, 20.0)
@@ -89,16 +97,17 @@ def main():
     # 4. Callbacks
     # -----------------------------
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_f1_macro",
+        monitor="val_precision",
         mode="max",
-        filename="maneuver-{epoch:02d}-{val_f1_macro:.2f}",
+        filename="maneuver-{epoch:02d}-{val_precision:.2f}",
         save_top_k=2
     )
-    
+
     early_stop = EarlyStopping(
-        monitor="val_f1_macro", 
-        patience=10, 
-        mode="max"
+        monitor="val_precision",
+        patience=10,
+        mode="max",
+        check_on_train_epoch_end=False
     )
 
     # -----------------------------
