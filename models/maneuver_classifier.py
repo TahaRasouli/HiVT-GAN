@@ -171,18 +171,9 @@ class ManeuverClassifier(pl.LightningModule):
 
         batch_index = batch.batch
 
-        ego_indices = torch.cat([
-            torch.tensor([0], device=batch_index.device),
-            torch.where(batch_index[1:] != batch_index[:-1])[0] + 1
-        ])
+        ego_indices = batch.ego_index.view(-1)
 
-        ego_embed = node_features[ego_indices]
-
-        # -------------------------------------------------
-        # Ground truth trajectory
-        # -------------------------------------------------
-
-        traj = batch.y[:, 0]   # ego trajectory
+        traj = batch.y[ego_indices]   # [B,T,2]
 
         traj_embed = self.traj_encoder(traj)
 
